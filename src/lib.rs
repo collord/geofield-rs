@@ -7,4 +7,5 @@
 //! Build is staged (see `BUILD_geofield_rs.md`). Currently only the cubic kernel
 //! triple (step 1) is implemented.
 
+pub mod data;
 pub mod kernel;
