@@ -154,6 +154,30 @@ impl WasmModel {
         }
     }
 
+    /// Recovered per-interface isovalues, ascending by isovalue, as a
+    /// `Float64Array`. These are the scalar-field levels at which each interface's
+    /// contact lives — mesh each one to render the actual geological surfaces (as
+    /// opposed to an arbitrary level set like 0).
+    pub fn interface_isovalues(&self) -> Vec<f64> {
+        self.inner
+            .lithology()
+            .interfaces
+            .iter()
+            .map(|iv| iv.isovalue)
+            .collect()
+    }
+
+    /// Interface ids matching `interface_isovalues()` order, as a `Float64Array`
+    /// (ids are small integers; f64 carries them losslessly).
+    pub fn interface_ids(&self) -> Vec<f64> {
+        self.inner
+            .lithology()
+            .interfaces
+            .iter()
+            .map(|iv| iv.interface_id as f64)
+            .collect()
+    }
+
     /// Solve residual ‖K w − b‖₂ (diagnostic).
     pub fn residual(&self) -> f64 {
         self.inner.residual

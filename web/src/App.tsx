@@ -10,7 +10,6 @@ import { SurfacePointTable, OrientationTable } from "./Tables";
 import { Viewer } from "./Viewer";
 
 const DEBOUNCE_MS = 300;
-const ISOVALUE = 0; // single isosurface at the zero level set
 
 export default function App() {
   const [wasmReady, setWasmReady] = useState(false);
@@ -35,12 +34,7 @@ export default function App() {
     if (timer.current) window.clearTimeout(timer.current);
     timer.current = window.setTimeout(() => {
       const t0 = performance.now();
-      const { mesh, error } = solveAndMesh(
-        surfacePoints,
-        orientations,
-        res,
-        ISOVALUE,
-      );
+      const { mesh, error } = solveAndMesh(surfacePoints, orientations, res);
       setMesh(mesh);
       setError(error);
       setBusyMs(performance.now() - t0);
@@ -58,6 +52,10 @@ export default function App() {
           {!wasmReady && <span>loading WASM…</span>}
           {wasmReady && mesh && (
             <>
+              <span>
+                {mesh.surfaces.length} surface
+                {mesh.surfaces.length === 1 ? "" : "s"}
+              </span>
               <span>{mesh.triangleCount.toLocaleString()} tris</span>
               <span>residual {fmt(mesh.residual)}</span>
               <span>iso-spread {fmt(mesh.isovalueSpread)}</span>

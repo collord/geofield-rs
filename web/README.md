@@ -7,9 +7,12 @@ re-render live in a three.js viewport.
 - **Upper area** — editable tables seeded from gempy's `jan_models/model1`
   (12 surface points, 2 orientations), in gempy's CSV columns
   (X,Y,Z,formation and X,Y,Z,azimuth,dip,polarity,formation).
-- **Lower area** — three.js rendering: the zero-isosurface mesh (dual contoured
-  in Rust/WASM), surface points as spheres, orientation poles as arrows, inside
-  the model extent box. Z is up.
+- **Lower area** — three.js rendering: one **contact surface per interface**,
+  dual contoured (in Rust/WASM) at that interface's *recovered isovalue* so each
+  surface passes through its input points — the geological boundaries, matching
+  gempy (not an arbitrary level set). Surfaces are colored by formation; surface
+  points are spheres, orientation poles are arrows, inside the model extent box.
+  Z is up.
 - Edits **auto re-solve** after a ~300 ms debounce. A grid slider (8³–96³) sets
   the dual-contouring resolution.
 
@@ -28,9 +31,11 @@ placing one QEF vertex per sign-changing cell from the field's analytic gradient
 (Hermite data). It is the first increment toward adaptive octree dual contouring;
 no octree/adaptivity yet (the grid slider stands in for it).
 
-`mesh_isosurface` renders a single isosurface at the zero level set. For model1
-(horizontal layers) that sheet sits at z≈500, midway between the rock2 contact
-(z=600) and rock1 (z=400) — verified.
+The harness meshes **one surface per interface** at the isovalue recovered at
+that interface's input points (`WasmModel::interface_isovalues()`). For model1
+the rock2 contact (isovalue +0.125) meshes to z≈600 and the rock1 contact
+(isovalue −0.125) to z≈400 — passing through their points, as gempy renders them.
+Verified: surface z-means land at 600.0 and 400.0.
 
 ## Running
 

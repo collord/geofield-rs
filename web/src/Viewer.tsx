@@ -105,29 +105,35 @@ export function Viewer({ mesh, surfacePoints, orientations }: Props) {
     };
   }, []);
 
-  // Rebuild the isosurface mesh whenever it changes.
+  // Rebuild the contact surfaces whenever the mesh changes. One mesh per
+  // interface, colored by formation, at its recovered isovalue.
   useEffect(() => {
     const group = surfaceGroupRef.current;
     if (!group) return;
     clearGroup(group);
-    if (mesh.triangleCount === 0) return;
 
-    const geom = new THREE.BufferGeometry();
-    geom.setAttribute(
-      "position",
-      new THREE.BufferAttribute(mesh.positions, 3),
-    );
-    geom.setIndex(new THREE.BufferAttribute(mesh.indices, 1));
-    geom.computeVertexNormals();
+    for (const surf of mesh.surfaces) {
+      if (surf.triangleCount === 0) continue;
+      const geom = new THREE.BufferGeometry();
+      geom.setAttribute(
+        "position",
+        new THREE.BufferAttribute(surf.positions, 3),
+      );
+      geom.setIndex(new THREE.BufferAttribute(surf.indices, 1));
+      geom.computeVertexNormals();
 
-    const mat = new THREE.MeshStandardMaterial({
-      color: 0x9aa7b4,
-      metalness: 0.1,
-      roughness: 0.75,
-      side: THREE.DoubleSide,
-      flatShading: false,
-    });
-    group.add(new THREE.Mesh(geom, mat));
+      const color = FORMATION_COLORS[surf.formation] ?? colorFor(surf.formation);
+      const mat = new THREE.MeshStandardMaterial({
+        color,
+        metalness: 0.1,
+        roughness: 0.7,
+        side: THREE.DoubleSide,
+        flatShading: false,
+        transparent: true,
+        opacity: 0.85,
+      });
+      group.add(new THREE.Mesh(geom, mat));
+    }
   }, [mesh]);
 
   // Rebuild data markers (surface points as spheres, orientations as arrows).

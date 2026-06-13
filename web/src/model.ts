@@ -34,11 +34,20 @@ export function azimuthDipToPole(
   ];
 }
 
-export interface MeshData {
+/** One dual-contoured contact surface, at a recovered interface isovalue. */
+export interface SurfaceMesh {
+  interfaceId: number;
+  formation: string; // formation name for this interface id (best-effort)
+  isovalue: number;
   positions: Float32Array; // 3 * V
   indices: Uint32Array; // 3 * T
-  vertexCount: number;
   triangleCount: number;
+}
+
+export interface MeshData {
+  /** One mesh per interface, at that interface's recovered isovalue. */
+  surfaces: SurfaceMesh[];
+  triangleCount: number; // total across surfaces
   residual: number;
   isovalueSpread: number;
 }
@@ -48,14 +57,14 @@ export interface SolveResult {
   error: string | null;
 }
 
-/** Fit the model from the current rows and dual-contour the isovalue-0 surface.
- *  `res` is cells per axis for the meshing grid. Returns a mesh or an error
- *  string (e.g. degenerate inputs) without throwing. */
+/** Fit the model from the current rows and dual-contour ONE surface per
+ *  interface, each at its recovered isovalue (so the meshes pass through the
+ *  input surface points, as gempy renders contacts — not an arbitrary level set).
+ *  `res` is cells per axis. Returns meshes or an error string without throwing. */
 export function solveAndMesh(
   surfacePoints: SurfacePointRow[],
   orientations: OrientationRow[],
   res: number,
-  isovalue: number,
 ): SolveResult {
   const idOf = (formation: string): number => {
     const i = SERIES_ORDER.indexOf(formation);
@@ -105,35 +114,52 @@ export function solveAndMesh(
   }
 
   const [minX, maxX, minY, maxY, minZ, maxZ] = EXTENT;
-  const wm = model.mesh_isosurface(
-    minX,
-    minY,
-    minZ,
-    maxX,
-    maxY,
-    maxZ,
-    res,
-    isovalue,
-  );
+
+  // Mesh ONE surface per interface, at its recovered isovalue. These pass
+  // through the input surface points (the geological contacts), matching gempy —
+  // not an arbitrary level set.
+  const isovalues = Array.from(model.interface_isovalues());
+  const ids = Array.from(model.interface_ids());
+  const nameOf = (id: number): string => SERIES_ORDER[id] ?? `interface ${id}`;
+
+  const surfaces: SurfaceMesh[] = [];
+  let totalTris = 0;
+  for (let s = 0; s < isovalues.length; s++) {
+    const wm = model.mesh_isosurface(
+      minX,
+      minY,
+      minZ,
+      maxX,
+      maxY,
+      maxZ,
+      res,
+      isovalues[s],
+    );
+    surfaces.push({
+      interfaceId: ids[s],
+      formation: nameOf(ids[s]),
+      isovalue: isovalues[s],
+      positions: wm.positions(),
+      indices: wm.indices(),
+      triangleCount: wm.triangle_count,
+    });
+    totalTris += wm.triangle_count;
+    wm.free();
+  }
 
   const mesh: MeshData = {
-    positions: wm.positions(),
-    indices: wm.indices(),
-    vertexCount: wm.vertex_count,
-    triangleCount: wm.triangle_count,
+    surfaces,
+    triangleCount: totalTris,
     residual: model.residual(),
     isovalueSpread: model.isovalue_spread(),
   };
-  wm.free();
   model.free();
   return { mesh, error: null };
 }
 
 function emptyMesh(): MeshData {
   return {
-    positions: new Float32Array(0),
-    indices: new Uint32Array(0),
-    vertexCount: 0,
+    surfaces: [],
     triangleCount: 0,
     residual: NaN,
     isovalueSpread: NaN,
