@@ -174,7 +174,7 @@ the WASM field against a native reference. Native↔WASM agreement was verified 
 
 ## Tests
 
-`cargo test` runs 36 tests:
+`cargo test` runs 41 tests:
 
 | file | covers |
 |------|--------|
