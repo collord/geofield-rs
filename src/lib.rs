@@ -9,6 +9,7 @@
 
 pub mod assemble;
 pub mod data;
+pub mod evaluate;
 pub mod geometry;
 pub mod kernel;
 pub mod solve;
