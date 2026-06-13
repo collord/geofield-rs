@@ -656,34 +656,71 @@ fn add_skirt(tree: &Octree, mesh: &mut Mesh) {
             cells.insert(key, (id, fv));
         }
 
-        // Stitch: for each boundary cell, connect to its neighbor in +u and +v
-        // along the face (skirt panel), plus tie its own interior vertex to its
-        // face vertex.
-        let step_keys: Vec<(i64, i64)> = cells.keys().cloned().collect();
-        for k in step_keys {
+        // Point-locator over boundary cells: map a sampled (u,v) on the face to
+        // the boundary cell covering it (by quantized containment). Built from the
+        // collected cells so it spans mixed sizes (handles 2:1 along the face).
+        let locate = |su: f64, sv: f64| -> Option<(NodeId, u32)> {
+            for (&(_ku, _kv), &(nid, nfv)) in cells.iter() {
+                let (nmin, nsz) = tree.bounds[nid];
+                if su >= nmin[u] - 1e-6
+                    && su <= nmin[u] + nsz + 1e-6
+                    && sv >= nmin[v] - 1e-6
+                    && sv <= nmin[v] + nsz + 1e-6
+                {
+                    return Some((nid, nfv));
+                }
+            }
+            None
+        };
+
+        // Stitch by face-minimal-edge: for each boundary cell, its +u and +v
+        // face edges. Sample just past the edge to find the abutting cell(s). A
+        // coarse cell facing two finer cells abuts both — sample at the two
+        // quarter points to catch each, and emit a skirt panel per distinct
+        // neighbor. Only the finer side processes a transition edge (the coarse
+        // side's single sample would emit a duplicate), so we skip a neighbor
+        // that is strictly larger than this cell.
+        let cell_keys: Vec<(i64, i64)> = cells.keys().cloned().collect();
+        for k in cell_keys {
             let (id, fv) = cells[&k];
-            let lsize = tree.bounds[id].1;
-            let du = qkey(lsize, finest);
+            let (lmin, lsize) = (tree.bounds[id].0, tree.bounds[id].1);
             let int_v = match &tree.nodes[id] {
                 Node::Leaf(l) => l.out_index,
                 _ => continue,
             };
-            // neighbor in +u and +v (same-size assumption, stage 1)
-            for &(dku, dkv) in &[(du, 0i64), (0i64, du)] {
-                let nk = (k.0 + dku, k.1 + dkv);
-                if let Some(&(nid, nfv)) = cells.get(&nk) {
-                    let nint = match &tree.nodes[nid] {
-                        Node::Leaf(l) => l.out_index,
-                        _ => continue,
-                    };
-                    // Skirt panel quad: interiorA, faceA, faceB, interiorB.
-                    // orient_to_gradient fixes winding.
-                    emit_quad(mesh, int_v, fv, nfv, nint);
+            let eps = finest * 0.5;
+            // For each of the two in-face directions (+u, +v), the shared edge is
+            // the cell's far side in that direction; sample two points along it on
+            // the neighbor side.
+            for dirsel in 0..2 {
+                let (da, db) = if dirsel == 0 { (u, v) } else { (v, u) };
+                // edge is at da = lmin[da] + lsize (the +da side), spanning db.
+                let edge_a = lmin[da] + lsize + eps;
+                let mut emitted: std::collections::HashSet<NodeId> =
+                    std::collections::HashSet::new();
+                for frac in [0.25, 0.75] {
+                    let edge_b = lmin[db] + lsize * frac;
+                    let mut sp = [0.0; 3];
+                    sp[da] = edge_a;
+                    sp[db] = edge_b;
+                    if let Some((nid, nfv)) = locate(sp[u], sp[v]) {
+                        if nid == id || emitted.contains(&nid) {
+                            continue;
+                        }
+                        // Skip strictly-larger neighbor: the smaller cell owns the
+                        // transition edge (avoids duplicate panels).
+                        if tree.bounds[nid].1 > lsize + 1e-6 {
+                            continue;
+                        }
+                        emitted.insert(nid);
+                        let nint = match &tree.nodes[nid] {
+                            Node::Leaf(l) => l.out_index,
+                            _ => continue,
+                        };
+                        emit_quad(mesh, int_v, fv, nfv, nint);
+                    }
                 }
             }
-            // tie interior to face vertex handled implicitly by the panels above,
-            // but emit a degenerate-safe direct connection where a panel exists.
-            let _ = int_v;
         }
     }
 }
