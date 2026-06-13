@@ -96,7 +96,54 @@ pub fn octree_dual_contour(
     // Crack-free contouring by minimal-edge iteration (2:1 balance guarantees
     // each surface-crossing minimal edge is shared by exactly 4 leaves).
     contour_edges(&tree, &mut mesh);
+    // Final orientation pass: the per-edge winding is locally consistent but can
+    // flip whole patches at transitions, leaving normals that disagree across the
+    // surface (visible as dark bands). The field gradient points toward
+    // increasing field EVERYWHERE, so we flip any triangle whose geometric normal
+    // disagrees with the gradient at its centroid — giving globally coherent
+    // outward normals independent of the edge bookkeeping.
+    orient_to_gradient(model, &mut mesh);
     mesh
+}
+
+/// Flip each triangle whose geometric normal opposes the field gradient at its
+/// centroid, so all faces are oriented toward increasing field.
+fn orient_to_gradient(model: &Model, mesh: &mut Mesh) {
+    let pos = |i: u32| {
+        let b = (i as usize) * 3;
+        [
+            mesh.positions[b] as f64,
+            mesh.positions[b + 1] as f64,
+            mesh.positions[b + 2] as f64,
+        ]
+    };
+    let tri_count = mesh.indices.len() / 3;
+    for t in 0..tri_count {
+        let i0 = mesh.indices[3 * t];
+        let i1 = mesh.indices[3 * t + 1];
+        let i2 = mesh.indices[3 * t + 2];
+        let a = pos(i0);
+        let b = pos(i1);
+        let c = pos(i2);
+        let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+        let ac = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+        let n = [
+            ab[1] * ac[2] - ab[2] * ac[1],
+            ab[2] * ac[0] - ab[0] * ac[2],
+            ab[0] * ac[1] - ab[1] * ac[0],
+        ];
+        let ctr = [
+            (a[0] + b[0] + c[0]) / 3.0,
+            (a[1] + b[1] + c[1]) / 3.0,
+            (a[2] + b[2] + c[2]) / 3.0,
+        ];
+        let g = model.scalar_field_gradient(ctr);
+        if n[0] * g[0] + n[1] * g[1] + n[2] * g[2] < 0.0 {
+            // Reverse winding (swap two vertices).
+            mesh.indices[3 * t + 1] = i2;
+            mesh.indices[3 * t + 2] = i1;
+        }
+    }
 }
 
 /// Sample the field at a node's 8 corners (field − isovalue).
@@ -609,7 +656,7 @@ mod tests {
     /// regressing. (Measured with the same edge/winding stats used during the
     /// fix; thresholds are generous — the real numbers are ≪ them.)
     #[test]
-    fn curved_surface_is_crack_free_and_consistently_wound() {
+    fn curved_surface_is_crack_free_wound_and_oriented() {
         use std::collections::HashMap;
         // A paraboloid bowl interface — strong curvature → adaptive refinement.
         let mut sps = Vec::new();
@@ -669,6 +716,43 @@ mod tests {
             }
         }
         assert_eq!(bad, 0, "inconsistent winding on {bad} edges");
+
+        // Globally coherent normals: EVERY face normal must agree with the field
+        // gradient at its centroid (the orient_to_gradient pass). Edge-paired
+        // winding alone does NOT guarantee this — a fully flipped patch passes the
+        // winding check but shades dark; this assertion is what actually catches
+        // the misoriented-normal bug.
+        let posn = |i: u32| {
+            let b = (i as usize) * 3;
+            [
+                mesh.positions[b] as f64,
+                mesh.positions[b + 1] as f64,
+                mesh.positions[b + 2] as f64,
+            ]
+        };
+        let mut backward = 0;
+        for t in mesh.indices.chunks_exact(3) {
+            let a = posn(t[0]);
+            let b = posn(t[1]);
+            let c = posn(t[2]);
+            let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+            let ac = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+            let n = [
+                ab[1] * ac[2] - ab[2] * ac[1],
+                ab[2] * ac[0] - ab[0] * ac[2],
+                ab[0] * ac[1] - ab[1] * ac[0],
+            ];
+            let ctr = [
+                (a[0] + b[0] + c[0]) / 3.0,
+                (a[1] + b[1] + c[1]) / 3.0,
+                (a[2] + b[2] + c[2]) / 3.0,
+            ];
+            let g = model.scalar_field_gradient(ctr);
+            if n[0] * g[0] + n[1] * g[1] + n[2] * g[2] < 0.0 {
+                backward += 1;
+            }
+        }
+        assert_eq!(backward, 0, "{backward} triangles oriented against the gradient");
     }
 }
 
