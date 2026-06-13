@@ -336,6 +336,11 @@ fn add_nuggets(sys: &mut System) {
 /// error. We use the form that satisfies the invariant; the step-5 block diff
 /// against gempy's actual U_SP border is the authority. The eval-side drift
 /// basis (evaluate.rs) is the matching plain monomial `{x, y, z}`.
+///
+/// This decision is pinned by `tests/increment_consistency.rs`: a positive test
+/// (within-interface field spread ≤ 1e-7 across the model progression) plus a
+/// negative control that re-injects the rejected `−gi_res` form and asserts the
+/// spread blows up (> 1e-4). If either changes, revisit this border.
 fn assemble_drift_border(sys: &mut System) {
     // U_G: ug = e_dim · e_u = (dim == u).
     for dim in 0..3 {
