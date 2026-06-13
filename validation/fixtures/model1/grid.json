@@ -1,0 +1,18 @@
+{
+  "extent": [
+    0.0,
+    1000.0,
+    0.0,
+    1000.0,
+    0.0,
+    1000.0
+  ],
+  "resolution": [
+    50,
+    50,
+    50
+  ],
+  "n_points": 125000,
+  "ordering": "rows of grid.npy; z fastest, then y, then x (gempy cell centers)",
+  "note": "Rust evaluates at grid.npy points directly \u2014 order is authoritative."
+}

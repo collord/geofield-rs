@@ -7,6 +7,8 @@ dependencies = [
     "numpy>=1.26",
     "gempy>=3",
     "gempy_engine",
+    "pooch>=1.9.0",
+    "pandas>=2,<3",
 ]
 
 # uv-managed env. Create/refresh with:  cd validation && uv sync

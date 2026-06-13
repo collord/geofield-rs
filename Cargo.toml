@@ -16,15 +16,25 @@ license = "MIT OR Apache-2.0"
 # wasm32 (usize = u32). 0.24 fixes this; the Lblt/Solve API is unchanged.
 faer = { version = "0.24", default-features = false, features = ["std", "linalg", "npy"] }
 wasm-bindgen = { version = "0.2", optional = true }
+# Fixture I/O for the geofield-cli validation binary (feature = "cli").
+npyz = { version = "0.8", optional = true }
+serde_json = { version = "1", optional = true }
 
 [features]
 default = []
 # Native builds opt into rayon for parallel BLAS; wasm omits it.
 native-parallel = ["faer/rayon"]
 wasm = ["dep:wasm-bindgen"]
+# The validation CLI (geofield-cli) reads/writes .npy + .json fixtures.
+cli = ["dep:npyz", "dep:serde_json"]
 
 [lib]
 crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "geofield-cli"
+path = "src/bin/geofield_cli.rs"
+required-features = ["cli"]
 
 [dev-dependencies]
 # Fixture I/O for the validation tests (gempy dumps .npy + .json).

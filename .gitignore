@@ -5,3 +5,7 @@ Cargo.lock
 /pkg-node
 # gempy parity env (uv-managed; pyproject.toml + uv.lock are committed)
 /validation/.venv
+# fixture binaries are large + regenerable by run_model1_validation.py; the
+# small input/options/provenance JSON+CSV in each fixture dir stay tracked.
+/validation/fixtures/**/*.npy
+/validation/fixtures/**/rust_*.json
