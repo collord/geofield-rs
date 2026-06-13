@@ -3,3 +3,5 @@ Cargo.lock
 # wasm-pack build outputs
 /pkg
 /pkg-node
+# gempy parity env (uv-managed; pyproject.toml + uv.lock are committed)
+/validation/.venv

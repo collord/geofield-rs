@@ -1,0 +1,18 @@
+[project]
+name = "geofield-validation"
+version = "0.0.0"
+description = "gempy parity fixtures for geofield-rs (not part of the crate build)"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=1.26",
+    "gempy>=3",
+    "gempy_engine",
+]
+
+# uv-managed env. Create/refresh with:  cd validation && uv sync
+# Run the fixture generator with:        cd validation && uv run python make_fixtures.py
+# The .venv is gitignored; pyproject.toml + uv.lock are committed for repro.
+[tool.uv]
+# gempy_engine main may be needed rather than a release; if so, pin it here, e.g.
+#   [tool.uv.sources]
+#   gempy_engine = { git = "https://github.com/gempy-project/gempy_engine", branch = "main" }
