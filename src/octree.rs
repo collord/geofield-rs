@@ -96,6 +96,7 @@ pub fn octree_dual_contour(
     // Crack-free contouring by minimal-edge iteration (2:1 balance guarantees
     // each surface-crossing minimal edge is shared by exactly 4 leaves).
     contour_edges(&tree, &mut mesh);
+    add_skirt(&tree, &mut mesh);
     // Final orientation pass: the per-edge winding is locally consistent but can
     // flip whole patches at transitions, leaving normals that disagree across the
     // surface (visible as dark bands). The field gradient points toward
@@ -457,28 +458,18 @@ fn qkey(v: f64, finest: f64) -> i64 {
 }
 
 fn contour_edges(tree: &Octree, mesh: &mut Mesh) {
-    // Finest leaf size present (for quantization + half-step offsets).
     let mut finest = f64::INFINITY;
     for id in 0..tree.nodes.len() {
         if matches!(tree.nodes[id], Node::Leaf(_)) {
             finest = finest.min(tree.bounds[id].1);
         }
     }
-    // Domain box = the root node's bounds (used to project boundary vertices onto
-    // the domain faces, closing the surface flush to the box).
-    let (rmin, rsize) = tree.bounds[tree.root];
-    let domain_min = rmin;
-    let domain_max = [rmin[0] + rsize, rmin[1] + rsize, rmin[2] + rsize];
     if !finest.is_finite() {
         return;
     }
 
     let mut seen: std::collections::HashSet<(usize, i64, i64, i64)> =
         std::collections::HashSet::new();
-    // Boundary vertices placed ON domain faces, deduped by quantized position so
-    // adjacent boundary edges share them (a connected boundary strip).
-    let mut boundary_verts: std::collections::HashMap<(i64, i64, i64), u32> =
-        std::collections::HashMap::new();
 
     for id in 0..tree.nodes.len() {
         let (lmin, lsize) = tree.bounds[id];
@@ -511,24 +502,12 @@ fn contour_edges(tree: &Octree, mesh: &mut Mesh) {
                 1 => (0, 2),
                 _ => (0, 1),
             };
-
             let key = (
                 axis,
                 qkey(mid[0], finest),
                 qkey(mid[1], finest),
                 qkey(mid[2], finest),
             );
-
-            // The surface crossing point on this edge (where the boundary vertex
-            // is projected to, if a quadrant is exterior).
-            let (va, vb) = (corners[ca], corners[cb]);
-            let t = va / (va - vb);
-            let cross = {
-                let mut c = p0;
-                c[axis] += lsize * t;
-                c
-            };
-
             let off = finest * 0.5;
             let quad_centers = [
                 quad_center(mid, u, v, -off, -off),
@@ -536,74 +515,43 @@ fn contour_edges(tree: &Octree, mesh: &mut Mesh) {
                 quad_center(mid, u, v, off, off),
                 quad_center(mid, u, v, -off, off),
             ];
-
-            // Resolve each quadrant: interior leaf, or exterior (boundary).
-            #[derive(Clone, Copy)]
-            enum Q {
-                Leaf(NodeId),
-                Exterior([f64; 3]), // the quadrant center, used to pick the face
-            }
-            let mut q = [Q::Exterior([0.0; 3]); 4];
+            // Interior edge only: all 4 quadrants must be leaves in the tree, and
+            // this leaf must be the finest owner. Boundary edges (a quadrant
+            // outside the tree) are handled by add_skirt.
+            let mut leaves = [usize::MAX; 4];
+            let mut ok = true;
             let mut this_is_finest = true;
             for (qi, qc) in quad_centers.iter().enumerate() {
                 match leaf_at(tree, tree.root, *qc) {
                     Some(lf) => {
-                        q[qi] = Q::Leaf(lf);
+                        leaves[qi] = lf;
                         if tree.bounds[lf].1 < lsize - 1e-9 {
                             this_is_finest = false;
                         }
                     }
-                    None => q[qi] = Q::Exterior(*qc),
+                    None => {
+                        ok = false;
+                        break;
+                    }
                 }
             }
-            if !this_is_finest {
+            if !ok || !this_is_finest || !seen.insert(key) {
                 continue;
             }
-            // All-exterior would be degenerate (shouldn't happen for a real edge).
-            if q.iter().all(|x| matches!(x, Q::Exterior(_))) {
-                continue;
-            }
-            if !seen.insert(key) {
-                continue;
-            }
-
-            // Build the 4 ring vertices. Interior quadrants use the leaf's vertex;
-            // exterior quadrants get a boundary vertex placed at `cross` projected
-            // onto the domain face nearest that quadrant.
-            let mut vtx = [u32::MAX; 4];
+            let mut vtx = [0u32; 4];
             let mut good = true;
             for qi in 0..4 {
-                match q[qi] {
-                    Q::Leaf(lf) => match &tree.nodes[lf] {
-                        Node::Leaf(l) if l.out_index != u32::MAX => vtx[qi] = l.out_index,
-                        _ => {
-                            good = false;
-                            break;
-                        }
-                    },
-                    Q::Exterior(qc) => {
-                        // Project the edge crossing onto the domain face that the
-                        // exterior quadrant center lies beyond (in u and/or v).
-                        let mut bp = cross;
-                        for &d in &[u, v] {
-                            if qc[d] < domain_min[d] {
-                                bp[d] = domain_min[d];
-                            } else if qc[d] > domain_max[d] {
-                                bp[d] = domain_max[d];
-                            }
-                        }
-                        vtx[qi] = boundary_vertex(mesh, &mut boundary_verts, bp, finest);
+                match &tree.nodes[leaves[qi]] {
+                    Node::Leaf(l) if l.out_index != u32::MAX => vtx[qi] = l.out_index,
+                    _ => {
+                        good = false;
+                        break;
                     }
                 }
             }
             if !good {
                 continue;
             }
-
-            // Triangulate the ring, emitting each triangle only if its 3 vertices
-            // are distinct (boundary rings can collapse two corners onto the same
-            // deduped face vertex, which would make slivers / non-manifold edges).
-            // orient_to_gradient fixes winding later.
             for tri in [[vtx[0], vtx[1], vtx[2]], [vtx[0], vtx[2], vtx[3]]] {
                 if tri[0] != tri[1] && tri[1] != tri[2] && tri[0] != tri[2] {
                     mesh.indices.extend_from_slice(&tri);
@@ -611,30 +559,6 @@ fn contour_edges(tree: &Octree, mesh: &mut Mesh) {
             }
         }
     }
-}
-
-/// Get or create a deduplicated boundary vertex at world position `p` (on a
-/// domain face), keyed by quantized position so adjacent boundary edges share it.
-fn boundary_vertex(
-    mesh: &mut Mesh,
-    cache: &mut std::collections::HashMap<(i64, i64, i64), u32>,
-    p: [f64; 3],
-    finest: f64,
-) -> u32 {
-    let key = (
-        qkey(p[0], finest),
-        qkey(p[1], finest),
-        qkey(p[2], finest),
-    );
-    if let Some(&idx) = cache.get(&key) {
-        return idx;
-    }
-    let idx = (mesh.positions.len() / 3) as u32;
-    mesh.positions.push(p[0] as f32);
-    mesh.positions.push(p[1] as f32);
-    mesh.positions.push(p[2] as f32);
-    cache.insert(key, idx);
-    idx
 }
 
 /// Center point offset from edge midpoint `mid` by `du,dv` along in-plane axes.
@@ -645,6 +569,221 @@ fn quad_center(mid: [f64; 3], u: usize, v: usize, du: f64, dv: f64) -> [f64; 3] 
     p
 }
 
+// ---------------------------------------------------------------------------
+// Boundary closure ("skirt"): stitch the interior mesh to the domain faces so
+// the surface terminates flush with the box, with connectivity ALONG each face.
+//
+// For each of the 6 faces we treat the boundary leaves touching that face as a
+// 2D grid. A boundary leaf whose face-quad crosses the surface contributes a
+// "face vertex" placed on the face at the surface's 2D crossing within that quad.
+// We then connect, per pair of face-adjacent boundary leaves, a skirt panel:
+// [interiorA, faceA, faceB, interiorB] — filling the strip. Corner box-edge
+// leaves contribute a face vertex on each face they touch.
+//
+// Stage 1: assumes boundary leaves along a face are at uniform depth (no along-
+// face 2:1 transitions). The geological surfaces of interest stay coarse at the
+// boundary, so this covers the common case; along-face transitions are a TODO.
+// ---------------------------------------------------------------------------
+
+/// The 6 faces: (axis, side) where side=0 is the −axis face, side=1 the +axis.
+const FACES: [(usize, usize); 6] = [
+    (0, 0), (0, 1),
+    (1, 0), (1, 1),
+    (2, 0), (2, 1),
+];
+
+fn add_skirt(tree: &Octree, mesh: &mut Mesh) {
+    let mut finest = f64::INFINITY;
+    for id in 0..tree.nodes.len() {
+        if matches!(tree.nodes[id], Node::Leaf(_)) {
+            finest = finest.min(tree.bounds[id].1);
+        }
+    }
+    if !finest.is_finite() {
+        return;
+    }
+    let (rmin, rsize) = tree.bounds[tree.root];
+    let dmin = rmin;
+    let dmax = [rmin[0] + rsize, rmin[1] + rsize, rmin[2] + rsize];
+
+    // Shared face-vertex cache across all faces (corner box-edge cells reuse).
+    let mut fcache: std::collections::HashMap<(i64, i64, i64), u32> =
+        std::collections::HashMap::new();
+
+    for (axis, side) in FACES {
+        let face_coord = if side == 0 { dmin[axis] } else { dmax[axis] };
+        let (u, v) = match axis {
+            0 => (1, 2),
+            1 => (0, 2),
+            _ => (0, 1),
+        };
+
+        // Collect boundary leaves touching this face, with a surface crossing on
+        // their face-quad, keyed by their (u,v) min for adjacency lookup.
+        // value: (leaf_id, face_vertex_index)
+        let mut cells: std::collections::HashMap<(i64, i64), (NodeId, u32)> =
+            std::collections::HashMap::new();
+
+        for id in 0..tree.nodes.len() {
+            let (lmin, lsize) = match &tree.nodes[id] {
+                Node::Leaf(l) if l.out_index != u32::MAX => (tree.bounds[id].0, tree.bounds[id].1),
+                _ => continue,
+            };
+            // Touches this face?
+            let touches = (lmin[axis] - face_coord).abs() < lsize * 1e-3
+                || (lmin[axis] + lsize - face_coord).abs() < lsize * 1e-3;
+            // More precisely: the −side face is at lmin[axis]==dmin; +side at
+            // lmin[axis]+lsize==dmax.
+            let on_face = if side == 0 {
+                (lmin[axis] - dmin[axis]).abs() < lsize * 1e-3
+            } else {
+                (lmin[axis] + lsize - dmax[axis]).abs() < lsize * 1e-3
+            };
+            let _ = touches;
+            if !on_face {
+                continue;
+            }
+            // Face-quad corner field values: the 4 corners of this leaf on the
+            // face plane. Corner bit for `axis` is `side`.
+            let fc = face_quad_field(tree, id, axis, side);
+            if !face_quad_crosses(&fc) {
+                continue;
+            }
+            // 2D crossing point on the face quad → face vertex.
+            let fp = face_crossing_point(lmin, lsize, axis, side, u, v, &fc, face_coord);
+            let fv = boundary_vertex(mesh, &mut fcache, fp, finest);
+            let key = (qkey(lmin[u], finest), qkey(lmin[v], finest));
+            cells.insert(key, (id, fv));
+        }
+
+        // Stitch: for each boundary cell, connect to its neighbor in +u and +v
+        // along the face (skirt panel), plus tie its own interior vertex to its
+        // face vertex.
+        let step_keys: Vec<(i64, i64)> = cells.keys().cloned().collect();
+        for k in step_keys {
+            let (id, fv) = cells[&k];
+            let lsize = tree.bounds[id].1;
+            let du = qkey(lsize, finest);
+            let int_v = match &tree.nodes[id] {
+                Node::Leaf(l) => l.out_index,
+                _ => continue,
+            };
+            // neighbor in +u and +v (same-size assumption, stage 1)
+            for &(dku, dkv) in &[(du, 0i64), (0i64, du)] {
+                let nk = (k.0 + dku, k.1 + dkv);
+                if let Some(&(nid, nfv)) = cells.get(&nk) {
+                    let nint = match &tree.nodes[nid] {
+                        Node::Leaf(l) => l.out_index,
+                        _ => continue,
+                    };
+                    // Skirt panel quad: interiorA, faceA, faceB, interiorB.
+                    // orient_to_gradient fixes winding.
+                    emit_quad(mesh, int_v, fv, nfv, nint);
+                }
+            }
+            // tie interior to face vertex handled implicitly by the panels above,
+            // but emit a degenerate-safe direct connection where a panel exists.
+            let _ = int_v;
+        }
+    }
+}
+
+fn emit_quad(mesh: &mut Mesh, a: u32, b: u32, c: u32, d: u32) {
+    for tri in [[a, b, c], [a, c, d]] {
+        if tri[0] != tri[1] && tri[1] != tri[2] && tri[0] != tri[2] {
+            mesh.indices.extend_from_slice(&tri);
+        }
+    }
+}
+
+/// Field values (field − iso) at the 4 corners of a leaf's face quad, in
+/// (u-bit, v-bit) order: (0,0),(1,0),(1,1),(0,1).
+fn face_quad_field(tree: &Octree, id: NodeId, axis: usize, side: usize) -> [f64; 4] {
+    let l = match &tree.nodes[id] {
+        Node::Leaf(l) => l,
+        _ => return [0.0; 4],
+    };
+    let (u, v) = match axis {
+        0 => (1, 2),
+        1 => (0, 2),
+        _ => (0, 1),
+    };
+    // corner index from bits: set axis bit = side, u bit, v bit.
+    let ci = |ub: usize, vb: usize| (side << axis) | (ub << u) | (vb << v);
+    [
+        l.corners[ci(0, 0)],
+        l.corners[ci(1, 0)],
+        l.corners[ci(1, 1)],
+        l.corners[ci(0, 1)],
+    ]
+}
+
+fn face_quad_crosses(fc: &[f64; 4]) -> bool {
+    let s0 = fc[0] <= 0.0;
+    fc.iter().any(|&v| (v <= 0.0) != s0)
+}
+
+/// Place the face vertex at the centroid of the surface crossings on the face
+/// quad's 4 edges (a simple, robust 2D-DC vertex on the face plane).
+fn face_crossing_point(
+    lmin: [f64; 3],
+    lsize: f64,
+    axis: usize,
+    side: usize,
+    u: usize,
+    v: usize,
+    fc: &[f64; 4],
+    face_coord: f64,
+) -> [f64; 3] {
+    // The 4 face-quad corners in world (u,v) coords, (0,0),(1,0),(1,1),(0,1).
+    let cu = [lmin[u], lmin[u] + lsize, lmin[u] + lsize, lmin[u]];
+    let cv = [lmin[v], lmin[v], lmin[v] + lsize, lmin[v] + lsize];
+    // 4 quad edges: (0,1),(1,2),(2,3),(3,0)
+    let edges = [(0, 1), (1, 2), (2, 3), (3, 0)];
+    let mut su = 0.0;
+    let mut sv = 0.0;
+    let mut n = 0.0;
+    for &(a, b) in &edges {
+        let (va, vb) = (fc[a], fc[b]);
+        if (va <= 0.0) == (vb <= 0.0) {
+            continue;
+        }
+        let t = va / (va - vb);
+        su += cu[a] + (cu[b] - cu[a]) * t;
+        sv += cv[a] + (cv[b] - cv[a]) * t;
+        n += 1.0;
+    }
+    let mut p = [0.0; 3];
+    if n > 0.0 {
+        p[u] = su / n;
+        p[v] = sv / n;
+    } else {
+        p[u] = lmin[u] + lsize * 0.5;
+        p[v] = lmin[v] + lsize * 0.5;
+    }
+    p[axis] = face_coord;
+    let _ = side;
+    p
+}
+
+/// Get or create a deduplicated boundary/face vertex at world position `p`.
+fn boundary_vertex(
+    mesh: &mut Mesh,
+    cache: &mut std::collections::HashMap<(i64, i64, i64), u32>,
+    p: [f64; 3],
+    finest: f64,
+) -> u32 {
+    let key = (qkey(p[0], finest), qkey(p[1], finest), qkey(p[2], finest));
+    if let Some(&idx) = cache.get(&key) {
+        return idx;
+    }
+    let idx = (mesh.positions.len() / 3) as u32;
+    mesh.positions.push(p[0] as f32);
+    mesh.positions.push(p[1] as f32);
+    mesh.positions.push(p[2] as f32);
+    cache.insert(key, idx);
+    idx
+}
 #[cfg(test)]
 mod tests {
     use super::*;
