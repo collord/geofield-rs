@@ -8,4 +8,5 @@
 //! triple (step 1) is implemented.
 
 pub mod data;
+pub mod geometry;
 pub mod kernel;
