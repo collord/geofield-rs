@@ -126,11 +126,20 @@ fn run(dir: &Path) -> Result<(), String> {
     );
 
     // Scalar field + lithology unit at each gempy grid point, in gempy's order.
+    //
+    // gempy numbers lithology units 1..=n_units in DESCENDING scalar order
+    // (highest scalar value → unit 1; basement → highest id). Our Lithology uses
+    // 0-indexed ASCENDING (lowest scalar → unit 0). The geometry is identical;
+    // only the label convention differs. Remap to gempy's so rust_litho.npy
+    // compares directly: gempy_id = n_units − our_id  (verified 100% voxel
+    // agreement on model1).
+    let n_units = model.lithology().n_units();
     let mut field = Vec::with_capacity(grid.len());
     let mut litho = Vec::with_capacity(grid.len());
     for p in &grid {
         field.push(model.scalar_field(*p));
-        litho.push(model.lithology_unit(*p) as f64);
+        let our_id = model.lithology_unit(*p);
+        litho.push((n_units - our_id) as f64);
     }
 
     write_npy_1d(&dir.join("rust_scalar_field.npy"), &field)?;
@@ -275,23 +284,36 @@ fn read_kernel_options(dir: &Path) -> Result<KernelOptions, String> {
     })
 }
 
-/// Read the (N,3) grid.npy gempy evaluated, in world coords, preserving order.
+/// Read the (N,3) grid.npy gempy evaluated, in world coords, preserving row order.
+///
+/// CRITICAL: gempy's `regular_grid.values` is **Fortran-ordered**, and `np.save`
+/// records that in the npy header. A Fortran (N,3) buffer is column-major —
+/// `[all x, all y, all z]` — NOT row-major `[x0,y0,z0, x1,...]`. Reading it with
+/// `chunks_exact(3)` (C-order assumption) scrambles every coordinate (the bug
+/// that made the field look constant per column). We honor `npy.order()` and
+/// de-interleave accordingly.
 fn read_grid(dir: &Path) -> Result<Vec<[f64; 3]>, String> {
     let path = dir.join("grid.npy");
     let bytes = std::fs::read(&path).map_err(|e| format!("reading {}: {e}", path.display()))?;
     let npy = npyz::NpyFile::new(&bytes[..]).map_err(|e| format!("grid.npy: {e}"))?;
     let shape = npy.shape().to_vec();
+    let order = npy.order();
+    if shape.len() == 2 && shape[1] != 3 {
+        return Err(format!("grid.npy shape {shape:?} — expected (N,3)"));
+    }
     let flat: Vec<f64> = npy.into_vec::<f64>().map_err(|e| format!("grid.npy data: {e}"))?;
     if flat.len() % 3 != 0 {
         return Err(format!("grid.npy length {} not divisible by 3", flat.len()));
     }
-    // Sanity: if shape is recorded, confirm trailing dim is 3.
-    if let Some(&last) = shape.last() {
-        if shape.len() == 2 && last != 3 {
-            return Err(format!("grid.npy shape {shape:?} — expected (N,3)"));
-        }
-    }
-    Ok(flat.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect())
+    let n = flat.len() / 3;
+    let pts = match order {
+        npyz::Order::C => flat.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect(),
+        // Fortran/column-major: element (i,j) lives at index j*n + i.
+        npyz::Order::Fortran => (0..n)
+            .map(|i| [flat[i], flat[n + i], flat[2 * n + i]])
+            .collect(),
+    };
+    Ok(pts)
 }
 
 fn write_npy_1d(path: &Path, data: &[f64]) -> Result<(), String> {

@@ -1,48 +1,43 @@
-//! Increment-consistency regression probe (self-consistency guard).
+//! Increment-consistency regression probe (necessary guard — NOT a correctness
+//! oracle).
 //!
-//! ## What this proves
+//! ## What this proves — and the hard lesson about what it does NOT
 //! In the increment formulation, all surface points of one interface constrain
-//! the scalar field to a single common (unknown) value for that interface. So a
-//! correctly assembled dual system MUST satisfy `Z(rest) = Z(ref)` — i.e. equal
-//! recovered field value across every surface point on an interface — to ~1e-9.
-//! This is the *defining property* of the formulation, not a gempy convention,
-//! so it holds independently of any reference implementation.
+//! the scalar field toward a common value for that interface, so a sane dual
+//! system keeps the within-interface field spread small. This probe checks that.
 //!
-//! ## Why it exists (the finding, 2026-06-13)
-//! `KERNEL_MATH.md` §4.1 transcribes the U_SP drift border as
-//! `−selector·gi_res·(usp_rest − usp_ref)`. With that `−gi_res` factor the
-//! assembled system is internally inconsistent: the solved predictor cannot
-//! reproduce `Z(rest) = Z(ref)`, leaving the within-interface spread at
-//! `≈ 7e-3`. Switching U_SP to the plain basis difference `(rest[u] − ref[u])`
-//! drives the spread to `≈ 1e-9` (machine precision). The production assembler
-//! (`src/assemble.rs::assemble_drift_border`) deliberately uses the plain form;
-//! see the loud DIVERGENCE comment there. This test pins that decision so no
-//! future change (degree-2 drift, multi-series, a border refactor, a different
-//! nugget) can silently reintroduce the defect.
+//! ⚠ FOUND INSUFFICIENT-ALONE (the U_SP/RHS misdiagnosis, 2026-06-13). An earlier
+//! session used this probe to *validate* a sign/scale fix. That was the precise
+//! error it now warns against. Two bugs — a `1/scale`-scaled RHS and a `−gi_res`-
+//! dropped U_SP border — were **mutually compensating**: together they produced a
+//! field that was a *valid potential* (smooth, solvable, self-consistent: spread
+//! ≈ 1e-9) but was NOT gempy's potential. The probe passed at 1e-9 *because the
+//! system was wrong in a self-cancelling way*. Only the block diff against gempy
+//! (`validation/dump_kernel.py`) localized it.
 //!
-//! ## Scope — read before trusting a pass
-//! This probe is **invariant to the global scale and level of the field**: it
-//! only checks that points on one interface agree with each other, which any
-//! affine rescaling of Z preserves. It therefore does NOT prove agreement with
-//! gempy's isovalue *magnitudes*. It is a self-consistency guard only. It must
-//! never substitute for:
-//!   - the step-5 block-by-block diff against gempy's assembled K/border, which
-//!     remains the authority on whether the U_SP divergence is gempy-faithful or
-//!     merely internally consistent; nor
-//!   - the isovalue-magnitude / RHS-scaling check (KERNEL_MATH.md §7.4).
-//! A pass here does NOT close the U_SP open item flagged in `assemble.rs`.
+//! The corrected, gempy-faithful assembly (raw-pole RHS, `−gi_res` U_SP per §4.1,
+//! single-axis CG_SP, nuggets inside c_o) has within-interface spread on the
+//! order of `~2e-6` — *larger* than the wrong system's artificial 1e-9. That is
+//! the tell: a tiny non-flatness is the real field's behavior; near-perfect
+//! flatness was the symptom of the compensating-error field. So this probe is
+//! demoted to one NECESSARY condition among several. The AUTHORITIES are:
+//!   - `validation/dump_kernel.py` — block diff vs gempy's K/b (assembly);
+//!   - `validation/run_model1_validation.py` — field/litho diff vs gempy (eval).
+//! Do NOT use a pass here to conclude a sign/scale convention is correct.
+//! See the cross-referenced history note in `src/assemble.rs`.
 
 use geofield_rs::assemble::{assemble, KernelOptions, System};
 use geofield_rs::data::{Orientation, Series, SurfacePoint};
 use geofield_rs::evaluate::Field;
 use geofield_rs::solve::{solve, Solution};
 
-/// Within-interface spread that a correctly assembled system must stay under.
-/// The correct form reaches ≈1e-9; 1e-7 leaves headroom for larger models and
-/// conditioning while staying ~5 orders below the 7e-3 defect, so a regression
-/// fails loudly. Do NOT loosen this to accommodate a red test — if it goes red
-/// the assembly is wrong, not the tolerance.
-const TOL_INCREMENT: f64 = 1e-7;
+/// Within-interface spread the corrected (gempy-faithful) system stays under.
+/// Calibrated to the CORRECT field's behavior (~2e-6 on the tiny model), with
+/// headroom — NOT to the wrong system's artificial 1e-9. `1e-4` catches the
+/// `~7e-3` gross-defect class while admitting the real field's small spread.
+/// Tightening this toward 1e-9 would (perversely) re-prefer the compensating-
+/// error field; do not.
+const TOL_INCREMENT: f64 = 1e-4;
 
 /// A named reference model in the progression. Inputs mirror the geometries
 /// `validation/make_fixtures.py` emits (tiny / flat3 / dipping); we build them
@@ -195,55 +190,64 @@ fn within_interface_field_is_consistent_across_models() {
 }
 
 // ---------------------------------------------------------------------------
-// NEGATIVE CONTROL — regression lock on the probe itself.
+// NEGATIVE CONTROL — INVERTED (regression lock on the U_SP border convention).
 //
-// Re-assembles the dipping model, then overwrites ONLY the U_SP drift border
-// with the REJECTED `−gi_res·(rest[u] − ref[u])` form from KERNEL_MATH.md §4.1,
-// re-solves, and asserts the within-interface spread blows up (> 1e-4). This
-// proves the probe can actually DETECT the defect — so a future refactor cannot
-// quietly neuter the positive test into always-passing. The rejected form lives
-// only here, never in the production assembly path.
+// The original control asserted the `−gi_res` U_SP form *broke* the increment
+// probe — i.e. it locked in the WRONG (step-7) fix. The block diff proved the
+// opposite: gempy uses `−gi_res·(rest − ref)` (§4.1) and that is correct; the
+// plain `(rest − ref)` form (the step-7 fix) is the defect.
+//
+// So this control is inverted: it pins that the production assembler emits
+// gempy's `−gi_res·(rest − ref)` U_SP border, and that the rejected plain
+// `(rest − ref)` form would DIFFER from it. This keeps the regression lock on
+// the invariant that was actually in question — U_SP must match gempy's border,
+// which `validation/dump_kernel.py` confirmed to ratio 1.0 / max|Δ|=0. The
+// rejected form lives only here, never in the production path.
 // ---------------------------------------------------------------------------
 
-/// Overwrite the U_SP border (SP-row ↔ drift-col block, both symmetric halves)
-/// of an already-assembled system with the rejected `−gi_res`-scaled form.
-fn apply_rejected_usp(sys: &mut System) {
-    let gi_res = sys.geom.opts.gi_res;
-    let dim = sys.dim;
-    for k in 0..sys.geom.n_sp_inc {
-        let (rest, refp) = sys.geom.sp_increments[k];
-        let si = sys.geom.sp_index(k);
-        for u in 0..3 {
-            let ui = sys.geom.uni_index(u);
-            let v = -gi_res * (rest[u] - refp[u]); // the rejected §4.1 form
-            sys.k[si * dim + ui] = v;
-            sys.k[ui * dim + si] = v;
-        }
-    }
-}
-
 #[test]
-fn negative_control_rejected_usp_breaks_consistency() {
-    // Dipping model (multi-point interface) — same geometry as the positive test.
+fn negative_control_usp_border_is_gempy_minus_gi_res_form() {
     let series = models()
         .into_iter()
         .find(|m| m.name == "dipping")
         .unwrap()
         .series;
 
-    let mut sys = assemble(&series, KernelOptions::default());
-    apply_rejected_usp(&mut sys); // inject the defect
-    let sol = solve(&sys);
+    let sys = assemble(&series, KernelOptions::default());
+    let gi_res = sys.geom.opts.gi_res;
 
-    let spreads = within_interface_spreads(&series, &sys, &sol);
-    let max_spread = spreads.iter().map(|(_, s)| *s).fold(0.0_f64, f64::max);
-    eprintln!("negative control (rejected −gi_res U_SP): max spread = {max_spread:.3e}");
+    let mut any_nonzero = false;
+    for k in 0..sys.geom.n_sp_inc {
+        let (rest, refp) = sys.geom.sp_increments[k];
+        let si = sys.geom.sp_index(k);
+        for u in 0..3 {
+            let ui = sys.geom.uni_index(u);
+            let produced = sys.at(si, ui);
+            let gempy_form = -gi_res * (rest[u] - refp[u]); // §4.1, the correct one
+            let rejected_form = rest[u] - refp[u]; // the plain step-7 fix
+            if gempy_form.abs() > 1e-12 {
+                any_nonzero = true;
+            }
 
-    assert!(
-        max_spread > 1e-4,
-        "NEGATIVE CONTROL FAILED: the rejected −gi_res U_SP form should break \
-         increment consistency (spread > 1e-4) but the spread was only {max_spread:e}. \
-         The probe can no longer detect the defect it was written to catch — \
-         investigate before trusting the positive test."
-    );
+            // Production must emit gempy's −gi_res form, bit-for-bit.
+            assert!(
+                (produced - gempy_form).abs() < 1e-12,
+                "U_SP[{si},{ui}] = {produced} != gempy −gi_res form {gempy_form}. \
+                 The drift border must match gempy (validation/dump_kernel.py is \
+                 the authority); do not revert to the plain step-7 form."
+            );
+            // And where the entry is nonzero it must NOT equal the rejected plain
+            // form (gi_res = 2 ≠ 1, so they differ wherever rest != ref — the lock
+            // that catches a re-regression). They legitimately coincide at 0 when
+            // rest[u] == ref[u], so only check nonzero entries.
+            if gempy_form.abs() > 1e-12 {
+                assert!(
+                    (produced - rejected_form).abs() > 1e-12,
+                    "U_SP[{si},{ui}] equals the REJECTED plain (rest−ref) form — the \
+                     step-7 misdiagnosis has been reintroduced. See assemble.rs history."
+                );
+            }
+        }
+    }
+    assert!(any_nonzero, "control vacuous: all U_SP entries zero");
 }

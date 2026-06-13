@@ -28,7 +28,7 @@
 //! internal consistency regardless of any global factor error.
 
 use crate::assemble::AssembledGeometry;
-use crate::geometry::{huv, kernel_arg_dist, r2};
+use crate::geometry::{kernel_arg_dist, r2};
 use crate::kernel::{cubic_a, cubic_c, cubic_p_div_r};
 use crate::solve::Solution;
 
@@ -53,6 +53,15 @@ impl<'a> Field<'a> {
     }
 
     /// Scalar field at a point already in the **normalized** box.
+    ///
+    /// Re-derived from gempy's evaluation kernel `create_scalar_kernel`
+    /// (degree 1) so the predictor is the faithful dual of the *corrected*
+    /// assembly (raw-pole RHS, −gi_res U_SP, single-axis CG_SP, nuggets inside
+    /// c_o). Per gempy:
+    ///   sigma_0_grad_sp = gi_res · hu_ref · k_p_ref          (hu_ref=(ori−x)[di])
+    ///   sigma_0_sp      = −i_res · (k_rest_rest − k_ref_ref) (value-point form)
+    ///   cov             = c_o·(sigma_0_sp + sigma_0_grad_sp) + uni_drift
+    ///   uni_drift       = gi_res · x[u]                       (degree-1 linear basis)
     pub fn scalar_field_norm(&self, x: [f64; 3]) -> f64 {
         let a = self.geom.opts.range;
         let c_o = self.geom.opts.c_o;
@@ -61,37 +70,30 @@ impl<'a> Field<'a> {
 
         let mut z = 0.0;
 
-        // Gradient functionals.
+        // Gradient functionals: c_o·gi_res·(ori − x)[dim]·(C'/r).
         for o in 0..self.geom.n_ori {
             let ori = self.geom.ori_pos[o];
             let r = kernel_arg_dist(r2(x, ori));
             let k_p = cubic_p_div_r(r, a); // C'(r)/r
-            // separation x − ori (value point vs orientation).
-            let d = [x[0] - ori[0], x[1] - ori[1], x[2] - ori[2]];
             for dim in 0..3 {
                 let w = self.weights[self.geom.grad_index(dim, o)];
-                // Leading minus: κ_grad(x) must satisfy
-                //   κ_grad(rest) − κ_grad(ref) = K_{sp,grad}
-                //     = gi_res·(huv(ref−ori)·k_p_ref − huv(rest−ori)·k_p_rest),
-                // which forces κ_grad(x) = −gi_res·huv(x−ori)·k_p(‖x−ori‖)
-                // (×c_o, matching the c_o-scaled CG_SP block). See module docs.
-                z += -w * c_o * gi_res * huv(d, dim) * k_p;
+                z += w * c_o * gi_res * (ori[dim] - x[dim]) * k_p;
             }
         }
 
-        // Surface-point increments.
+        // Surface-point increments: c_o·(−i_res)·(C(‖x−rest‖) − C(‖x−ref‖)).
         for k in 0..self.geom.n_sp_inc {
             let (rest, refp) = self.geom.sp_increments[k];
             let c_rest = cubic_c(kernel_arg_dist(r2(x, rest)), a);
             let c_ref = cubic_c(kernel_arg_dist(r2(x, refp)), a);
             let w = self.weights[self.geom.sp_index(k)];
-            z += w * c_o * i_res * (c_rest - c_ref);
+            z += w * c_o * (-i_res) * (c_rest - c_ref);
         }
 
-        // Degree-1 drift: linear basis {x, y, z}.
+        // Degree-1 drift: gi_res · linear basis {x, y, z}.
         for u in 0..3 {
             let w = self.weights[self.geom.uni_index(u)];
-            z += w * x[u];
+            z += w * gi_res * x[u];
         }
 
         z
@@ -116,36 +118,31 @@ impl<'a> Field<'a> {
 
         let mut g = [0.0_f64; 3];
 
-        // Gradient functionals: term = c_o·gi_res·w·huv(x−ori,dim)·(C'/r).
-        // huv(x−ori,dim) = 2·(x−ori)[dim]; so term = c_o·gi_res·w·2·(x−ori)[dim]·(C'/r).
-        // ∂/∂x_e of [ (x−ori)[dim] · k_p(r) ] where k_p = C'(r)/r:
-        //   = δ(e,dim)·k_p + (x−ori)[dim] · dk_p/dx_e.
-        // dk_p/dx_e = (dk_p/dr)·∂r/∂x_e, with ∂r/∂x_e = (x−ori)[e]/r.
-        // dk_p/dr = d(C'/r)/dr = (C'' − C'/r)/r = (k_a − k_p)/r.
+        // Gradient functionals: term = c_o·gi_res·w·(ori − x)[dim]·k_p(r), r=‖x−ori‖.
+        // Let d = x − ori, so (ori − x)[dim] = −d[dim]. ∂r/∂x_e = d[e]/r,
+        // dk_p/dr = d(C'/r)/dr = (k_a − k_p)/r.
+        // ∂/∂x_e [ −d[dim]·k_p ] = −δ(e,dim)·k_p − d[dim]·(dk_p/dr)·d[e]/r.
         for o in 0..self.geom.n_ori {
             let ori = self.geom.ori_pos[o];
-            let rr2 = r2(x, ori);
-            let r = kernel_arg_dist(rr2);
+            let r = kernel_arg_dist(r2(x, ori));
             let k_p = cubic_p_div_r(r, a);
             let k_a = cubic_a(r, a);
             let dkp_dr = (k_a - k_p) / r; // d(C'/r)/dr
             let d = [x[0] - ori[0], x[1] - ori[1], x[2] - ori[2]];
             for dim in 0..3 {
                 let w = self.weights[self.geom.grad_index(dim, o)];
-                // Leading minus mirrors scalar_field_norm (faithful dual).
-                let coeff = -w * c_o * gi_res * 2.0; // huv = 2·d[dim]
+                let coeff = w * c_o * gi_res;
                 for e in 0..3 {
                     let delta = if e == dim { 1.0 } else { 0.0 };
-                    // ∂/∂x_e [ d[dim] · k_p ]
                     let dr_dxe = d[e] / r;
-                    let term = delta * k_p + d[dim] * dkp_dr * dr_dxe;
+                    let term = -delta * k_p - d[dim] * dkp_dr * dr_dxe;
                     g[e] += coeff * term;
                 }
             }
         }
 
-        // Surface-point increments: term = c_o·i_res·w·(C(‖x−rest‖) − C(‖x−ref‖)).
-        // ∂/∂x_e C(‖x−p‖) = C'(r)·(x−p)[e]/r = (C'/r)·(x−p)[e] = k_p·(x−p)[e].
+        // Surface-point increments: term = c_o·(−i_res)·w·(C(‖x−rest‖) − C(‖x−ref‖)).
+        // ∂/∂x_e C(‖x−p‖) = (C'/r)·(x−p)[e] = k_p·(x−p)[e].
         for k in 0..self.geom.n_sp_inc {
             let (rest, refp) = self.geom.sp_increments[k];
             let w = self.weights[self.geom.sp_index(k)];
@@ -153,7 +150,7 @@ impl<'a> Field<'a> {
             let r_ref = kernel_arg_dist(r2(x, refp));
             let kp_rest = cubic_p_div_r(r_rest, a);
             let kp_ref = cubic_p_div_r(r_ref, a);
-            let coeff = w * c_o * i_res;
+            let coeff = w * c_o * (-i_res);
             for e in 0..3 {
                 let g_rest = kp_rest * (x[e] - rest[e]);
                 let g_ref = kp_ref * (x[e] - refp[e]);
@@ -161,9 +158,9 @@ impl<'a> Field<'a> {
             }
         }
 
-        // Drift: ∂/∂x_e [ Σ_u w_u · x_u ] = w_e.
+        // Drift: ∂/∂x_e [ Σ_u w_u · gi_res · x_u ] = gi_res · w_e.
         for e in 0..3 {
-            g[e] += self.weights[self.geom.uni_index(e)];
+            g[e] += gi_res * self.weights[self.geom.uni_index(e)];
         }
 
         g
