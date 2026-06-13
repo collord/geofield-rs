@@ -6,12 +6,25 @@ description = "Universal-cokriging scalar field (single series, non-faulted) —
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-# Added now per build plan; not yet used until the solve step.
-faer = "0.21"
+# Trim faer to std + dense linalg + npy: its default `rand` feature pulls in
+# getrandom (breaks wasm32-unknown-unknown) and `rayon` has no wasm threads, so
+# both are dropped. `npy` is kept because faer 0.21.9's src/io.rs references npyz
+# unconditionally (not gated by the feature), so disabling it fails to compile;
+# npyz is pure-Rust and wasm-safe. The Bunch-Kaufman solver lives under `linalg`.
+# faer 0.24+: 0.21's faer-traits sets `type Index = u64` for the f64
+# ComplexField but only impls Index for u32/usize, so `u64: Index` fails on
+# wasm32 (usize = u32). 0.24 fixes this; the Lblt/Solve API is unchanged.
+faer = { version = "0.24", default-features = false, features = ["std", "linalg", "npy"] }
+wasm-bindgen = { version = "0.2", optional = true }
 
 [features]
 default = []
-wasm = []
+# Native builds opt into rayon for parallel BLAS; wasm omits it.
+native-parallel = ["faer/rayon"]
+wasm = ["dep:wasm-bindgen"]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
 
 [dev-dependencies]
 # Fixture I/O for the validation tests (gempy dumps .npy + .json).

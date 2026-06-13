@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>geofield-rs — WASM vs native parity harness</title>
+  <style>
+    body { font: 14px/1.5 ui-monospace, monospace; margin: 2rem; }
+    table { border-collapse: collapse; margin-top: 1rem; }
+    th, td { border: 1px solid #ccc; padding: 4px 8px; text-align: right; }
+    .ok { color: #137333; } .bad { color: #c5221f; font-weight: bold; }
+    #verdict { font-size: 1.2rem; margin-top: 1rem; }
+  </style>
+</head>
+<body>
+  <h1>geofield-rs WASM parity harness</h1>
+  <p>Fits the dipping single-layer model in WASM and compares the field,
+     gradient, and lithology against the native Rust reference
+     (<code>examples/web/reference.json</code>). The WASM and native paths run the
+     identical <code>Model</code> code, so agreement should be at f64 round-trip
+     precision.</p>
+  <div id="verdict">Running…</div>
+  <table id="results"></table>
+
+  <script type="module">
+    // Build first:  wasm-pack build --target web --out-dir pkg -- --features wasm
+    // Serve from repo root: python3 -m http.server, then open
+    //   /examples/web/index.html
+    import init, { WasmModel } from "../../pkg/geofield_rs.js";
+
+    const NAN = Number.NaN;
+    const TOL = 1e-9;
+
+    async function main() {
+      await init();
+
+      // Same dipping model as examples/single_layer.rs / dump_reference.rs.
+      const sp_xyz = new Float64Array([
+        0,0,1.0,  1,0,1.3,  0,1,1.05,  1,1,1.35,
+      ]);
+      const sp_interface = new Float64Array([0,0,0,0]);
+      const ori_xyz  = new Float64Array([0.25,0.5,1.1,  0.75,0.5,1.25]);
+      const ori_pole = new Float64Array([-0.3,0,1.0,   -0.3,0,1.0]);
+
+      // NaN options -> use crate defaults (range=1.7, c_o=10, i_res=4, gi_res=2,
+      // uni_degree=1, nugget=1e-5).
+      const model = new WasmModel(
+        sp_xyz, sp_interface, ori_xyz, ori_pole,
+        NAN, NAN, NAN, NAN, 1, NAN,
+      );
+
+      const ref = await (await fetch("./reference.json")).json();
+
+      const table = document.getElementById("results");
+      table.innerHTML =
+        "<tr><th>point</th><th>field Δ</th><th>|grad Δ|</th><th>unit</th></tr>";
+      let worst = 0, allOk = true;
+
+      for (const row of ref.points) {
+        const [x,y,z] = row.p;
+        const f = model.scalar_field(x,y,z);
+        const g = model.scalar_field_gradient(x,y,z);
+        const u = model.lithology_unit(x,y,z);
+
+        const df = Math.abs(f - row.field);
+        let dg = 0;
+        for (let i=0;i<3;i++) dg = Math.max(dg, Math.abs(g[i]-row.grad[i]));
+        worst = Math.max(worst, df, dg);
+        const unitOk = u === row.unit;
+        const ok = df < TOL && dg < TOL && unitOk;
+        allOk = allOk && ok;
+
+        const tr = document.createElement("tr");
+        tr.innerHTML =
+          `<td>[${x}, ${y}, ${z}]</td>` +
+          `<td class="${df<TOL?'ok':'bad'}">${df.toExponential(2)}</td>` +
+          `<td class="${dg<TOL?'ok':'bad'}">${dg.toExponential(2)}</td>` +
+          `<td class="${unitOk?'ok':'bad'}">${u} vs ${row.unit}</td>`;
+        table.appendChild(tr);
+      }
+
+      const v = document.getElementById("verdict");
+      v.textContent = allOk
+        ? `✅ WASM matches native (worst Δ = ${worst.toExponential(2)} ≤ ${TOL})`
+        : `❌ WASM diverges from native (worst Δ = ${worst.toExponential(2)})`;
+      v.className = allOk ? "ok" : "bad";
+    }
+
+    main().catch(e => {
+      document.getElementById("verdict").textContent = "Error: " + e;
+      document.getElementById("verdict").className = "bad";
+    });
+  </script>
+</body>
+</html>
