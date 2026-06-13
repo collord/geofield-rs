@@ -64,20 +64,18 @@ normals):
   point-locating the 4 quadrant centers), each emitting one quad. Flat regions
   stay coarse, curved regions refine. (This replaces the recursive
   cellProc/faceProc/edgeProc of Ju et al. 2002, whose transition tables are
-  error-prone; the edge-iteration form is regression-tested crack-free and
-  consistently wound on a refined curved surface.)
+  error-prone.) Regression-tested for no holes, consistent winding, and
+  gradient-coherent normals on a refined curved surface.
+
+  **Boundary closure:** where the surface meets a domain face, boundary vertices
+  are placed *on* the face at the field crossing, so the mesh terminates flush
+  with the domain box (a clean clipped boundary in plan view) instead of ending
+  raggedly inside it. Verified: vertices reach the domain extent, none escape it,
+  and the closed mesh has zero non-manifold edges.
 
 Both are exposed over WASM (`mesh_isosurface`, `mesh_isosurface_octree`). The
 `web/` harness uses the octree path, meshing one surface per interface at its
 recovered isovalue (the geological contacts).
-
-> **Known limitation.** The octree contourer is crack-free and consistently
-> wound (regression-tested: boundary edges only at the open-sheet perimeter,
-> zero winding inconsistencies). Vanilla dual contouring can still leave a *very*
-> small number of **non-manifold edges** (>2 faces meeting) at the deepest
-> transition cells — < 0.1% on a strongly curved test surface. These render
-> correctly; fully eliminating them requires Manifold Dual Contouring (Schaefer
-> et al. 2007), which is not implemented.
 
 ## Public API
 
@@ -247,7 +245,7 @@ geometric effect.
 | scalar field + analytic gradient | ✅ field matches gempy (affine, `2.7e-15`) |
 | lithology | ✅ 100% voxel agreement vs gempy |
 | WASM | ✅ builds + native parity `1.2e-15` |
-| isosurface meshing (uniform + adaptive octree DC) | ✅ crack-free; minor non-manifold edges at deepest level |
+| isosurface meshing (uniform + adaptive octree DC) | ✅ crack-free, oriented, boundary-closed to the domain |
 | faults / multi-series solve | ⛔ out of scope |
 | degree-2 drift | ⛔ seam only |
 

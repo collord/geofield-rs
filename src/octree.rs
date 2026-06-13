@@ -464,12 +464,21 @@ fn contour_edges(tree: &Octree, mesh: &mut Mesh) {
             finest = finest.min(tree.bounds[id].1);
         }
     }
+    // Domain box = the root node's bounds (used to project boundary vertices onto
+    // the domain faces, closing the surface flush to the box).
+    let (rmin, rsize) = tree.bounds[tree.root];
+    let domain_min = rmin;
+    let domain_max = [rmin[0] + rsize, rmin[1] + rsize, rmin[2] + rsize];
     if !finest.is_finite() {
         return;
     }
 
     let mut seen: std::collections::HashSet<(usize, i64, i64, i64)> =
         std::collections::HashSet::new();
+    // Boundary vertices placed ON domain faces, deduped by quantized position so
+    // adjacent boundary edges share them (a connected boundary strip).
+    let mut boundary_verts: std::collections::HashMap<(i64, i64, i64), u32> =
+        std::collections::HashMap::new();
 
     for id in 0..tree.nodes.len() {
         let (lmin, lsize) = tree.bounds[id];
@@ -478,13 +487,10 @@ fn contour_edges(tree: &Octree, mesh: &mut Mesh) {
             _ => continue,
         };
 
-        // For each of the 12 cell edges with a sign change, treat it as a
-        // candidate minimal edge.
         for &(ca, cb) in CELL_EDGES.iter() {
             if (corners[ca] <= 0.0) == (corners[cb] <= 0.0) {
                 continue;
             }
-            // Edge axis = the bit that differs between ca and cb.
             let diff = ca ^ cb;
             let axis = match diff {
                 1 => 0,
@@ -492,100 +498,143 @@ fn contour_edges(tree: &Octree, mesh: &mut Mesh) {
                 4 => 2,
                 _ => continue,
             };
-            // Edge endpoints in world coords.
             let (ax, ay, az) = corner_offset(ca);
             let p0 = [
                 lmin[0] + ax as f64 * lsize,
                 lmin[1] + ay as f64 * lsize,
                 lmin[2] + az as f64 * lsize,
             ];
-            // Edge midpoint.
             let mut mid = p0;
             mid[axis] += lsize * 0.5;
-            // The two in-plane axes.
             let (u, v) = match axis {
                 0 => (1, 2),
                 1 => (0, 2),
                 _ => (0, 1),
             };
 
-            // Dedup key: only the finest leaf owning this edge should process it.
-            // Quantize the midpoint. If a finer leaf shares this edge, skip — it
-            // will (or did) process it at the finer resolution.
             let key = (
                 axis,
                 qkey(mid[0], finest),
                 qkey(mid[1], finest),
                 qkey(mid[2], finest),
             );
-            // Only the finest owner emits: check the 4 quadrant leaves; if any is
-            // finer than this leaf, let that one handle it.
-            let off = finest * 0.5; // half a finest-cell step, guaranteed < any leaf
+
+            // The surface crossing point on this edge (where the boundary vertex
+            // is projected to, if a quadrant is exterior).
+            let (va, vb) = (corners[ca], corners[cb]);
+            let t = va / (va - vb);
+            let cross = {
+                let mut c = p0;
+                c[axis] += lsize * t;
+                c
+            };
+
+            let off = finest * 0.5;
             let quad_centers = [
                 quad_center(mid, u, v, -off, -off),
                 quad_center(mid, u, v, off, -off),
                 quad_center(mid, u, v, off, off),
                 quad_center(mid, u, v, -off, off),
             ];
-            let mut leaves = [usize::MAX; 4];
-            let mut ok = true;
+
+            // Resolve each quadrant: interior leaf, or exterior (boundary).
+            #[derive(Clone, Copy)]
+            enum Q {
+                Leaf(NodeId),
+                Exterior([f64; 3]), // the quadrant center, used to pick the face
+            }
+            let mut q = [Q::Exterior([0.0; 3]); 4];
             let mut this_is_finest = true;
             for (qi, qc) in quad_centers.iter().enumerate() {
                 match leaf_at(tree, tree.root, *qc) {
                     Some(lf) => {
-                        leaves[qi] = lf;
+                        q[qi] = Q::Leaf(lf);
                         if tree.bounds[lf].1 < lsize - 1e-9 {
                             this_is_finest = false;
                         }
                     }
-                    None => {
-                        ok = false;
-                        break;
-                    }
+                    None => q[qi] = Q::Exterior(*qc),
                 }
             }
-            if !ok || !this_is_finest {
+            if !this_is_finest {
+                continue;
+            }
+            // All-exterior would be degenerate (shouldn't happen for a real edge).
+            if q.iter().all(|x| matches!(x, Q::Exterior(_))) {
                 continue;
             }
             if !seen.insert(key) {
                 continue;
             }
 
-            // Gather vertices; all 4 must be surface leaves.
-            let mut vtx = [0u32; 4];
+            // Build the 4 ring vertices. Interior quadrants use the leaf's vertex;
+            // exterior quadrants get a boundary vertex placed at `cross` projected
+            // onto the domain face nearest that quadrant.
+            let mut vtx = [u32::MAX; 4];
             let mut good = true;
             for qi in 0..4 {
-                match &tree.nodes[leaves[qi]] {
-                    Node::Leaf(l) if l.out_index != u32::MAX => vtx[qi] = l.out_index,
-                    _ => {
-                        good = false;
-                        break;
+                match q[qi] {
+                    Q::Leaf(lf) => match &tree.nodes[lf] {
+                        Node::Leaf(l) if l.out_index != u32::MAX => vtx[qi] = l.out_index,
+                        _ => {
+                            good = false;
+                            break;
+                        }
+                    },
+                    Q::Exterior(qc) => {
+                        // Project the edge crossing onto the domain face that the
+                        // exterior quadrant center lies beyond (in u and/or v).
+                        let mut bp = cross;
+                        for &d in &[u, v] {
+                            if qc[d] < domain_min[d] {
+                                bp[d] = domain_min[d];
+                            } else if qc[d] > domain_max[d] {
+                                bp[d] = domain_max[d];
+                            }
+                        }
+                        vtx[qi] = boundary_vertex(mesh, &mut boundary_verts, bp, finest);
                     }
                 }
             }
             if !good {
                 continue;
             }
-            // Dedup degenerate cases where two quadrant centers hit the same leaf
-            // (can happen at the box boundary): skip if fewer than 3 distinct.
-            let mut distinct = leaves.to_vec();
-            distinct.sort_unstable();
-            distinct.dedup();
-            if distinct.len() < 3 {
-                continue;
-            }
 
-            // Winding from the edge sign so the front face points up-field.
-            let inside0 = corners[ca] <= 0.0; // sign at the −axis end
-            let (t0, t1) = if inside0 {
-                ([vtx[0], vtx[1], vtx[2]], [vtx[0], vtx[2], vtx[3]])
-            } else {
-                ([vtx[0], vtx[3], vtx[2]], [vtx[0], vtx[2], vtx[1]])
-            };
-            mesh.indices.extend_from_slice(&t0);
-            mesh.indices.extend_from_slice(&t1);
+            // Triangulate the ring, emitting each triangle only if its 3 vertices
+            // are distinct (boundary rings can collapse two corners onto the same
+            // deduped face vertex, which would make slivers / non-manifold edges).
+            // orient_to_gradient fixes winding later.
+            for tri in [[vtx[0], vtx[1], vtx[2]], [vtx[0], vtx[2], vtx[3]]] {
+                if tri[0] != tri[1] && tri[1] != tri[2] && tri[0] != tri[2] {
+                    mesh.indices.extend_from_slice(&tri);
+                }
+            }
         }
     }
+}
+
+/// Get or create a deduplicated boundary vertex at world position `p` (on a
+/// domain face), keyed by quantized position so adjacent boundary edges share it.
+fn boundary_vertex(
+    mesh: &mut Mesh,
+    cache: &mut std::collections::HashMap<(i64, i64, i64), u32>,
+    p: [f64; 3],
+    finest: f64,
+) -> u32 {
+    let key = (
+        qkey(p[0], finest),
+        qkey(p[1], finest),
+        qkey(p[2], finest),
+    );
+    if let Some(&idx) = cache.get(&key) {
+        return idx;
+    }
+    let idx = (mesh.positions.len() / 3) as u32;
+    mesh.positions.push(p[0] as f32);
+    mesh.positions.push(p[1] as f32);
+    mesh.positions.push(p[2] as f32);
+    cache.insert(key, idx);
+    idx
 }
 
 /// Center point offset from edge midpoint `mid` by `du,dv` along in-plane axes.
@@ -678,6 +727,32 @@ mod tests {
         };
         let mesh = octree_dual_contour(&model, [0.0, 0.0, 0.0], 1000.0, 0.0, cfg);
         assert!(mesh.triangle_count() > 100, "expected a refined mesh");
+
+        // Boundary closure: the surface must reach the domain faces — some
+        // vertices lie ON the box (x or y at 0 or 1000), and none escape it.
+        let posb = |i: usize| {
+            [
+                mesh.positions[3 * i] as f64,
+                mesh.positions[3 * i + 1] as f64,
+            ]
+        };
+        let nverts = mesh.positions.len() / 3;
+        let mut on_face = 0;
+        for i in 0..nverts {
+            let [x, y] = posb(i);
+            assert!(
+                x >= -1e-6 && x <= 1000.0 + 1e-6 && y >= -1e-6 && y <= 1000.0 + 1e-6,
+                "vertex {x},{y} escaped the domain box"
+            );
+            if x.abs() < 1.0 || (x - 1000.0).abs() < 1.0 || y.abs() < 1.0 || (y - 1000.0).abs() < 1.0
+            {
+                on_face += 1;
+            }
+        }
+        assert!(
+            on_face > 0,
+            "surface did not reach any domain face (boundary not closed)"
+        );
 
         // Edge stats.
         let mut dir: HashMap<(u32, u32), i32> = HashMap::new();
