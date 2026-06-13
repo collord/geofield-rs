@@ -96,7 +96,13 @@ pub fn octree_dual_contour(
     // Crack-free contouring by minimal-edge iteration (2:1 balance guarantees
     // each surface-crossing minimal edge is shared by exactly 4 leaves).
     contour_edges(&tree, &mut mesh);
-    add_skirt(&tree, &mut mesh);
+    // Boundary closure: a shared face/edge-vertex cache so the per-face skirt and
+    // the corner-wedge pass dedup to the SAME mesh vertices (otherwise the wedge
+    // wouldn't share edges with the strips and corners would still gap).
+    let mut bcache: std::collections::HashMap<(i64, i64, i64), u32> =
+        std::collections::HashMap::new();
+    add_skirt(&tree, &mut mesh, &mut bcache);
+    close_corners(&tree, &mut mesh, &mut bcache);
     // Final orientation pass: the per-edge winding is locally consistent but can
     // flip whole patches at transitions, leaving normals that disagree across the
     // surface (visible as dark bands). The field gradient points toward
@@ -592,7 +598,11 @@ const FACES: [(usize, usize); 6] = [
     (2, 0), (2, 1),
 ];
 
-fn add_skirt(tree: &Octree, mesh: &mut Mesh) {
+fn add_skirt(
+    tree: &Octree,
+    mesh: &mut Mesh,
+    fcache: &mut std::collections::HashMap<(i64, i64, i64), u32>,
+) {
     let mut finest = f64::INFINITY;
     for id in 0..tree.nodes.len() {
         if matches!(tree.nodes[id], Node::Leaf(_)) {
@@ -605,10 +615,6 @@ fn add_skirt(tree: &Octree, mesh: &mut Mesh) {
     let (rmin, rsize) = tree.bounds[tree.root];
     let dmin = rmin;
     let dmax = [rmin[0] + rsize, rmin[1] + rsize, rmin[2] + rsize];
-
-    // Shared face-vertex cache across all faces (corner box-edge cells reuse).
-    let mut fcache: std::collections::HashMap<(i64, i64, i64), u32> =
-        std::collections::HashMap::new();
 
     for (axis, side) in FACES {
         let face_coord = if side == 0 { dmin[axis] } else { dmax[axis] };
@@ -651,7 +657,7 @@ fn add_skirt(tree: &Octree, mesh: &mut Mesh) {
             }
             // 2D crossing point on the face quad → face vertex.
             let fp = face_crossing_point(lmin, lsize, axis, side, u, v, &fc, face_coord);
-            let fv = boundary_vertex(mesh, &mut fcache, fp, finest);
+            let fv = boundary_vertex(mesh, fcache, fp, finest);
             let key = (qkey(lmin[u], finest), qkey(lmin[v], finest));
             cells.insert(key, (id, fv));
         }
@@ -731,6 +737,140 @@ fn emit_quad(mesh: &mut Mesh, a: u32, b: u32, c: u32, d: u32) {
             mesh.indices.extend_from_slice(&tri);
         }
     }
+}
+
+/// Close the wedge at each of the 12 box edges (where two domain faces meet).
+/// A cell sitting on a box edge gets, in addition to its two face vertices, a
+/// vertex placed ON the box edge at the surface crossing; we fan the cell's
+/// interior vertex + the two face vertices to that box-edge vertex, filling the
+/// corner notch the per-face skirts leave open.
+fn close_corners(
+    tree: &Octree,
+    mesh: &mut Mesh,
+    fcache: &mut std::collections::HashMap<(i64, i64, i64), u32>,
+) {
+    let mut finest = f64::INFINITY;
+    for id in 0..tree.nodes.len() {
+        if matches!(tree.nodes[id], Node::Leaf(_)) {
+            finest = finest.min(tree.bounds[id].1);
+        }
+    }
+    if !finest.is_finite() {
+        return;
+    }
+    let (rmin, rsize) = tree.bounds[tree.root];
+    let dmin = rmin;
+    let dmax = [rmin[0] + rsize, rmin[1] + rsize, rmin[2] + rsize];
+
+    // The 12 box edges: edge axis `e`, and the two other axes pinned to a domain
+    // side. We enumerate by (e, side_a, side_b) where the two non-`e` axes a<b.
+    for e in 0..3 {
+        let (a, b) = match e {
+            0 => (1usize, 2usize),
+            1 => (0, 2),
+            _ => (0, 1),
+        };
+        for sa in 0..2 {
+            for sb in 0..2 {
+                let pin_a = if sa == 0 { dmin[a] } else { dmax[a] };
+                let pin_b = if sb == 0 { dmin[b] } else { dmax[b] };
+
+                for id in 0..tree.nodes.len() {
+                    let (lmin, lsize) = match &tree.nodes[id] {
+                        Node::Leaf(l) if l.out_index != u32::MAX => {
+                            (tree.bounds[id].0, tree.bounds[id].1)
+                        }
+                        _ => continue,
+                    };
+                    let int_v = match &tree.nodes[id] {
+                        Node::Leaf(l) => l.out_index,
+                        _ => continue,
+                    };
+                    // Does this leaf touch this box edge? Its `a` side must be at
+                    // pin_a and its `b` side at pin_b.
+                    let on_a = (lmin[a] - pin_a).abs() < lsize * 1e-3
+                        || (lmin[a] + lsize - pin_a).abs() < lsize * 1e-3;
+                    let on_b = (lmin[b] - pin_b).abs() < lsize * 1e-3
+                        || (lmin[b] + lsize - pin_b).abs() < lsize * 1e-3;
+                    if !on_a || !on_b {
+                        continue;
+                    }
+                    // The cell's edge parallel to `e` lying on the box edge: its
+                    // two endpoints have a-coord=pin_a, b-coord=pin_b, e-coord at
+                    // lmin[e] and lmin[e]+lsize. Read the field there.
+                    let l = match &tree.nodes[id] {
+                        Node::Leaf(l) => l,
+                        _ => continue,
+                    };
+                    // corner bits: a-bit from which a-side pin sits on, etc.
+                    let abit = if (lmin[a] - pin_a).abs() < lsize * 1e-3 { 0 } else { 1 };
+                    let bbit = if (lmin[b] - pin_b).abs() < lsize * 1e-3 { 0 } else { 1 };
+                    let ci = |ebit: usize| (ebit << e) | (abit << a) | (bbit << b);
+                    let (f0, f1) = (l.corners[ci(0)], l.corners[ci(1)]);
+                    if (f0 <= 0.0) == (f1 <= 0.0) {
+                        continue; // surface doesn't cross the box edge here
+                    }
+                    let t = f0 / (f0 - f1);
+                    let mut corner_p = [0.0; 3];
+                    corner_p[a] = pin_a;
+                    corner_p[b] = pin_b;
+                    corner_p[e] = lmin[e] + lsize * t;
+                    let cv = boundary_vertex(mesh, fcache, corner_p, finest);
+
+                    // The cell's two face vertices on the adjacent faces (recompute
+                    // their positions exactly as add_skirt did, then dedup-fetch).
+                    let fv_a = face_vertex_index(tree, mesh, fcache, id, a, abit, finest);
+                    let fv_b = face_vertex_index(tree, mesh, fcache, id, b, bbit, finest);
+
+                    // Fan the wedge: interior + each face vertex to the corner.
+                    if let Some(fa) = fv_a {
+                        emit_tri(mesh, int_v, fa, cv);
+                    }
+                    if let Some(fb) = fv_b {
+                        emit_tri(mesh, int_v, cv, fb);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn emit_tri(mesh: &mut Mesh, a: u32, b: u32, c: u32) {
+    if a != b && b != c && a != c {
+        mesh.indices.extend_from_slice(&[a, b, c]);
+    }
+}
+
+/// Recompute (and dedup-fetch) the face vertex a leaf contributes on the face
+/// (axis, side), matching add_skirt's placement. Returns None if that face quad
+/// doesn't cross the surface.
+fn face_vertex_index(
+    tree: &Octree,
+    mesh: &mut Mesh,
+    cache: &mut std::collections::HashMap<(i64, i64, i64), u32>,
+    id: NodeId,
+    axis: usize,
+    side: usize,
+    finest: f64,
+) -> Option<u32> {
+    let (lmin, lsize) = (tree.bounds[id].0, tree.bounds[id].1);
+    let (rmin, rsize) = tree.bounds[tree.root];
+    let face_coord = if side == 0 {
+        rmin[axis]
+    } else {
+        rmin[axis] + rsize
+    };
+    let (u, v) = match axis {
+        0 => (1, 2),
+        1 => (0, 2),
+        _ => (0, 1),
+    };
+    let fc = face_quad_field(tree, id, axis, side);
+    if !face_quad_crosses(&fc) {
+        return None;
+    }
+    let fp = face_crossing_point(lmin, lsize, axis, side, u, v, &fc, face_coord);
+    Some(boundary_vertex(mesh, cache, fp, finest))
 }
 
 /// Field values (field − iso) at the 4 corners of a leaf's face quad, in
@@ -940,17 +1080,37 @@ mod tests {
                 *undirected.entry(e).or_insert(0) += 1;
             }
         }
-        let boundary = undirected.values().filter(|&&c| c == 1).count();
         let nonmanifold = undirected.values().filter(|&&c| c > 2).count();
         let total = undirected.len();
 
-        // Crack-free: boundary edges are only the open-sheet perimeter, a small
-        // fraction. (Broken contourer hit ~30%+; we require < 10%.)
+        // Interior holes = boundary edges (shared by 1 triangle) whose BOTH
+        // endpoints are off the domain faces. A genuine open-sheet perimeter runs
+        // along the domain faces and is fine; an interior hole (a gap/notch, incl.
+        // unclosed corners) is the actual defect. With boundary closure + corner
+        // wedges this must be ~0. (Distinguishing these two is the metric the
+        // earlier "boundary edge count" check lacked.)
+        let on_face_v = |i: u32| -> bool {
+            let b = (i as usize) * 3;
+            let x = mesh.positions[b] as f64;
+            let y = mesh.positions[b + 1] as f64;
+            let z = mesh.positions[b + 2] as f64;
+            x.abs() < 1.0
+                || (x - 1000.0).abs() < 1.0
+                || y.abs() < 1.0
+                || (y - 1000.0).abs() < 1.0
+                || z.abs() < 1.0
+                || (z - 1000.0).abs() < 1.0
+        };
+        let interior_holes = undirected
+            .iter()
+            .filter(|(_, &c)| c == 1)
+            .filter(|((a, b), _)| !on_face_v(*a) && !on_face_v(*b))
+            .count();
         assert!(
-            (boundary as f64) < 0.10 * (total as f64),
-            "too many boundary edges (holes): {boundary}/{total}"
+            interior_holes <= 2,
+            "interior holes (gaps/unclosed corners): {interior_holes}"
         );
-        // Near-manifold (vanilla DC may leave a tiny number at deepest cells).
+        // Near-manifold (vanilla DC + boundary closure may leave a tiny number).
         assert!(
             (nonmanifold as f64) < 0.02 * (total as f64),
             "too many non-manifold edges: {nonmanifold}/{total}"
