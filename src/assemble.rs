@@ -187,8 +187,13 @@ pub fn assemble(series: &Series, opts: KernelOptions) -> System {
     assemble_cov_grad(&mut sys, a);
     assemble_cov_grad_sp(&mut sys, a);
     assemble_cov_sp(&mut sys, a);
-    scale_by_c_o(&mut sys);
+    // Nuggets are added to the covariance blocks BEFORE the c_o scaling — gempy
+    // folds them into cov_grad / cov_surface_points, then multiplies the sum by
+    // c_o (`cov = c_o*(cov_grad + cov_sp + cov_grad_sp) + drift`). Adding them
+    // after c_o (as a prior version did) left the diagonal short by a factor of
+    // c_o on the nugget term (the 0.9981 CG_CG block-diff ratio). See Step C.
     add_nuggets(&mut sys);
+    scale_by_c_o(&mut sys);
     assemble_drift_border(&mut sys);
     assemble_rhs(&mut sys);
 
@@ -302,8 +307,11 @@ fn scale_by_c_o(sys: &mut System) {
 }
 
 /// Nuggets on the diagonals: gradient nugget on the gradient sub-block diagonal,
-/// SP nugget on the SP sub-block diagonal (§3.1, §3.3). Added after `c_o`
-/// scaling (nuggets are not part of the `c_o`-scaled blocks).
+/// SP nugget on the SP sub-block diagonal (§3.1, §3.3). Added to the covariance
+/// blocks BEFORE `c_o` scaling — gempy folds them into cov_grad /
+/// cov_surface_points and then scales the whole sum by `c_o`, so the nugget
+/// terms are themselves `c_o`-scaled. Values come from `KernelOptions` (read
+/// live from the fixture by the CLI; never hardcoded).
 fn add_nuggets(sys: &mut System) {
     let gn = sys.geom.opts.grad_nugget;
     let sn = sys.geom.opts.sp_nugget;
