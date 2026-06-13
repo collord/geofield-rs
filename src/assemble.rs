@@ -14,7 +14,7 @@
 
 use crate::data::{Series, Transform};
 use crate::geometry::{
-    cg_cg_divisor, debug_assert_within_range, diff, huv, hv, hu, kernel_arg_dist, perp_matrix, r2,
+    cg_cg_divisor, debug_assert_within_range, diff, hv, hu, kernel_arg_dist, perp_matrix, r2,
 };
 use crate::kernel::{cubic_a, cubic_c, cubic_p_div_r};
 
@@ -229,9 +229,15 @@ fn assemble_cov_grad(sys: &mut System, a: f64) {
 /// §3.2 CG_SP — `_get_cross_cov_grad_sp`. Writes both the (grad, sp) block and
 /// its symmetric (sp, grad) transpose.
 ///
-/// `cov_grad_sp = gi_res·(huv_ref·k_p_ref − huv_rest·k_p_rest)`,
-/// with `k_p_ref = C'(r_ref)/r_ref` (orientation↔ref) and
-/// `k_p_rest = C'(r_rest)/r_rest` (orientation↔rest).
+/// `cov_grad_sp = gi_res·(huv_ref·k_p_ref − huv_rest·k_p_rest)`.
+///
+/// CG_SP `huv` convention (confirmed by the gempy block diff + source
+/// `_kernels_assembler._compute_distances_new`): for the gradient↔SP cross
+/// block, `huv_ref` reduces to the **single-axis** separation `(ori − point)[di]`
+/// along the gradient functional's axis `di` — factor **1**, signed `ori − point`.
+/// This is NOT the CG_CG `huv = hu − hv = 2·d` reduction (that helper conflates
+/// the two blocks' selector conventions). Using `huv()` here produced a uniform
+/// `−2×` error vs gempy; this single-axis `(ori − point)[di]` form matches.
 fn assemble_cov_grad_sp(sys: &mut System, a: f64) {
     let gi_res = sys.geom.opts.gi_res;
     for oa in 0..sys.geom.n_ori {
@@ -239,17 +245,15 @@ fn assemble_cov_grad_sp(sys: &mut System, a: f64) {
         for k in 0..sys.geom.n_sp_inc {
             let (rest, refp) = sys.geom.sp_increments[k];
 
-            let d_ref = diff(refp, ori);
-            let d_rest = diff(rest, ori);
-
             let r_ref = kernel_arg_dist(r2(refp, ori));
             let r_rest = kernel_arg_dist(r2(rest, ori));
             let k_p_ref = cubic_p_div_r(r_ref, a);
             let k_p_rest = cubic_p_div_r(r_rest, a);
 
             for di in 0..3 {
-                let huv_ref = huv(d_ref, di);
-                let huv_rest = huv(d_rest, di);
+                // huv = (ori − point)[di], single axis, factor 1.
+                let huv_ref = ori[di] - refp[di];
+                let huv_rest = ori[di] - rest[di];
                 let val = gi_res * (huv_ref * k_p_ref - huv_rest * k_p_rest);
                 let gi = sys.geom.grad_index(di, oa);
                 let si = sys.geom.sp_index(k);
