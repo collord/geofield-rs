@@ -11,3 +11,4 @@ pub mod assemble;
 pub mod data;
 pub mod geometry;
 pub mod kernel;
+pub mod solve;
