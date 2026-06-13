@@ -28,7 +28,7 @@ edit tables (React)
 
 The mesh is **adaptive octree dual contouring** over the WASM-evaluated scalar
 field: refine toward surface detail (QEF residual), 2:1-balance, contour
-crack-free with Ju et al. `edgeProc`. One QEF vertex per cell from the field's
+crack-free by minimal-edge iteration. One QEF vertex per cell from the field's
 analytic gradient (Hermite data). The **octree-depth slider** caps refinement
 (finest cell = extent / 2^depth); flat regions stay coarse, curved regions
 refine. (A uniform contourer also exists in the crate; the harness uses the

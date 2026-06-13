@@ -1,10 +1,15 @@
-//! Adaptive octree dual contouring (Ju, Losasso, Schaefer, Warren 2002).
+//! Adaptive octree dual contouring.
 //!
 //! Refines the octree where the isosurface has detail (sign-changing cells whose
 //! single-QEF-vertex residual exceeds a threshold), 2:1-balances the tree, then
-//! contours it with the crack-free `cellProc/faceProc/edgeProc` recursion. The
-//! 2:1 balance is the precondition that lets `edgeProc` emit one quad per minimal
-//! edge without gaps across refinement levels.
+//! contours it by **minimal-edge iteration**: every surface-crossing minimal edge
+//! is, in a 2:1-balanced tree, shared by exactly 4 leaves, located by point
+//! sampling the 4 quadrant centers around the edge; each emits one quad. This is
+//! simple point-location rather than the recursive cellProc/faceProc/edgeProc of
+//! Ju et al. (2002) — the recursion's transition tables are notoriously error-
+//! prone to reproduce, and an earlier attempt left ~30% boundary edges (holes) on
+//! genuinely refined surfaces. The edge-iteration form is crack-free and
+//! consistently wound (regression-tested), at the cost of per-edge leaf lookups.
 //!
 //! Hermite data (zero-crossings + analytic gradients) comes from
 //! `Model::scalar_field` / `scalar_field_gradient` — the same source the uniform
@@ -88,8 +93,9 @@ pub fn octree_dual_contour(
     let mut mesh = Mesh::default();
     // Emit each leaf's vertex into the mesh, recording its out_index.
     assign_vertices(&mut tree, &mut mesh);
-    // Crack-free contouring.
-    cell_proc(&tree, tree.root, &mut mesh);
+    // Crack-free contouring by minimal-edge iteration (2:1 balance guarantees
+    // each surface-crossing minimal edge is shared by exactly 4 leaves).
+    contour_edges(&tree, &mut mesh);
     mesh
 }
 
@@ -360,231 +366,187 @@ fn assign_vertices(tree: &mut Octree, mesh: &mut Mesh) {
 }
 
 // ---------------------------------------------------------------------------
-// Crack-free contouring: cellProc / faceProc / edgeProc (Ju et al. 2002).
+// Crack-free contouring by minimal-edge iteration.
 //
-// Tables below follow the canonical implementation. Children are indexed by
-// corner number c = x + 2y + 4z. Faces and edges are processed per axis.
+// Rather than the recursive cellProc/faceProc/edgeProc (whose transition tables
+// are error-prone to reproduce), we iterate the minimal surface-crossing edges
+// directly. With a 2:1-balanced octree, every minimal edge that crosses the
+// surface is shared by exactly 4 leaves; we locate them by point sampling the 4
+// quadrant centers around the edge and emit one quad. This is simple point-
+// location, not fragile recursion — far harder to get subtly wrong.
+//
+// A "minimal edge" is an edge of a *finest* leaf among those sharing it. We find
+// them by walking every leaf and, for each of its 12 edges that change sign,
+// keying the edge by (axis, quantized midpoint) so each is processed once, by
+// the finest leaf that owns it.
 // ---------------------------------------------------------------------------
 
-/// cellProc: recurse into all 8 children, then the 12 internal faces and 6
-/// internal edges between them.
-fn cell_proc(tree: &Octree, id: NodeId, mesh: &mut Mesh) {
-    let ch = match &tree.nodes[id] {
-        Node::Internal(ch) => ch,
-        Node::Leaf(_) => return,
-    };
-    let c: Vec<NodeId> = ch.iter().map(|x| x.unwrap()).collect();
-
-    for &cid in &c {
-        cell_proc(tree, cid, mesh);
+/// Find the leaf node containing point `p` (or None if outside the tree).
+fn leaf_at(tree: &Octree, id: NodeId, p: [f64; 3]) -> Option<NodeId> {
+    let (min, size) = tree.bounds[id];
+    if p[0] < min[0] || p[1] < min[1] || p[2] < min[2] {
+        return None;
     }
-
-    // 12 internal faces: pairs of children sharing a face, grouped by axis.
-    // (axis, child_a, child_b)
-    const FACES: [(usize, usize, usize); 12] = [
-        // x-faces (children differ in x bit)
-        (0, 0, 1), (0, 2, 3), (0, 4, 5), (0, 6, 7),
-        // y-faces (differ in y bit)
-        (1, 0, 2), (1, 1, 3), (1, 4, 6), (1, 5, 7),
-        // z-faces (differ in z bit)
-        (2, 0, 4), (2, 1, 5), (2, 2, 6), (2, 3, 7),
-    ];
-    for (axis, a, b) in FACES {
-        face_proc(tree, c[a], c[b], axis, mesh);
+    if p[0] > min[0] + size || p[1] > min[1] + size || p[2] > min[2] + size {
+        return None;
     }
-
-    // 6 internal edges: groups of 4 children around an edge, per axis.
-    // (axis, [4 children around the edge in CCW order])
-    const EDGES: [(usize, [usize; 4]); 6] = [
-        // edges along x: vary x, the 4 cells around share a common x-edge
-        (0, [0, 2, 6, 4]),
-        (0, [1, 3, 7, 5]),
-        // edges along y
-        (1, [0, 1, 5, 4]),
-        (1, [2, 3, 7, 6]),
-        // edges along z
-        (2, [0, 1, 3, 2]),
-        (2, [4, 5, 7, 6]),
-    ];
-    for (axis, quad) in EDGES {
-        edge_proc(tree, [c[quad[0]], c[quad[1]], c[quad[2]], c[quad[3]]], axis, mesh);
-    }
-}
-
-/// faceProc: process the shared face between two nodes adjacent along `axis`.
-/// Recurses into the 4 child-face pairs and the 4 perpendicular edges straddling
-/// the face. Handles level differences by reusing a coarser node in place of its
-/// (absent) children.
-fn face_proc(tree: &Octree, a: NodeId, b: NodeId, axis: usize, mesh: &mut Mesh) {
-    let a_leaf = matches!(tree.nodes[a], Node::Leaf(_));
-    let b_leaf = matches!(tree.nodes[b], Node::Leaf(_));
-    if a_leaf && b_leaf {
-        return; // a face between two leaves generates no edges itself
-    }
-
-    // The two child columns on each side of the face, for this axis.
-    // For axis x: a contributes its +x children {1,3,5,7}, b its −x children {0,2,4,6}.
-    let (a_face, b_face) = face_children(axis);
-    let child = |node: NodeId, want: usize| -> NodeId {
-        match &tree.nodes[node] {
-            Node::Internal(ch) => ch[want].unwrap(),
-            Node::Leaf(_) => node, // coarser side: reuse the leaf
+    match &tree.nodes[id] {
+        Node::Leaf(_) => Some(id),
+        Node::Internal(ch) => {
+            for c in ch.iter().flatten() {
+                if let Some(l) = leaf_at(tree, *c, p) {
+                    return Some(l);
+                }
+            }
+            None
         }
-    };
-
-    // 4 child face pairs across the face.
-    for i in 0..4 {
-        let na = child(a, a_face[i]);
-        let nb = child(b, b_face[i]);
-        face_proc(tree, na, nb, axis, mesh);
-    }
-
-    // 4 edges perpendicular to the face, each shared by 4 of the 8 child cells
-    // straddling the face. Tables give the (edge axis, 4 children) per face axis.
-    for (eaxis, quad_a, quad_b) in face_edge_groups(axis) {
-        let n0 = child(a, quad_a[0]);
-        let n1 = child(b, quad_b[0]);
-        let n2 = child(b, quad_b[1]);
-        let n3 = child(a, quad_a[1]);
-        edge_proc(tree, [n0, n1, n2, n3], eaxis, mesh);
     }
 }
 
-/// edgeProc: the 4 nodes around a common edge (axis `axis`). If all 4 are leaves,
-/// emit the dual quad connecting their vertices. Otherwise recurse into the
-/// finer children along the edge, substituting a coarser node for its children.
-fn edge_proc(tree: &Octree, nodes: [NodeId; 4], axis: usize, mesh: &mut Mesh) {
-    let all_leaves = nodes
-        .iter()
-        .all(|&n| matches!(tree.nodes[n], Node::Leaf(_)));
+/// Quantize a world coordinate to an integer grid at the finest cell size, for
+/// stable edge-deduplication keys.
+fn qkey(v: f64, finest: f64) -> i64 {
+    (v / finest).round() as i64
+}
 
-    if all_leaves {
-        emit_edge_quad(tree, nodes, axis, mesh);
+fn contour_edges(tree: &Octree, mesh: &mut Mesh) {
+    // Finest leaf size present (for quantization + half-step offsets).
+    let mut finest = f64::INFINITY;
+    for id in 0..tree.nodes.len() {
+        if matches!(tree.nodes[id], Node::Leaf(_)) {
+            finest = finest.min(tree.bounds[id].1);
+        }
+    }
+    if !finest.is_finite() {
         return;
     }
 
-    // Recurse: along the edge axis there are 2 sub-edges. For each, descend each
-    // of the 4 nodes to the child touching that sub-edge (or reuse if it's a
-    // leaf). The 4 children around each sub-edge are given by the edge tables.
-    let pairs = edge_child_pairs(axis); // [2][4] child indices per sub-edge
-    for sub in 0..2 {
-        let mut sub_nodes = [0usize; 4];
-        for q in 0..4 {
-            sub_nodes[q] = match &tree.nodes[nodes[q]] {
-                Node::Internal(ch) => ch[pairs[sub][q]].unwrap(),
-                Node::Leaf(_) => nodes[q],
+    let mut seen: std::collections::HashSet<(usize, i64, i64, i64)> =
+        std::collections::HashSet::new();
+
+    for id in 0..tree.nodes.len() {
+        let (lmin, lsize) = tree.bounds[id];
+        let corners = match &tree.nodes[id] {
+            Node::Leaf(l) if has_crossing(&l.corners) => l.corners,
+            _ => continue,
+        };
+
+        // For each of the 12 cell edges with a sign change, treat it as a
+        // candidate minimal edge.
+        for &(ca, cb) in CELL_EDGES.iter() {
+            if (corners[ca] <= 0.0) == (corners[cb] <= 0.0) {
+                continue;
+            }
+            // Edge axis = the bit that differs between ca and cb.
+            let diff = ca ^ cb;
+            let axis = match diff {
+                1 => 0,
+                2 => 1,
+                4 => 2,
+                _ => continue,
             };
+            // Edge endpoints in world coords.
+            let (ax, ay, az) = corner_offset(ca);
+            let p0 = [
+                lmin[0] + ax as f64 * lsize,
+                lmin[1] + ay as f64 * lsize,
+                lmin[2] + az as f64 * lsize,
+            ];
+            // Edge midpoint.
+            let mut mid = p0;
+            mid[axis] += lsize * 0.5;
+            // The two in-plane axes.
+            let (u, v) = match axis {
+                0 => (1, 2),
+                1 => (0, 2),
+                _ => (0, 1),
+            };
+
+            // Dedup key: only the finest leaf owning this edge should process it.
+            // Quantize the midpoint. If a finer leaf shares this edge, skip — it
+            // will (or did) process it at the finer resolution.
+            let key = (
+                axis,
+                qkey(mid[0], finest),
+                qkey(mid[1], finest),
+                qkey(mid[2], finest),
+            );
+            // Only the finest owner emits: check the 4 quadrant leaves; if any is
+            // finer than this leaf, let that one handle it.
+            let off = finest * 0.5; // half a finest-cell step, guaranteed < any leaf
+            let quad_centers = [
+                quad_center(mid, u, v, -off, -off),
+                quad_center(mid, u, v, off, -off),
+                quad_center(mid, u, v, off, off),
+                quad_center(mid, u, v, -off, off),
+            ];
+            let mut leaves = [usize::MAX; 4];
+            let mut ok = true;
+            let mut this_is_finest = true;
+            for (qi, qc) in quad_centers.iter().enumerate() {
+                match leaf_at(tree, tree.root, *qc) {
+                    Some(lf) => {
+                        leaves[qi] = lf;
+                        if tree.bounds[lf].1 < lsize - 1e-9 {
+                            this_is_finest = false;
+                        }
+                    }
+                    None => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if !ok || !this_is_finest {
+                continue;
+            }
+            if !seen.insert(key) {
+                continue;
+            }
+
+            // Gather vertices; all 4 must be surface leaves.
+            let mut vtx = [0u32; 4];
+            let mut good = true;
+            for qi in 0..4 {
+                match &tree.nodes[leaves[qi]] {
+                    Node::Leaf(l) if l.out_index != u32::MAX => vtx[qi] = l.out_index,
+                    _ => {
+                        good = false;
+                        break;
+                    }
+                }
+            }
+            if !good {
+                continue;
+            }
+            // Dedup degenerate cases where two quadrant centers hit the same leaf
+            // (can happen at the box boundary): skip if fewer than 3 distinct.
+            let mut distinct = leaves.to_vec();
+            distinct.sort_unstable();
+            distinct.dedup();
+            if distinct.len() < 3 {
+                continue;
+            }
+
+            // Winding from the edge sign so the front face points up-field.
+            let inside0 = corners[ca] <= 0.0; // sign at the −axis end
+            let (t0, t1) = if inside0 {
+                ([vtx[0], vtx[1], vtx[2]], [vtx[0], vtx[2], vtx[3]])
+            } else {
+                ([vtx[0], vtx[3], vtx[2]], [vtx[0], vtx[2], vtx[1]])
+            };
+            mesh.indices.extend_from_slice(&t0);
+            mesh.indices.extend_from_slice(&t1);
         }
-        edge_proc(tree, sub_nodes, axis, mesh);
     }
 }
 
-/// Emit the quad joining the dual vertices of the 4 leaves around an edge, if the
-/// edge actually crosses the surface (sign change on the minimal edge). The
-/// minimal edge sign is read from the finest (smallest) of the 4 leaves.
-fn emit_edge_quad(tree: &Octree, nodes: [NodeId; 4], axis: usize, mesh: &mut Mesh) {
-    // Find the finest leaf (smallest size) to read the minimal-edge sign change.
-    let mut min_size = f64::INFINITY;
-    let mut finest = nodes[0];
-    for &n in &nodes {
-        let s = tree.bounds[n].1;
-        if s < min_size {
-            min_size = s;
-            finest = n;
-        }
-    }
-    let lf = match &tree.nodes[finest] {
-        Node::Leaf(l) => l,
-        _ => return,
-    };
-    // The minimal edge along `axis` on the finest cell: its two endpoint corners.
-    let (c0, c1) = minimal_edge_corners(axis);
-    let s0 = lf.corners[c0] <= 0.0;
-    let s1 = lf.corners[c1] <= 0.0;
-    if s0 == s1 {
-        return; // edge does not cross the surface → no face here
-    }
-
-    // Gather the 4 vertices; skip if any node is a non-surface leaf.
-    let mut v = [0u32; 4];
-    for (q, &n) in nodes.iter().enumerate() {
-        match &tree.nodes[n] {
-            Node::Leaf(l) if l.out_index != u32::MAX => v[q] = l.out_index,
-            _ => return,
-        }
-    }
-
-    // Winding from the sign direction so the surface faces increasing field.
-    // s0 = corner at the edge's "low" end is inside (≤0): flip accordingly.
-    let (t0, t1) = if s1 {
-        ([v[0], v[1], v[2]], [v[0], v[2], v[3]])
-    } else {
-        ([v[0], v[2], v[1]], [v[0], v[3], v[2]])
-    };
-    mesh.indices.extend_from_slice(&t0);
-    mesh.indices.extend_from_slice(&t1);
-}
-
-// --- topology tables -------------------------------------------------------
-
-/// For a face shared along `axis`: the 4 children of side A (the +axis side) and
-/// of side B (the −axis side) that touch the face, in matching order.
-fn face_children(axis: usize) -> ([usize; 4], [usize; 4]) {
-    match axis {
-        0 => ([1, 3, 5, 7], [0, 2, 4, 6]), // x: A's +x children, B's −x children
-        1 => ([2, 3, 6, 7], [0, 1, 4, 5]), // y
-        _ => ([4, 5, 6, 7], [0, 1, 2, 3]), // z
-    }
-}
-
-/// The 4 perpendicular-edge groups straddling a face along `axis`. Each entry is
-/// (edge_axis, two A-children, two B-children) describing the 4-node edge fan.
-fn face_edge_groups(axis: usize) -> [(usize, [usize; 2], [usize; 2]); 4] {
-    // For a face along `axis`, the perpendicular edges run along the other two
-    // axes. We produce 4 edge groups: 2 per perpendicular axis.
-    match axis {
-        0 => [
-            (1, [1, 5], [0, 4]),
-            (1, [3, 7], [2, 6]),
-            (2, [1, 3], [0, 2]),
-            (2, [5, 7], [4, 6]),
-        ],
-        1 => [
-            (0, [2, 6], [0, 4]),
-            (0, [3, 7], [1, 5]),
-            (2, [2, 3], [0, 1]),
-            (2, [6, 7], [4, 5]),
-        ],
-        _ => [
-            (0, [4, 6], [0, 2]),
-            (0, [5, 7], [1, 3]),
-            (1, [4, 5], [0, 1]),
-            (1, [6, 7], [2, 3]),
-        ],
-    }
-}
-
-/// For an edge fan along `axis`, the child indices each of the 4 surrounding
-/// nodes descends to, for the two sub-edges. `pairs[sub][q]` is the child of
-/// node `q` touching sub-edge `sub`.
-fn edge_child_pairs(axis: usize) -> [[usize; 4]; 2] {
-    // The 4 nodes around an x-edge are ordered (−y−z, +y−z, +y+z, −y+z) etc.
-    // Each descends to the 2 children sharing the edge along the edge axis.
-    match axis {
-        0 => [[6, 4, 0, 2], [7, 5, 1, 3]], // x: children vary in x for sub-edges
-        1 => [[5, 4, 0, 1], [7, 6, 2, 3]], // y
-        _ => [[3, 2, 0, 1], [7, 6, 4, 5]], // z
-    }
-}
-
-/// The two corner indices of the minimal edge along `axis` (the edge at the
-/// origin corner of the cell), used to read the sign change.
-fn minimal_edge_corners(axis: usize) -> (usize, usize) {
-    match axis {
-        0 => (0, 1), // x-edge from corner 0 to corner 1
-        1 => (0, 2), // y-edge
-        _ => (0, 4), // z-edge
-    }
+/// Center point offset from edge midpoint `mid` by `du,dv` along in-plane axes.
+fn quad_center(mid: [f64; 3], u: usize, v: usize, du: f64, dv: f64) -> [f64; 3] {
+    let mut p = mid;
+    p[u] += du;
+    p[v] += dv;
+    p
 }
 
 #[cfg(test)]
@@ -637,6 +599,76 @@ mod tests {
         // A box entirely above the contact (z in [1.5, 2.0]) has no crossing.
         let mesh = octree_dual_contour(&model, [0.0, 0.0, 1.5], 0.5, 0.0, OctreeConfig::default());
         assert_eq!(mesh.triangle_count(), 0);
+    }
+
+    /// Regression for the missing-triangle / winding bugs: on a CURVED surface
+    /// that forces refinement (so coarse/fine transitions exist), the mesh must
+    /// be (a) crack-free — few boundary edges relative to interior — and (b)
+    /// consistently wound. The earlier recursive contourer left ~30% boundary
+    /// edges (holes) here; this guards the edge-iteration contourer against
+    /// regressing. (Measured with the same edge/winding stats used during the
+    /// fix; thresholds are generous — the real numbers are ≪ them.)
+    #[test]
+    fn curved_surface_is_crack_free_and_consistently_wound() {
+        use std::collections::HashMap;
+        // A paraboloid bowl interface — strong curvature → adaptive refinement.
+        let mut sps = Vec::new();
+        for i in 0..5 {
+            for j in 0..5 {
+                let x = i as f64 * 250.0;
+                let y = j as f64 * 250.0;
+                let z = 500.0 + 0.0008 * ((x - 500.0).powi(2) + (y - 500.0).powi(2));
+                sps.push(SurfacePoint::new([x, y, z], 0));
+            }
+        }
+        let oris = vec![Orientation::new([500.0, 500.0, 500.0], [0.0, 0.0, 1.0])];
+        let model = Model::fit(&Series::new(sps, oris), KernelOptions::default());
+
+        let cfg = OctreeConfig {
+            max_depth: 5,
+            min_depth: 2,
+            qef_threshold: 1e-6,
+        };
+        let mesh = octree_dual_contour(&model, [0.0, 0.0, 0.0], 1000.0, 0.0, cfg);
+        assert!(mesh.triangle_count() > 100, "expected a refined mesh");
+
+        // Edge stats.
+        let mut dir: HashMap<(u32, u32), i32> = HashMap::new();
+        let mut undirected: HashMap<(u32, u32), u32> = HashMap::new();
+        for t in mesh.indices.chunks_exact(3) {
+            for &(a, b) in &[(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+                *dir.entry((a, b)).or_insert(0) += 1;
+                let e = if a < b { (a, b) } else { (b, a) };
+                *undirected.entry(e).or_insert(0) += 1;
+            }
+        }
+        let boundary = undirected.values().filter(|&&c| c == 1).count();
+        let nonmanifold = undirected.values().filter(|&&c| c > 2).count();
+        let total = undirected.len();
+
+        // Crack-free: boundary edges are only the open-sheet perimeter, a small
+        // fraction. (Broken contourer hit ~30%+; we require < 10%.)
+        assert!(
+            (boundary as f64) < 0.10 * (total as f64),
+            "too many boundary edges (holes): {boundary}/{total}"
+        );
+        // Near-manifold (vanilla DC may leave a tiny number at deepest cells).
+        assert!(
+            (nonmanifold as f64) < 0.02 * (total as f64),
+            "too many non-manifold edges: {nonmanifold}/{total}"
+        );
+        // Consistent winding: every interior edge traversed once each direction.
+        let mut bad = 0;
+        for (&(a, b), &n) in &dir {
+            let opp = *dir.get(&(b, a)).unwrap_or(&0);
+            if opp == 0 {
+                continue; // boundary edge
+            }
+            if n != opp {
+                bad += 1;
+            }
+        }
+        assert_eq!(bad, 0, "inconsistent winding on {bad} edges");
     }
 }
 

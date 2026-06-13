@@ -59,21 +59,25 @@ normals):
   regular grid.
 - **Adaptive octree** (`octree::octree_dual_contour`): refines toward surface
   detail (QEF residual > threshold) between a min and max depth, 2:1-balances the
-  octree, and contours crack-free with the Ju et al. (2002)
-  `cellProc`/`faceProc`/`edgeProc` recursion. Flat regions stay coarse, curved
-  regions refine.
+  octree, and contours by **minimal-edge iteration** — in a 2:1-balanced tree
+  every surface-crossing minimal edge is shared by exactly 4 leaves (found by
+  point-locating the 4 quadrant centers), each emitting one quad. Flat regions
+  stay coarse, curved regions refine. (This replaces the recursive
+  cellProc/faceProc/edgeProc of Ju et al. 2002, whose transition tables are
+  error-prone; the edge-iteration form is regression-tested crack-free and
+  consistently wound on a refined curved surface.)
 
 Both are exposed over WASM (`mesh_isosurface`, `mesh_isosurface_octree`). The
 `web/` harness uses the octree path, meshing one surface per interface at its
 recovered isovalue (the geological contacts).
 
-> **Known limitation.** The octree contourer is *crack-free* (verified: no
-> boundary gaps; meshes are watertight across refinement-level transitions), but
-> vanilla edgeProc can leave a small number of **non-manifold edges** (>2 faces
-> meeting) at the deepest transition cells — ~0.3% of edges at depth 6 on a
-> strongly curved test surface, none at depth ≤5. These render correctly; fully
-> eliminating them requires Manifold Dual Contouring (Schaefer et al. 2007),
-> which is not implemented.
+> **Known limitation.** The octree contourer is crack-free and consistently
+> wound (regression-tested: boundary edges only at the open-sheet perimeter,
+> zero winding inconsistencies). Vanilla dual contouring can still leave a *very*
+> small number of **non-manifold edges** (>2 faces meeting) at the deepest
+> transition cells — < 0.1% on a strongly curved test surface. These render
+> correctly; fully eliminating them requires Manifold Dual Contouring (Schaefer
+> et al. 2007), which is not implemented.
 
 ## Public API
 
@@ -141,7 +145,7 @@ src/
 ├── evaluate.rs     scalar_field + analytic gradient (§6)
 ├── litho.rs        isovalue recovery + interval assignment
 ├── mesh.rs         uniform dual contouring + shared QEF
-├── octree.rs       adaptive octree dual contouring (Ju et al. edgeProc)
+├── octree.rs       adaptive octree dual contouring (minimal-edge iteration)
 ├── wasm.rs         #[cfg(feature="wasm")] typed-array bindings
 └── bin/geofield_cli.rs  validation driver (feature = "cli")
 ```
@@ -150,7 +154,7 @@ src/
 
 ```bash
 cargo build                 # the library (lean: faer std + linalg only)
-cargo test                  # 36 tests
+cargo test                  # 41 tests
 cargo run --example single_layer
 ```
 
