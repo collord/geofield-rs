@@ -131,8 +131,26 @@ export function Viewer({ mesh, surfacePoints, orientations }: Props) {
         flatShading: false,
         transparent: true,
         opacity: 0.85,
+        // Push the filled faces slightly back so the edge overlay sits on top
+        // without z-fighting.
+        polygonOffset: true,
+        polygonOffsetFactor: 1,
+        polygonOffsetUnits: 1,
       });
-      group.add(new THREE.Mesh(geom, mat));
+      const fill = new THREE.Mesh(geom, mat);
+
+      // Edge overlay: show every mesh edge (threshold 0 keeps coplanar quad
+      // edges too, so the dual-contour cell structure is visible). Darken the
+      // formation color for the lines.
+      const edges = new THREE.EdgesGeometry(geom, 0);
+      const lineColor = new THREE.Color(color).multiplyScalar(0.45);
+      const lines = new THREE.LineSegments(
+        edges,
+        new THREE.LineBasicMaterial({ color: lineColor }),
+      );
+      fill.add(lines); // child so it shares the surface's transform
+
+      group.add(fill);
     }
   }, [mesh]);
 
