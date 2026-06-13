@@ -59,7 +59,8 @@ pub struct AssembledGeometry {
     pub opts: KernelOptions,
     /// Orientation positions in normalized coords.
     pub ori_pos: Vec<[f64; 3]>,
-    /// Orientation poles in normalized coords (gradient transform).
+    /// Orientation poles, RAW (world) — NOT gradient-transformed. gempy uses the
+    /// raw pole in the RHS (confirmed by block diff); see build of this field.
     pub ori_pole: Vec<[f64; 3]>,
     /// Per non-reference surface point: (rest position, ref position), both
     /// normalized, in input order.
@@ -80,11 +81,11 @@ impl AssembledGeometry {
             .iter()
             .map(|o| transform.apply(o.xyz))
             .collect();
-        let ori_pole: Vec<[f64; 3]> = series
-            .orientations
-            .iter()
-            .map(|o| transform.apply_gradient(o.pole))
-            .collect();
+        // RAW pole — NOT gradient-transformed. The block diff against gempy
+        // (validation/dump_kernel.py) showed b was off by exactly 1/scale: gempy
+        // puts the raw orientation pole into the RHS, it does NOT apply the
+        // §5.1 inverse-transpose to it. (Step A of the assembly+eval correction.)
+        let ori_pole: Vec<[f64; 3]> = series.orientations.iter().map(|o| o.pole).collect();
 
         // Increment rows: every surface point that is NOT its interface's
         // reference, in input order.
@@ -317,31 +318,24 @@ fn add_nuggets(sys: &mut System) {
 /// Universal drift border (§4), degree 1. Added **outside** `c_o`.
 ///
 /// U_G (§4.2): gradient row (dim, ori) ↔ drift col `u` gets `1` iff `dim == u`.
-/// U_SP: SP increment row `k` ↔ drift col `u` gets the plain basis difference
-///   `(rest[u] − ref[u])`  — **NO `gi_res` factor** (see divergence note below).
+/// U_SP (§4.1): SP increment row `k` ↔ drift col `u` gets
+///   `−gi_res·(rest[u] − ref[u])`.
 /// The drift–drift diagonal block is `0` (this is what makes `K` indefinite).
 ///
-/// ⚠ DIVERGENCE FROM KERNEL_MATH.md §4.1 — SURFACED IN THE STEP-7 REPORT.
-/// §4.1 transcribes U_SP as `−selector·gi_res·(usp_rest − usp_ref)`, a
-/// `−gi_res`-scaled basis difference. That scaling makes the assembled system
-/// **internally inconsistent**: the universal-drift columns are the unbiasedness
-/// constraints and must use one consistently-scaled basis across BOTH the
-/// gradient rows (U_G, plain `(dim==u)`) and the SP rows. With `−gi_res` on
-/// U_SP but plain `1` on U_G, the dual predictor provably cannot reproduce the
-/// increment constraint `Z(rest) = Z(ref)` at the data points — a *forced*
-/// property of cokriging, independent of any gempy convention. Empirically the
-/// `−gi_res` form leaves `Z(rest) − Z(ref) ≈ 7e-3` at the surface points; the
-/// plain basis difference here drives it to ≈ 1e-9 (machine precision, as it
-/// must). So either §4.1 folds the `gi_res`/`selector` elsewhere or it is a doc
-/// error. We use the form that satisfies the invariant; the step-5 block diff
-/// against gempy's actual U_SP border is the authority. The eval-side drift
-/// basis (evaluate.rs) is the matching plain monomial `{x, y, z}`.
-///
-/// This decision is pinned by `tests/increment_consistency.rs`: a positive test
-/// (within-interface field spread ≤ 1e-7 across the model progression) plus a
-/// negative control that re-injects the rejected `−gi_res` form and asserts the
-/// spread blows up (> 1e-4). If either changes, revisit this border.
+/// HISTORY — this is the §4.1 form, and it is CORRECT (confirmed by the step-5
+/// block diff against gempy's actual border: `validation/dump_kernel.py`, and by
+/// gempy source `_get_universal_sp_terms`: `usp = −selector·gi_res·(usp_rest −
+/// usp_ref)`). A step-7 session wrongly removed the `−gi_res` factor here,
+/// reasoning that it broke increment consistency. That was a MISDIAGNOSIS: the
+/// `−gi_res` U_SP and the (then-wrong) `1/scale`-scaled RHS were *mutually
+/// compensating* — two errors that together produced a locally self-consistent
+/// but non-gempy field. The increment-consistency probe passed because it tests
+/// "is this a valid potential" (scale/level-invariant), NOT "is this gempy's
+/// potential". The block diff is the only thing that localized it. Lesson: do
+/// not trust internal-consistency probes to validate sign/scale conventions.
 fn assemble_drift_border(sys: &mut System) {
+    let gi_res = sys.geom.opts.gi_res;
+
     // U_G: ug = e_dim · e_u = (dim == u).
     for dim in 0..3 {
         for o in 0..sys.geom.n_ori {
@@ -355,13 +349,13 @@ fn assemble_drift_border(sys: &mut System) {
         }
     }
 
-    // U_SP: plain linear-basis difference (rest[u] − ref[u]); no gi_res.
+    // U_SP (§4.1): −gi_res·(rest[u] − ref[u]).
     for k in 0..sys.geom.n_sp_inc {
         let (rest, refp) = sys.geom.sp_increments[k];
         let si = sys.geom.sp_index(k);
         for u in 0..3 {
             let ui = sys.geom.uni_index(u);
-            let v = rest[u] - refp[u];
+            let v = -gi_res * (rest[u] - refp[u]);
             sys.set(si, ui, v);
             sys.set(ui, si, v);
         }

@@ -31,12 +31,18 @@ use geofield_rs::Model;
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mut fixture: Option<PathBuf> = None;
+    let mut dump_kernel_only = false;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
             "--fixture" => {
                 i += 1;
                 fixture = args.get(i).map(PathBuf::from);
+            }
+            "--dump-kernel" => {
+                // Assemble K/b for the fixture inputs and write rust_K.npy /
+                // rust_b.npy. No grid needed — this is the step-5 block-diff path.
+                dump_kernel_only = true;
             }
             "-h" | "--help" => {
                 print_help();
@@ -56,7 +62,12 @@ fn main() {
         std::process::exit(2);
     });
 
-    if let Err(e) = run(&dir) {
+    let result = if dump_kernel_only {
+        dump_kernel(&dir)
+    } else {
+        run(&dir)
+    };
+    if let Err(e) = result {
         eprintln!("geofield-cli: {e}");
         std::process::exit(1);
     }
@@ -64,11 +75,32 @@ fn main() {
 
 fn print_help() {
     println!(
-        "geofield-cli --fixture <DIR>\n\n\
-         Reads gempy fixture inputs, fits geofield-rs, evaluates on gempy's grid,\n\
-         and writes rust_scalar_field.npy / rust_litho.npy / rust_isovalues.json.\n\
+        "geofield-cli --fixture <DIR> [--dump-kernel]\n\n\
+         Default: reads gempy fixture inputs, fits geofield-rs, evaluates on\n\
+         gempy's grid, writes rust_scalar_field.npy / rust_litho.npy /\n\
+         rust_isovalues.json.\n\
+         --dump-kernel: assemble K/b for the inputs and write rust_K.npy /\n\
+         rust_b.npy (the step-5 block-diff path; no grid.npy required).\n\
          Build with:  cargo build --release --features cli"
     );
+}
+
+/// Assemble the kriging system for the fixture inputs and write the dense K
+/// (row-major (dim,dim)) and b ((dim,)) as .npy for the block diff.
+fn dump_kernel(dir: &Path) -> Result<(), String> {
+    use geofield_rs::assemble::assemble;
+    let series = read_inputs(dir)?;
+    let opts = read_kernel_options(dir)?;
+    let sys = assemble(&series, opts);
+    let (k, b, n) = sys.dump_matrix();
+    eprintln!(
+        "[cli] dump-kernel: dim={n}  range={} c_o={} gi_res={} i_res={} nugget(g/sp)={}/{}",
+        opts.range, opts.c_o, opts.gi_res, opts.i_res, opts.grad_nugget, opts.sp_nugget
+    );
+    write_npy_2d(&dir.join("rust_K.npy"), k, n, n)?;
+    write_npy_1d(&dir.join("rust_b.npy"), b)?;
+    eprintln!("[cli] wrote rust_K.npy ({n}x{n}), rust_b.npy ({n})");
+    Ok(())
 }
 
 fn run(dir: &Path) -> Result<(), String> {
@@ -265,6 +297,25 @@ fn read_grid(dir: &Path) -> Result<Vec<[f64; 3]>, String> {
 fn write_npy_1d(path: &Path, data: &[f64]) -> Result<(), String> {
     npyz::to_file_1d(path, data.iter().copied())
         .map_err(|e| format!("writing {}: {e}", path.display()))
+}
+
+/// Write a row-major dense matrix as a (rows, cols) C-order .npy.
+fn write_npy_2d(path: &Path, data: &[f64], rows: usize, cols: usize) -> Result<(), String> {
+    use npyz::WriterBuilder;
+    let file = std::fs::File::create(path).map_err(|e| format!("create {}: {e}", path.display()))?;
+    let mut w = std::io::BufWriter::new(file);
+    let mut writer = npyz::WriteOptions::new()
+        .default_dtype()
+        .shape(&[rows as u64, cols as u64])
+        .writer(&mut w)
+        .begin_nd()
+        .map_err(|e| format!("npy header {}: {e}", path.display()))?;
+    writer
+        .extend(data.iter().copied())
+        .map_err(|e| format!("npy body {}: {e}", path.display()))?;
+    writer
+        .finish()
+        .map_err(|e| format!("npy finish {}: {e}", path.display()))
 }
 
 fn read_to_string(dir: &Path, name: &str) -> Result<String, String> {

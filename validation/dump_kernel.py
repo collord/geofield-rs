@@ -99,6 +99,27 @@ def extract_kernel_options(data) -> dict:
             out[attr] = float(v) if isinstance(v, (int, float)) else v
     kf = getattr(ko, "kernel_function", None)
     out["kernel_function"] = getattr(kf, "name", str(kf)) if kf else None
+
+    # Live per-element nuggets (the CLI reads these — never hardcode). On these
+    # models orientation nugget defaults to 0.01, surface points to ~2e-5.
+    sp_n, ori_n = [], []
+    for el in data.structural_frame.structural_elements:
+        sp = getattr(el, "surface_points", None)
+        ori = getattr(el, "orientations", None)
+        if sp is not None and getattr(sp, "nugget", None) is not None:
+            sp_n += list(np.atleast_1d(sp.nugget))
+        if ori is not None and getattr(ori, "nugget", None) is not None:
+            ori_n += list(np.atleast_1d(ori.nugget))
+
+    def _uniform(vals):
+        vals = [float(v) for v in vals]
+        return vals[0] if vals and all(abs(v - vals[0]) < 1e-15 for v in vals) else None
+
+    sp_u, ori_u = _uniform(sp_n), _uniform(ori_n)
+    if sp_u is not None:
+        out["sp_nugget"] = sp_u
+    if ori_u is not None:
+        out["grad_nugget"] = ori_u
     return out
 
 
@@ -135,11 +156,80 @@ def main():
 
     print(f"[ok] K {snap['cov'].shape}  b {snap['b'].shape}  w {snap['w'].shape}")
     print(f"[ok] dumped to {outdir}")
-    # Quick echo so we can eyeball structure immediately.
     np.set_printoptions(precision=4, suppress=True, linewidth=140)
-    print("K =\n", snap["cov"])
-    print("b =", snap["b"].ravel())
-    print("w =", snap["w"].ravel())
+
+    # Block layout (single series, degree-1): n_grad = 3*n_ori gradient rows
+    # (component-major gx..,gy..,gz..), then n_sp increment rows, then 3 drift.
+    n = snap["cov"].shape[0]
+    n_ori = _count_csv_rows(ori_csv)
+    n_sp_total = _count_csv_rows(sp_csv)
+    n_interfaces = 1  # rockA only
+    n_grad = 3 * n_ori
+    n_sp = n_sp_total - n_interfaces
+    layout = {"n": n, "n_grad": n_grad, "n_sp": n_sp, "n_uni": 3,
+              "n_ori": n_ori, "n_sp_total": n_sp_total}
+    print(f"[layout] {layout}")
+    assert n_grad + n_sp + 3 == n, f"layout {layout} != dim {n}"
+
+    # Build the geofield-rs K/b on the SAME inputs via the CLI.
+    rust_bin = default_rust_bin()
+    if rust_bin is None:
+        print("[warn] geofield-cli not built; skipping block diff. "
+              "Build: cargo build --release --features cli")
+        return
+    import subprocess
+    subprocess.run([str(rust_bin), "--fixture", str(outdir), "--dump-kernel"], check=True)
+    rust_K = np.load(outdir / "rust_K.npy")
+    rust_b = np.load(outdir / "rust_b.npy").ravel()
+    gK, gb = snap["cov"], snap["b"].ravel()
+
+    block_ratio_table(gK, gb, rust_K, rust_b, n_grad, n_sp)
+
+
+def _count_csv_rows(path: Path) -> int:
+    lines = [ln for ln in path.read_text().splitlines() if ln.strip()]
+    return max(0, len(lines) - 1)  # minus header
+
+
+def default_rust_bin():
+    for profile in ("release", "debug"):
+        cand = REPO_ROOT / "target" / profile / "geofield-cli"
+        if cand.exists():
+            return cand
+    return None
+
+
+REPO_ROOT = SCRIPT_DIR.parent
+
+
+def _block_ratio(g, m, label):
+    """Report the ratio mine/gempy over a block, only where gempy is nonzero."""
+    mask = np.abs(g) > 1e-12
+    if not mask.any():
+        same = np.allclose(m, 0, atol=1e-10)
+        return f"  {label:<14} gempy all~0; mine {'~0 OK' if same else 'NONZERO!'}"
+    r = m[mask] / g[mask]
+    # also the raw max abs diff (the true gate)
+    d = np.abs(m - g).max()
+    return (f"  {label:<14} ratio[min,max]=[{r.min():.4f},{r.max():.4f}]  "
+            f"max|Δ|={d:.3e}")
+
+
+def block_ratio_table(gK, gb, mK, mb, n_grad, n_sp):
+    g, s = n_grad, n_grad + n_sp  # block boundaries
+    print("\n=== per-block ratio (mine/gempy) + max|Δ| — GATE: ratio→1.0, Δ→~1e-4 ===")
+    print(_block_ratio(gK[:g, :g],   mK[:g, :g],   "CG_CG"))
+    print(_block_ratio(gK[:g, g:s],  mK[:g, g:s],  "CG_SP"))
+    print(_block_ratio(gK[g:s, g:s], mK[g:s, g:s], "SP_SP"))
+    print(_block_ratio(gK[:g, s:],   mK[:g, s:],   "U_G"))
+    print(_block_ratio(gK[g:s, s:],  mK[g:s, s:],  "U_SP"))
+    print(_block_ratio(gb,           mb,           "b (RHS)"))
+    full = np.abs(mK - gK).max()
+    print(f"  {'FULL K':<14} max|Δ|={full:.3e}   "
+          f"{'PASS' if full < 1e-4 else 'FAIL'} @ 1e-4")
+    bd = np.abs(mb - gb).max()
+    print(f"  {'FULL b':<14} max|Δ|={bd:.3e}   "
+          f"{'PASS' if bd < 1e-4 else 'FAIL'} @ 1e-4")
 
 
 if __name__ == "__main__":
