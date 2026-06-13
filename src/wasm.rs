@@ -13,7 +13,35 @@ use wasm_bindgen::prelude::*;
 
 use crate::assemble::KernelOptions;
 use crate::data::{Orientation, Series, SurfacePoint};
+use crate::mesh::{dual_contour, MeshGrid};
 use crate::Model;
+
+/// A dual-contoured triangle mesh handed to JS: flat position + index buffers.
+#[wasm_bindgen]
+pub struct WasmMesh {
+    positions: Vec<f32>,
+    indices: Vec<u32>,
+}
+
+#[wasm_bindgen]
+impl WasmMesh {
+    /// `3 * vertexCount` world-space positions (x,y,z, …) as a `Float32Array`.
+    pub fn positions(&self) -> Vec<f32> {
+        self.positions.clone()
+    }
+    /// `3 * triangleCount` triangle indices as a `Uint32Array`.
+    pub fn indices(&self) -> Vec<u32> {
+        self.indices.clone()
+    }
+    #[wasm_bindgen(getter)]
+    pub fn vertex_count(&self) -> usize {
+        self.positions.len() / 3
+    }
+    #[wasm_bindgen(getter)]
+    pub fn triangle_count(&self) -> usize {
+        self.indices.len() / 3
+    }
+}
 
 /// A fitted model exposed to JS.
 #[wasm_bindgen]
@@ -101,6 +129,29 @@ impl WasmModel {
             .chunks_exact(3)
             .map(|c| self.inner.scalar_field([c[0], c[1], c[2]]))
             .collect()
+    }
+
+    /// Dual-contour the isosurface `scalar_field == isovalue` over the axis-
+    /// aligned box `[min, max]` at `res` cells per axis. Returns a triangle mesh
+    /// (positions + indices) ready for a three.js BufferGeometry.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mesh_isosurface(
+        &self,
+        min_x: f64,
+        min_y: f64,
+        min_z: f64,
+        max_x: f64,
+        max_y: f64,
+        max_z: f64,
+        res: usize,
+        isovalue: f64,
+    ) -> WasmMesh {
+        let grid = MeshGrid::new([min_x, min_y, min_z], [max_x, max_y, max_z], res.max(1));
+        let m = dual_contour(&self.inner, &grid, isovalue);
+        WasmMesh {
+            positions: m.positions,
+            indices: m.indices,
+        }
     }
 
     /// Solve residual ‖K w − b‖₂ (diagnostic).

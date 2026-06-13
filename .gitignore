@@ -9,3 +9,8 @@ Cargo.lock
 # small input/options/provenance JSON+CSV in each fixture dir stay tracked.
 /validation/fixtures/**/*.npy
 /validation/fixtures/**/rust_*.json
+# web harness
+/web/node_modules
+/web/dist
+/web/src/wasm
+/web/*.tsbuildinfo
