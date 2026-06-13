@@ -1,0 +1,16 @@
+[package]
+name = "geofield-rs"
+version = "0.1.0"
+edition = "2021"
+description = "Universal-cokriging scalar field (single series, non-faulted) — WASM-targetable"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+# Added now per build plan; not yet used until the solve step.
+faer = "0.21"
+
+[features]
+default = []
+wasm = []
+
+[dev-dependencies]
