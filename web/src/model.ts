@@ -57,14 +57,16 @@ export interface SolveResult {
   error: string | null;
 }
 
-/** Fit the model from the current rows and dual-contour ONE surface per
- *  interface, each at its recovered isovalue (so the meshes pass through the
- *  input surface points, as gempy renders contacts — not an arbitrary level set).
- *  `res` is cells per axis. Returns meshes or an error string without throwing. */
+/** Fit the model from the current rows and adaptively (octree) dual-contour ONE
+ *  surface per interface, each at its recovered isovalue (so the meshes pass
+ *  through the input surface points, as gempy renders contacts — not an arbitrary
+ *  level set). `maxDepth` caps octree refinement (finest cell = extent / 2^depth);
+ *  coarse where the surface is flat, fine where it curves. Returns meshes or an
+ *  error string without throwing. */
 export function solveAndMesh(
   surfacePoints: SurfacePointRow[],
   orientations: OrientationRow[],
-  res: number,
+  maxDepth: number,
 ): SolveResult {
   const idOf = (formation: string): number => {
     const i = SERIES_ORDER.indexOf(formation);
@@ -114,6 +116,8 @@ export function solveAndMesh(
   }
 
   const [minX, maxX, minY, maxY, minZ, maxZ] = EXTENT;
+  // Octree needs a cube; use the largest extent span and anchor at the min corner.
+  const size = Math.max(maxX - minX, maxY - minY, maxZ - minZ);
 
   // Mesh ONE surface per interface, at its recovered isovalue. These pass
   // through the input surface points (the geological contacts), matching gempy —
@@ -122,18 +126,21 @@ export function solveAndMesh(
   const ids = Array.from(model.interface_ids());
   const nameOf = (id: number): string => SERIES_ORDER[id] ?? `interface ${id}`;
 
+  const minDepth = Math.min(2, maxDepth);
+  const QEF_EPS = 1e-6;
+
   const surfaces: SurfaceMesh[] = [];
   let totalTris = 0;
   for (let s = 0; s < isovalues.length; s++) {
-    const wm = model.mesh_isosurface(
+    const wm = model.mesh_isosurface_octree(
       minX,
       minY,
       minZ,
-      maxX,
-      maxY,
-      maxZ,
-      res,
+      size,
       isovalues[s],
+      maxDepth,
+      minDepth,
+      QEF_EPS,
     );
     surfaces.push({
       interfaceId: ids[s],

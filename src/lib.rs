@@ -14,6 +14,7 @@ pub mod geometry;
 pub mod kernel;
 pub mod litho;
 pub mod mesh;
+pub mod octree;
 pub mod solve;
 
 #[cfg(feature = "wasm")]

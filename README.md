@@ -16,10 +16,13 @@ case. The following are deliberately **out of scope** (clean seams are left wher
 they would attach, but they are not implemented):
 
 - faults
-- multi-series stacking
-- octrees / adaptive refinement
-- dual contouring / mesh extraction
+- multi-series stacking (the *solve* is single-series; octree refinement for
+  meshing is implemented, see below)
 - degree-2 universal drift (degree-1 only; a seam is left)
+
+Mesh extraction **is** implemented (it was originally out of scope): both uniform
+and adaptive-octree dual contouring of the scalar field — see
+[Isosurface meshing](#isosurface-meshing).
 
 The math is transcribed and cross-checked against `gempy_engine` `main` and
 recorded in **[`KERNEL_MATH.md`](KERNEL_MATH.md)**, which is the source of truth:
@@ -43,7 +46,34 @@ the document wins.
   per-interface isovalue recovery.
 - **Lithology**: assignment of query points to units between consecutive
   recovered isovalues.
+- **Isosurface meshing**: uniform and adaptive-octree dual contouring (see below).
 - **WASM bindings** + a verified native-vs-WASM parity check.
+
+## Isosurface meshing
+
+Two dual contourers extract a triangle mesh of an isosurface from the field,
+both reusing `scalar_field` (crossings) + `scalar_field_gradient` (Hermite
+normals):
+
+- **Uniform** (`mesh::dual_contour`): one QEF vertex per sign-changing cell on a
+  regular grid.
+- **Adaptive octree** (`octree::octree_dual_contour`): refines toward surface
+  detail (QEF residual > threshold) between a min and max depth, 2:1-balances the
+  octree, and contours crack-free with the Ju et al. (2002)
+  `cellProc`/`faceProc`/`edgeProc` recursion. Flat regions stay coarse, curved
+  regions refine.
+
+Both are exposed over WASM (`mesh_isosurface`, `mesh_isosurface_octree`). The
+`web/` harness uses the octree path, meshing one surface per interface at its
+recovered isovalue (the geological contacts).
+
+> **Known limitation.** The octree contourer is *crack-free* (verified: no
+> boundary gaps; meshes are watertight across refinement-level transitions), but
+> vanilla edgeProc can leave a small number of **non-manifold edges** (>2 faces
+> meeting) at the deepest transition cells — ~0.3% of edges at depth 6 on a
+> strongly curved test surface, none at depth ≤5. These render correctly; fully
+> eliminating them requires Manifold Dual Contouring (Schaefer et al. 2007),
+> which is not implemented.
 
 ## Public API
 
@@ -110,6 +140,8 @@ src/
 ├── solve.rs        faer Bunch–Kaufman factor + solve (§6)
 ├── evaluate.rs     scalar_field + analytic gradient (§6)
 ├── litho.rs        isovalue recovery + interval assignment
+├── mesh.rs         uniform dual contouring + shared QEF
+├── octree.rs       adaptive octree dual contouring (Ju et al. edgeProc)
 ├── wasm.rs         #[cfg(feature="wasm")] typed-array bindings
 └── bin/geofield_cli.rs  validation driver (feature = "cli")
 ```
@@ -211,7 +243,8 @@ geometric effect.
 | scalar field + analytic gradient | ✅ field matches gempy (affine, `2.7e-15`) |
 | lithology | ✅ 100% voxel agreement vs gempy |
 | WASM | ✅ builds + native parity `1.2e-15` |
-| faults / multi-series / octrees / dual contouring | ⛔ out of scope |
+| isosurface meshing (uniform + adaptive octree DC) | ✅ crack-free; minor non-manifold edges at deepest level |
+| faults / multi-series solve | ⛔ out of scope |
 | degree-2 drift | ⛔ seam only |
 
 ## License

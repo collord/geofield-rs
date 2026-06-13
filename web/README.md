@@ -13,8 +13,8 @@ re-render live in a three.js viewport.
   gempy (not an arbitrary level set). Surfaces are colored by formation; surface
   points are spheres, orientation poles are arrows, inside the model extent box.
   Z is up.
-- Edits **auto re-solve** after a ~300 ms debounce. A grid slider (8³–96³) sets
-  the dual-contouring resolution.
+- Edits **auto re-solve** after a ~300 ms debounce. An octree-depth slider (2–7)
+  caps adaptive refinement.
 
 ## Architecture
 
@@ -26,10 +26,13 @@ edit tables (React)
    → Viewer (three.js)           BufferGeometry from positions + indices
 ```
 
-The mesh is **uniform dual contouring** over the WASM-evaluated scalar field,
-placing one QEF vertex per sign-changing cell from the field's analytic gradient
-(Hermite data). It is the first increment toward adaptive octree dual contouring;
-no octree/adaptivity yet (the grid slider stands in for it).
+The mesh is **adaptive octree dual contouring** over the WASM-evaluated scalar
+field: refine toward surface detail (QEF residual), 2:1-balance, contour
+crack-free with Ju et al. `edgeProc`. One QEF vertex per cell from the field's
+analytic gradient (Hermite data). The **octree-depth slider** caps refinement
+(finest cell = extent / 2^depth); flat regions stay coarse, curved regions
+refine. (A uniform contourer also exists in the crate; the harness uses the
+octree path.)
 
 The harness meshes **one surface per interface** at the isovalue recovered at
 that interface's input points (`WasmModel::interface_isovalues()`). For model1

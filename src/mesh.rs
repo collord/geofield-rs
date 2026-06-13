@@ -62,7 +62,7 @@ impl Mesh {
 
 /// The 12 edges of a cell, as pairs of corner-offset indices (0..8).
 /// Corner index = i + 2*j + 4*k (local bit layout: bit0=x, bit1=y, bit2=z).
-const CELL_EDGES: [(usize, usize); 12] = [
+pub(crate) const CELL_EDGES: [(usize, usize); 12] = [
     (0, 1), (2, 3), (4, 5), (6, 7), // x-direction edges
     (0, 2), (1, 3), (4, 6), (5, 7), // y-direction edges
     (0, 4), (1, 5), (2, 6), (3, 7), // z-direction edges
@@ -70,7 +70,7 @@ const CELL_EDGES: [(usize, usize); 12] = [
 
 /// Local corner offsets for index = i + 2j + 4k.
 #[inline]
-fn corner_offset(c: usize) -> (usize, usize, usize) {
+pub(crate) fn corner_offset(c: usize) -> (usize, usize, usize) {
     (c & 1, (c >> 1) & 1, (c >> 2) & 1)
 }
 
@@ -169,6 +169,24 @@ fn solve_qef(
     cj: usize,
     ck: usize,
 ) -> [f64; 3] {
+    let lo = grid.corner(ci, cj, ck);
+    let hi = grid.corner(ci + 1, cj + 1, ck + 1);
+    qef_vertex(crossings, lo, hi).0
+}
+
+/// Solve the QEF for a cell vertex from its Hermite crossings, clamped into the
+/// cell AABB `[lo, hi]`. Returns `(vertex, residual_error)`, where the residual
+/// is `Σ (nᵢ·(x − pᵢ))²` at the solved vertex — a measure of how badly one
+/// vertex fits the cell's surface detail (used by the octree refinement rule).
+///
+/// Shared by the uniform and octree dual contourers. Uses the normal-equations
+/// form with a small Tikhonov regularization toward the mass point, which keeps
+/// the vertex inside the cell and stable when normals are near-degenerate.
+pub(crate) fn qef_vertex(
+    crossings: &[([f64; 3], [f64; 3])],
+    lo: [f64; 3],
+    hi: [f64; 3],
+) -> ([f64; 3], f64) {
     // Mass point (average of crossings) — also the regularization target.
     let mut mass = [0.0_f64; 3];
     for (p, _) in crossings {
@@ -199,17 +217,23 @@ fn solve_qef(
         atb[r] += lambda * mass[r];
     }
 
-    let x = solve3(ata, atb).unwrap_or(mass);
+    let mut x = solve3(ata, atb).unwrap_or(mass);
 
-    // Clamp the vertex into the cell's AABB (uniform DC vertices should stay in
-    // their cell; clamp guards against an ill-conditioned QEF escaping it).
-    let lo = grid.corner(ci, cj, ck);
-    let hi = grid.corner(ci + 1, cj + 1, ck + 1);
-    [
+    // Clamp the vertex into the cell AABB (DC vertices should stay in their cell;
+    // clamp guards against an ill-conditioned QEF escaping it).
+    x = [
         x[0].clamp(lo[0], hi[0]),
         x[1].clamp(lo[1], hi[1]),
         x[2].clamp(lo[2], hi[2]),
-    ]
+    ];
+
+    // Residual error Σ (nᵢ·(x − pᵢ))² at the (clamped) vertex.
+    let mut err = 0.0;
+    for (p, nrm) in crossings {
+        let d = nrm[0] * (x[0] - p[0]) + nrm[1] * (x[1] - p[1]) + nrm[2] * (x[2] - p[2]);
+        err += d * d;
+    }
+    (x, err)
 }
 
 /// Emit a quad (two triangles) for each interior grid edge that changes sign,
@@ -296,7 +320,7 @@ fn push_quad(cell_vertex: &[u32], cells: &[usize; 4], flip: bool, mesh: &mut Mes
     mesh.indices.extend_from_slice(&t1);
 }
 
-fn normalize(v: [f64; 3]) -> [f64; 3] {
+pub(crate) fn normalize(v: [f64; 3]) -> [f64; 3] {
     let n = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
     if n < 1e-30 {
         [0.0, 0.0, 0.0]

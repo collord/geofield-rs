@@ -18,7 +18,7 @@ export default function App() {
   );
   const [orientations, setOrientations] =
     useState<OrientationRow[]>(SEED_ORIENTATIONS);
-  const [res, setRes] = useState(32);
+  const [maxDepth, setMaxDepth] = useState(5);
   const [mesh, setMesh] = useState<MeshData | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busyMs, setBusyMs] = useState<number | null>(null);
@@ -34,7 +34,11 @@ export default function App() {
     if (timer.current) window.clearTimeout(timer.current);
     timer.current = window.setTimeout(() => {
       const t0 = performance.now();
-      const { mesh, error } = solveAndMesh(surfacePoints, orientations, res);
+      const { mesh, error } = solveAndMesh(
+        surfacePoints,
+        orientations,
+        maxDepth,
+      );
       setMesh(mesh);
       setError(error);
       setBusyMs(performance.now() - t0);
@@ -42,7 +46,7 @@ export default function App() {
     return () => {
       if (timer.current) window.clearTimeout(timer.current);
     };
-  }, [wasmReady, surfacePoints, orientations, res]);
+  }, [wasmReady, surfacePoints, orientations, maxDepth]);
 
   return (
     <div className="app">
@@ -63,16 +67,16 @@ export default function App() {
             </>
           )}
           <label className="res">
-            grid
+            octree depth
             <input
               type="range"
-              min={8}
-              max={96}
-              step={8}
-              value={res}
-              onChange={(e) => setRes(Number(e.target.value))}
+              min={2}
+              max={7}
+              step={1}
+              value={maxDepth}
+              onChange={(e) => setMaxDepth(Number(e.target.value))}
             />
-            {res}³
+            {maxDepth}
           </label>
         </div>
       </header>

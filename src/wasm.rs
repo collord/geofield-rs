@@ -14,6 +14,7 @@ use wasm_bindgen::prelude::*;
 use crate::assemble::KernelOptions;
 use crate::data::{Orientation, Series, SurfacePoint};
 use crate::mesh::{dual_contour, MeshGrid};
+use crate::octree::{octree_dual_contour, OctreeConfig};
 use crate::Model;
 
 /// A dual-contoured triangle mesh handed to JS: flat position + index buffers.
@@ -148,6 +149,40 @@ impl WasmModel {
     ) -> WasmMesh {
         let grid = MeshGrid::new([min_x, min_y, min_z], [max_x, max_y, max_z], res.max(1));
         let m = dual_contour(&self.inner, &grid, isovalue);
+        WasmMesh {
+            positions: m.positions,
+            indices: m.indices,
+        }
+    }
+
+    /// Adaptive **octree** dual contouring of `scalar_field == isovalue` over the
+    /// cube `[min, min+size]` (a cube is required for a clean octree — pass the
+    /// extent's bounding cube). Refines toward surface detail (QEF residual >
+    /// `qef_threshold`) between `min_depth` and `max_depth`, 2:1-balances, and
+    /// contours crack-free (Ju et al. edgeProc). Coarse where the surface is flat,
+    /// fine where it curves.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mesh_isosurface_octree(
+        &self,
+        min_x: f64,
+        min_y: f64,
+        min_z: f64,
+        size: f64,
+        isovalue: f64,
+        max_depth: u32,
+        min_depth: u32,
+        qef_threshold: f64,
+    ) -> WasmMesh {
+        let cfg = OctreeConfig {
+            max_depth: max_depth.max(1),
+            min_depth: min_depth.min(max_depth),
+            qef_threshold: if qef_threshold.is_finite() && qef_threshold > 0.0 {
+                qef_threshold
+            } else {
+                OctreeConfig::default().qef_threshold
+            },
+        };
+        let m = octree_dual_contour(&self.inner, [min_x, min_y, min_z], size, isovalue, cfg);
         WasmMesh {
             positions: m.positions,
             indices: m.indices,
