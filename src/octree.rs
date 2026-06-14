@@ -824,17 +824,7 @@ fn close_corners(
 
                     let fv_a = face_vertex_index(tree, mesh, fcache, id, a, abit, finest);
                     let fv_b = face_vertex_index(tree, mesh, fcache, id, b, bbit, finest);
-                    let (fa, fb) = match (fv_a, fv_b) {
-                        (Some(a), Some(b)) => (a, b),
-                        _ => continue, // need both face verts to close a corner
-                    };
 
-                    // Does the box-edge crossing coincide with a face vertex? If so
-                    // the corner is already at that face vertex — reuse it and emit
-                    // the single triangle [int, fa, fb], which squares the corner.
-                    // Creating a *separate* coincident vertex (earlier attempt) made
-                    // T-junctions → non-manifold/winding errors; merging them where
-                    // they're degenerate avoids both that and the chamfer.
                     let vpos = |i: u32| {
                         let o = (i as usize) * 3;
                         [
@@ -848,21 +838,50 @@ fn close_corners(
                             && (p[1] - q[1]).abs() < 1e-6
                             && (p[2] - q[2]).abs() < 1e-6
                     };
-                    if close(corner_p, vpos(fa)) || close(corner_p, vpos(fb)) {
-                        emit_tri(mesh, int_v, fa, fb);
-                    } else {
-                        // Genuine distinct corner: dedicated corner vertex + fan.
-                        let ckey =
-                            (e as i64, (sa * 2 + sb) as i64, qkey(corner_p[e], finest));
-                        let cv = *corner_cache.entry(ckey).or_insert_with(|| {
-                            let idx = (mesh.positions.len() / 3) as u32;
-                            mesh.positions.push(corner_p[0] as f32);
-                            mesh.positions.push(corner_p[1] as f32);
-                            mesh.positions.push(corner_p[2] as f32);
-                            idx
-                        });
-                        emit_tri(mesh, int_v, fa, cv);
-                        emit_tri(mesh, int_v, cv, fb);
+
+                    match (fv_a, fv_b) {
+                        // Both adjacent faces contour here: the standard corner.
+                        (Some(fa), Some(fb)) => {
+                            // If the box-edge crossing coincides with a face vertex
+                            // the corner is already there — one triangle squares it
+                            // (a separate coincident vertex would make a T-junction).
+                            if close(corner_p, vpos(fa)) || close(corner_p, vpos(fb)) {
+                                emit_tri(mesh, int_v, fa, fb);
+                            } else {
+                                let ckey =
+                                    (e as i64, (sa * 2 + sb) as i64, qkey(corner_p[e], finest));
+                                let cv = *corner_cache.entry(ckey).or_insert_with(|| {
+                                    let idx = (mesh.positions.len() / 3) as u32;
+                                    mesh.positions.push(corner_p[0] as f32);
+                                    mesh.positions.push(corner_p[1] as f32);
+                                    mesh.positions.push(corner_p[2] as f32);
+                                    idx
+                                });
+                                emit_tri(mesh, int_v, fa, cv);
+                                emit_tri(mesh, int_v, cv, fb);
+                            }
+                        }
+                        // Only ONE adjacent face contours through this cell — the
+                        // triple-junction case where the surface exits onto the
+                        // OTHER face (e.g. the box top) rather than continuing along
+                        // this box edge. The missing side is closed by that other
+                        // face's own skirt; here we just tie this face's vertex to
+                        // the box-edge crossing so the loop doesn't gap.
+                        (Some(fv), None) | (None, Some(fv)) => {
+                            if !close(corner_p, vpos(fv)) {
+                                let ckey =
+                                    (e as i64, (sa * 2 + sb) as i64, qkey(corner_p[e], finest));
+                                let cv = *corner_cache.entry(ckey).or_insert_with(|| {
+                                    let idx = (mesh.positions.len() / 3) as u32;
+                                    mesh.positions.push(corner_p[0] as f32);
+                                    mesh.positions.push(corner_p[1] as f32);
+                                    mesh.positions.push(corner_p[2] as f32);
+                                    idx
+                                });
+                                emit_tri(mesh, int_v, fv, cv);
+                            }
+                        }
+                        (None, None) => {}
                     }
                 }
             }
