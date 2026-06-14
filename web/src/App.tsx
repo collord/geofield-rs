@@ -19,6 +19,9 @@ export default function App() {
   const [orientations, setOrientations] =
     useState<OrientationRow[]>(SEED_ORIENTATIONS);
   const [maxDepth, setMaxDepth] = useState(5);
+  // Off → bounded open contact sheet; on → watertight closed solid (sheet +
+  // domain-boundary cap).
+  const [cap, setCap] = useState(false);
   const [mesh, setMesh] = useState<MeshData | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busyMs, setBusyMs] = useState<number | null>(null);
@@ -38,6 +41,7 @@ export default function App() {
         surfacePoints,
         orientations,
         maxDepth,
+        cap,
       );
       setMesh(mesh);
       setError(error);
@@ -46,7 +50,7 @@ export default function App() {
     return () => {
       if (timer.current) window.clearTimeout(timer.current);
     };
-  }, [wasmReady, surfacePoints, orientations, maxDepth]);
+  }, [wasmReady, surfacePoints, orientations, maxDepth, cap]);
 
   return (
     <div className="app">
@@ -77,6 +81,14 @@ export default function App() {
               onChange={(e) => setMaxDepth(Number(e.target.value))}
             />
             {maxDepth}
+          </label>
+          <label className="res">
+            <input
+              type="checkbox"
+              checked={cap}
+              onChange={(e) => setCap(e.target.checked)}
+            />
+            close domain (cap)
           </label>
         </div>
       </header>

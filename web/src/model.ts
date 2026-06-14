@@ -67,6 +67,7 @@ export function solveAndMesh(
   surfacePoints: SurfacePointRow[],
   orientations: OrientationRow[],
   maxDepth: number,
+  cap: boolean = false,
 ): SolveResult {
   const idOf = (formation: string): number => {
     const i = SERIES_ORDER.indexOf(formation);
@@ -141,6 +142,7 @@ export function solveAndMesh(
       maxDepth,
       minDepth,
       QEF_EPS,
+      cap,
     );
     surfaces.push({
       interfaceId: ids[s],

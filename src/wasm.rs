@@ -159,8 +159,11 @@ impl WasmModel {
     /// cube `[min, min+size]` (a cube is required for a clean octree — pass the
     /// extent's bounding cube). Refines toward surface detail (QEF residual >
     /// `qef_threshold`) between `min_depth` and `max_depth`, 2:1-balances, and
-    /// contours crack-free (Ju et al. edgeProc). Coarse where the surface is flat,
-    /// fine where it curves.
+    /// contours crack-free. Coarse where the surface is flat, fine where it curves.
+    ///
+    /// `cap = false` returns the bounded contact surface (an open sheet clipped to
+    /// the domain). `cap = true` additionally contours the domain-boundary cap,
+    /// returning a watertight closed solid (sheet + walls/bottom).
     #[allow(clippy::too_many_arguments)]
     pub fn mesh_isosurface_octree(
         &self,
@@ -172,6 +175,7 @@ impl WasmModel {
         max_depth: u32,
         min_depth: u32,
         qef_threshold: f64,
+        cap: bool,
     ) -> WasmMesh {
         let cfg = OctreeConfig {
             max_depth: max_depth.max(1),
@@ -181,6 +185,9 @@ impl WasmModel {
             } else {
                 OctreeConfig::default().qef_threshold
             },
+            // `false` → bounded open sheet (just the contact surface); `true` →
+            // watertight closed solid (sheet + domain-boundary cap).
+            cap,
         };
         let m = octree_dual_contour(&self.inner, [min_x, min_y, min_z], size, isovalue, cfg);
         WasmMesh {

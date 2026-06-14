@@ -349,6 +349,13 @@ pub struct OctreeConfig {
     pub min_depth: u32,
     /// QEF residual above which a sign-changing cell is subdivided.
     pub qef_threshold: f64,
+    /// Whether to contour the domain-boundary cap (`b == 0`, kept where
+    /// `field < iso`). When `true`, the output is a watertight closed surface
+    /// (field sheet + cap). When `false`, only the field sheet is emitted —
+    /// an OPEN surface clipped to the domain, with its perimeter flush on the
+    /// boundary. The harness uses `false` to show the bounded contact surface
+    /// and `true` to show the closed solid.
+    pub cap: bool,
 }
 
 impl Default for OctreeConfig {
@@ -357,6 +364,7 @@ impl Default for OctreeConfig {
             max_depth: 6,
             min_depth: 2,
             qef_threshold: 1e-4,
+            cap: true,
         }
     }
 }
@@ -410,8 +418,12 @@ pub fn octree_dual_contour_bounded(
     // `field < iso`. Same edge-iteration machine, run on the boundary sign field.
     // A cap triangle that would reuse a field edge is dropped: the seam belongs to
     // the field surface, and the cap abuts it rather than overlapping (this is what
-    // drives non-manifold edges to zero — see `contour_cap_edges`).
-    contour_cap_edges(&tree, model, boundary, isovalue, &field_edges, &mut mesh);
+    // drives non-manifold edges to zero — see `contour_cap_edges`). Skipped when
+    // `cfg.cap` is false: then the field sheet is emitted open (bounded by, but not
+    // closed against, the domain).
+    if cfg.cap {
+        contour_cap_edges(&tree, model, boundary, isovalue, &field_edges, &mut mesh);
+    }
 
     // Orient the FIELD triangles toward the field gradient (fixes whole-patch
     // winding flips that local edge winding can leave). Cap triangles lie on
@@ -1140,6 +1152,7 @@ mod tests {
             max_depth: 5,
             min_depth: 2,
             qef_threshold: 1e-5,
+            cap: true,
         };
         let mesh = octree_dual_contour(&model, [-0.5, -0.5, 0.0], 2.0, 0.0, cfg);
         assert!(mesh.vertex_count() > 0, "no vertices");
@@ -1194,6 +1207,7 @@ mod tests {
             max_depth: 5,
             min_depth: 2,
             qef_threshold: 1e-6,
+            cap: true,
         };
         let mesh = octree_dual_contour(&model, [0.0, 0.0, 0.0], 1000.0, 0.0, cfg);
         assert!(mesh.triangle_count() > 100, "expected a refined mesh");
@@ -1405,6 +1419,7 @@ mod tests {
             max_depth: 6,
             min_depth: 3,
             qef_threshold: 1e-6,
+            cap: true,
         };
         let mesh =
             octree_dual_contour_bounded(&model, &boundary, [0.0, 0.0, 0.0], 1000.0, 0.0, cfg);
