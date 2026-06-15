@@ -539,6 +539,51 @@ fn is_surface(corners: &[f64; 8], inside: &[bool; 8]) -> bool {
     has_field_crossing(corners) || has_boundary_crossing(inside)
 }
 
+/// Connected components of the cell's MINORITY-sign corners — one per surface sheet
+/// passing through the cell (Manifold Dual Contouring, Schaefer/Ju/Warren 2007).
+///
+/// `sign[c]` is the contoured sign at corner `c` (`true` = inside the solid). We
+/// take the rarer sign as the "minority" (ties → `true`), then group minority
+/// corners that are connected through cube edges (`CELL_EDGES`). Each group is one
+/// sheet: a cell with two disconnected minority groups is pierced by two sheets and
+/// must emit two vertices (else the single-vertex rule pinches them non-manifold).
+///
+/// Returns `(comp, ncomp)`: `comp[c]` is the component id of corner `c` if it is a
+/// minority corner, else `u8::MAX`; `ncomp` is the number of components. A surface-
+/// crossing cell always has `ncomp >= 1`; the common case is exactly 1.
+fn minority_components(sign: &[bool; 8]) -> ([u8; 8], usize) {
+    let inside_count = sign.iter().filter(|&&b| b).count();
+    let minority = inside_count <= 4; // rarer sign; tie → inside
+
+    // Cube-edge adjacency from CELL_EDGES.
+    let mut adj = [[false; 8]; 8];
+    for &(a, b) in CELL_EDGES.iter() {
+        adj[a][b] = true;
+        adj[b][a] = true;
+    }
+
+    let mut comp = [u8::MAX; 8];
+    let mut ncomp = 0u8;
+    for start in 0..8 {
+        if sign[start] != minority || comp[start] != u8::MAX {
+            continue;
+        }
+        // Flood-fill this component over cube edges.
+        let mut stack = vec![start];
+        comp[start] = ncomp;
+        while let Some(c) = stack.pop() {
+            for (n, &connected) in adj[c].iter().enumerate() {
+                if connected && sign[n] == minority && comp[n] == u8::MAX {
+                    comp[n] = ncomp;
+                    stack.push(n);
+                }
+            }
+        }
+        ncomp += 1;
+    }
+    (comp, ncomp as usize)
+}
+
 /// The contoured sign at corner `c` of a leaf.
 ///
 ///   * Solid (`cap = true`): the combined CSG field `g = max(field − iso, b)`.
@@ -1153,6 +1198,42 @@ mod tests {
             assert_eq!(nonmanifold, 0, "depth {depth}: non-manifold edges {nonmanifold}");
             assert_eq!(open, 0, "depth {depth}: open edges {open}");
         }
+    }
+
+    #[test]
+    fn minority_components_groups_sheets() {
+        // No minority corners (all same sign) → 0 components.
+        let (_c, n) = minority_components(&[false; 8]);
+        assert_eq!(n, 0, "uniform-outside cell has no components");
+        let (_c, n) = minority_components(&[true; 8]);
+        assert_eq!(n, 0, "uniform-inside cell has no components");
+
+        // One inside corner → one component (a single sheet cutting off a corner).
+        let mut s = [false; 8];
+        s[0] = true;
+        let (comp, n) = minority_components(&s);
+        assert_eq!(n, 1);
+        assert_eq!(comp[0], 0);
+        assert_eq!(comp[1], u8::MAX, "majority corner has no component");
+
+        // One face inside (corners 0,1,2,3 = z==0 face) → one connected component
+        // (a planar sheet) — the common single-sheet case.
+        let mut s = [false; 8];
+        for c in [0, 1, 2, 3] {
+            s[c] = true;
+        }
+        let (_comp, n) = minority_components(&s);
+        assert_eq!(n, 1, "a flat sheet is one component");
+
+        // TWO opposite corners inside (0 and 7, diagonal) → TWO components: they are
+        // not cube-edge adjacent, so two separate sheets pass through the cell. This
+        // is the two-sheets-in-one-cell case that needs two vertices.
+        let mut s = [false; 8];
+        s[0] = true;
+        s[7] = true;
+        let (comp, n) = minority_components(&s);
+        assert_eq!(n, 2, "two diagonal corners are two sheets");
+        assert_ne!(comp[0], comp[7], "diagonal corners in different components");
     }
 
     /// Regression for the missing-triangle / winding bugs: on a CURVED surface
