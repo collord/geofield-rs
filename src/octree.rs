@@ -207,6 +207,38 @@ impl<'a> Scene<'a> {
             }
         }
     }
+
+    /// Does the cell edge `pa..pb` carry crossings from TWO OR MORE different
+    /// surfaces of the scene (primary contact + contributors)?
+    ///
+    /// Two distinct surfaces crossing one edge means two sheets of the solid
+    /// boundary can pass through this one cell; a single dual vertex would average
+    /// them into a non-pairing point (a crack). `build` subdivides such cells so
+    /// each edge has at most one surface crossing, after which the single-vertex
+    /// minimal-edge contour is watertight.
+    ///
+    /// We deliberately count crossings of ALL surfaces, not only those currently on
+    /// the solid boundary: a buried crossing (inside or outside the solid here) can
+    /// become a boundary crossing one cell over, and subdividing conservatively is
+    /// cheap and keeps the criterion local and monotone. (Filtering to on-boundary
+    /// crossings under-subdivides and leaves cracks — measured.)
+    fn edge_double_crossed(&self, pa: [f64; 3], pb: [f64; 3]) -> bool {
+        let mut count = 0;
+        let fa = self.primary(pa);
+        let fb = self.primary(pb);
+        if (fa <= 0.0) != (fb <= 0.0) {
+            count += 1;
+        }
+        for c in &self.contributors {
+            if c.edge_crossing(pa, pb).is_some() {
+                count += 1;
+                if count >= 2 {
+                    return true;
+                }
+            }
+        }
+        count >= 2
+    }
 }
 
 /// Axis-aligned box boundary: the domain is the cube `[min, min+size]³` (an
@@ -564,6 +596,12 @@ pub fn octree_dual_contour_scene(
         root: 0,
     };
     tree.root = build(&mut tree, scene, min, size, 0, &cfg);
+    // Subdivide cells where two surfaces cross one edge (two sheets through one
+    // cell) before balancing — a single dual vertex there averages the sheets into
+    // a crack. Refining to a fixpoint (capped at max_depth) makes each edge
+    // single-crossed, after which the single-vertex minimal-edge contour is
+    // watertight.
+    refine_double_crossed(&mut tree, scene, &cfg);
     balance(&mut tree, scene, &cfg);
 
     let mut mesh = Mesh::default();
@@ -744,6 +782,15 @@ fn corner_sign(corners: &[f64; 8], inside: &[bool; 8], c: usize, cap: bool) -> b
     } else {
         corners[c] <= 0.0
     }
+}
+
+/// Does any of the cell's 12 edges carry two-or-more boundary crossings from
+/// different surfaces (the two-sheets-per-edge case)? Such a cell is subdivided in
+/// `build` so the single-vertex contour stays watertight.
+fn cell_has_double_crossed_edge(scene: &Scene, min: [f64; 3], size: f64) -> bool {
+    CELL_EDGES.iter().any(|&(a, b)| {
+        scene.edge_double_crossed(corner_pos(min, size, a), corner_pos(min, size, b))
+    })
 }
 
 /// Does the contoured sign change across this leaf (any of its 12 edges)?
@@ -1018,6 +1065,42 @@ fn split_leaf(tree: &mut Octree, scene: &Scene, leaf_id: NodeId, depth: u32, cfg
         children[c] = Some(build(tree, scene, cmin, half, depth + 1, cfg));
     }
     tree.nodes[leaf_id] = Node::Internal(Box::new(children));
+}
+
+/// Subdivide, to a fixpoint, every leaf below `max_depth` that has a double-crossed
+/// edge (two surfaces of the scene crossing one edge → two boundary sheets through
+/// the cell). Splitting these makes each edge single-crossed so the single-vertex
+/// minimal-edge contour stays watertight. A genuine grazing/tangent intersection
+/// can stay double-crossed at `max_depth`; that residual is capped, not infinite.
+fn refine_double_crossed(tree: &mut Octree, scene: &Scene, cfg: &OctreeConfig) {
+    loop {
+        let mut depths: std::collections::HashMap<NodeId, u32> =
+            std::collections::HashMap::new();
+        collect_leaf_depths(tree, tree.root, 0, &mut depths);
+
+        let mut to_split: Vec<(NodeId, u32)> = Vec::new();
+        for (&id, &d) in &depths {
+            if d >= cfg.max_depth {
+                continue;
+            }
+            let (min, size) = tree.bounds[id];
+            if cell_has_double_crossed_edge(scene, min, size) {
+                to_split.push((id, d));
+            }
+        }
+        if to_split.is_empty() {
+            break;
+        }
+        // Stable order so the arena indices we split are deterministic.
+        to_split.sort_unstable();
+        for (id, d) in to_split {
+            // `id` is still a leaf (we only split leaves and split_leaf replaces in
+            // place; new children are appended, not renumbering `id`).
+            if matches!(tree.nodes[id], Node::Leaf(_)) {
+                split_leaf(tree, scene, id, d, cfg);
+            }
+        }
+    }
 }
 
 /// Compute and emit each surface leaf's per-component QEF vertices, recording their
@@ -1784,5 +1867,157 @@ mod tests {
 
         check(0.7, "steep");
         check(0.08, "low-angle");
+    }
+
+    /// A half-space contact from a `Model`: `inside` is below (`field < iso`) when
+    /// `below`, else above. The crossing normal is the field gradient. Used to build
+    /// a slab (`below(hi) ∩ above(lo)`) from one field.
+    struct HalfSpace<'a> {
+        m: &'a Model,
+        iso: f64,
+        below: bool,
+    }
+    impl Boundary for HalfSpace<'_> {
+        fn inside(&self, p: [f64; 3]) -> bool {
+            let f = self.m.scalar_field(p) - self.iso;
+            if self.below {
+                f < 0.0
+            } else {
+                f > 0.0
+            }
+        }
+        fn edge_crossing(&self, a: [f64; 3], b: [f64; 3]) -> Option<([f64; 3], [f64; 3])> {
+            let fa = self.m.scalar_field(a) - self.iso;
+            let fb = self.m.scalar_field(b) - self.iso;
+            if (fa < 0.0) == (fb < 0.0) {
+                return None;
+            }
+            let t = fa / (fa - fb);
+            let p = [
+                a[0] + (b[0] - a[0]) * t,
+                a[1] + (b[1] - a[1]) * t,
+                a[2] + (b[2] - a[2]) * t,
+            ];
+            Some((p, normalize(self.m.scalar_field_gradient(p))))
+        }
+    }
+
+    #[test]
+    fn edge_double_crossed_detects_two_surfaces() {
+        // A slab (below-hi ∩ above-lo) plus the box. An edge that pierces BOTH the
+        // lo and hi faces is double-crossed; one piercing a single face is not.
+        let (m, _) = dipping_plane(500.0, 0.0, 0.0); // flat, field ∝ z
+        let lo = m.scalar_field([500.0, 500.0, 480.0]);
+        let hi = m.scalar_field([500.0, 500.0, 520.0]);
+        let below_hi = HalfSpace { m: &m, iso: hi, below: true };
+        let above_lo = HalfSpace { m: &m, iso: lo, below: false };
+        let box_b = AxisBox::new([0.0, 0.0, 0.0], 1000.0);
+        let scene = Scene::new(&m, hi, vec![&box_b, &above_lo]);
+        let _ = below_hi;
+
+        // Vertical edge spanning the whole slab (z 400→600) crosses BOTH faces.
+        assert!(
+            scene.edge_double_crossed([500.0, 500.0, 400.0], [500.0, 500.0, 600.0]),
+            "edge through both slab faces should be double-crossed"
+        );
+        // A short edge inside/near one face only — single crossing.
+        assert!(
+            !scene.edge_double_crossed([500.0, 500.0, 515.0], [500.0, 500.0, 525.0]),
+            "edge through one face only should not be double-crossed"
+        );
+        // An edge entirely outside the slab in z but the primary(hi) still bounds —
+        // below 480 is above-lo=false → not in solid → no boundary crossings here.
+        assert!(
+            !scene.edge_double_crossed([500.0, 500.0, 100.0], [500.0, 500.0, 200.0]),
+            "edge far from both faces should not be double-crossed"
+        );
+    }
+
+    /// A THICK slab (`below-hi ∩ above-lo ∩ box`) — two contacts bounding a layer —
+    /// must mesh watertight. Before the double-crossed-edge refinement, the lo/hi
+    /// faces cracked where they grazed the box wall (a cell edge pierced by two
+    /// surfaces averaged into one vertex). The refinement subdivides those cells so
+    /// each edge has ≤1 boundary crossing; the result is every edge incidence 2.
+    #[test]
+    fn csg_slab_is_watertight() {
+        use std::collections::HashMap;
+        let (m, _) = dipping_plane(500.0, 0.05, 0.03);
+        let f_at = |z: f64| m.scalar_field([500.0, 500.0, z]);
+        let lo = f_at(500.0).min(f_at(620.0));
+        let hi = f_at(500.0).max(f_at(620.0));
+        let above_lo = HalfSpace { m: &m, iso: lo, below: false };
+        let box_b = AxisBox::new([0.0, 0.0, 0.0], 1000.0);
+        // primary = below-hi (Model m at iso hi); contributors = box ∩ above-lo.
+        let scene = Scene::new(&m, hi, vec![&box_b, &above_lo]);
+
+        let cfg = OctreeConfig {
+            max_depth: 7,
+            min_depth: 2,
+            qef_threshold: 1e-6,
+            cap: true,
+        };
+        let mesh = octree_dual_contour_scene(&scene, [0.0, 0.0, 0.0], 1000.0, cfg);
+        assert!(mesh.triangle_count() > 100, "trivial slab mesh");
+
+        let mut undirected: HashMap<(u32, u32), u32> = HashMap::new();
+        for t in mesh.indices.chunks_exact(3) {
+            for &(a, b) in &[(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+                let e = if a < b { (a, b) } else { (b, a) };
+                *undirected.entry(e).or_insert(0) += 1;
+            }
+        }
+        let nonmanifold = undirected.values().filter(|&&c| c > 2).count();
+        let open = undirected.values().filter(|&&c| c == 1).count();
+        let total = undirected.len();
+        eprintln!("[slab] tris={} nm={nonmanifold} open={open}/{total}", mesh.triangle_count());
+        assert_eq!(nonmanifold, 0, "slab non-manifold edges {nonmanifold}/{total}");
+        assert_eq!(open, 0, "slab open edges {open}/{total}");
+    }
+
+    /// The headline geologic case: an EROSIONAL UNCONFORMITY (a contact) truncating
+    /// a conformable BED (a slab between two contacts) at a LOW angle. Three surfaces
+    /// — the bed's lower and upper contacts and the erosion — bound the solid, and
+    /// they meet at low-angle intersection lines (the double-crossed-edge case). Must
+    /// mesh watertight (every edge incidence exactly 2).
+    #[test]
+    fn erosion_truncating_a_bed_is_watertight() {
+        use std::collections::HashMap;
+        // Bed: a flat-lying slab between two contacts of field `bed`.
+        let (bed, _) = dipping_plane(500.0, 0.02, 0.0);
+        let f_at = |z: f64| bed.scalar_field([500.0, 500.0, z]);
+        let lo = f_at(450.0).min(f_at(550.0));
+        let hi = f_at(450.0).max(f_at(550.0));
+        let above_lo = HalfSpace { m: &bed, iso: lo, below: false };
+        // Erosion: a separate contact dipping the OTHER way at low angle, cutting the
+        // bed near the middle of the domain.
+        let (ero, iso_e) = dipping_plane(520.0, -0.06, 0.02);
+        let erosion = HalfSpace { m: &ero, iso: iso_e, below: true };
+        let box_b = AxisBox::new([0.0, 0.0, 0.0], 1000.0);
+        // primary = below-hi (the bed's upper contact); contributors = box, above-lo
+        // (bed's lower contact), erosion.
+        let scene = Scene::new(&bed, hi, vec![&box_b, &above_lo, &erosion]);
+
+        let cfg = OctreeConfig {
+            max_depth: 7,
+            min_depth: 2,
+            qef_threshold: 1e-6,
+            cap: true,
+        };
+        let mesh = octree_dual_contour_scene(&scene, [0.0, 0.0, 0.0], 1000.0, cfg);
+        assert!(mesh.triangle_count() > 100, "trivial truncated-bed mesh");
+
+        let mut undirected: HashMap<(u32, u32), u32> = HashMap::new();
+        for t in mesh.indices.chunks_exact(3) {
+            for &(a, b) in &[(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+                let e = if a < b { (a, b) } else { (b, a) };
+                *undirected.entry(e).or_insert(0) += 1;
+            }
+        }
+        let nonmanifold = undirected.values().filter(|&&c| c > 2).count();
+        let open = undirected.values().filter(|&&c| c == 1).count();
+        let total = undirected.len();
+        eprintln!("[erosion-bed] tris={} nm={nonmanifold} open={open}/{total}", mesh.triangle_count());
+        assert_eq!(nonmanifold, 0, "truncated-bed non-manifold {nonmanifold}/{total}");
+        assert_eq!(open, 0, "truncated-bed open edges {open}/{total}");
     }
 }
