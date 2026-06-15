@@ -11,29 +11,39 @@
 //! genuinely refined surfaces. The edge-iteration form is crack-free and
 //! consistently wound (regression-tested), at the cost of per-edge leaf lookups.
 //!
-//! # Two surfaces, one machine
+//! # Closing the surface against a domain boundary (CSG union)
 //!
-//! The final watertight mesh is the union of two implicit surfaces contoured by
-//! the *same* dual-contouring machinery:
+//! A bounded geological model is the solid `{ field < iso } ∩ { inside the domain
+//! }`. We mesh its boundary by contouring the **combined CSG field**
 //!
-//!   * the **field** isosurface `field == iso`, kept only where the domain
-//!     boundary function `b < 0` (inside the domain), and
-//!   * the **boundary cap** `b == 0`, kept only where `field < iso` (the part of
-//!     the wall actually inside the rock).
+//! ```text
+//!   g = max(field − iso, b)        (g < 0  ⟺  field < iso  AND  b < 0)
+//! ```
 //!
-//! Their seam is the curve `field == iso AND b == 0`. Watertightness holds iff
-//! both pieces place the *identical* vertex on that seam. Because a leaf emits
-//! exactly one vertex (its `out_index`) and both the field pass and the cap pass
-//! reference that same vertex, seam sharing is automatic — provided the seam
-//! leaf's single vertex actually sits on the seam, which a *joint* QEF (field +
-//! boundary Hermite samples) ensures. There are no corner / edge / triple-point
-//! special cases: manifoldness is a consequence of shared seam vertices.
+//! where `b` is the domain boundary function (`b < 0` inside). The intersection of
+//! two solids is the `max` of their signed fields (the standard SDF-CSG identity).
+//! Because the result is a SINGLE sign field, plain dual contouring meshes it
+//! watertight — the seam where the contact meets the boundary is just an ordinary
+//! crease, with no separate "cap" surface to stitch. The single QEF vertex per
+//! cell already minimizes the *joint* QEF of the field AND boundary Hermite
+//! samples, so the crease vertex snaps to the contact/boundary intersection.
+//!
+//! (An earlier design contoured the field surface and the boundary cap as two
+//! separate passes and tried to reconcile their seam; that cannot be made manifold
+//! for boundaries not aligned to the grid — the two passes discretize the seam
+//! curve into different edges. The CSG-union reframing removes the problem at the
+//! root. The one case it does not cover is a true two-components-in-one-cell, e.g.
+//! a sharp boundary crease, which needs Manifold Dual Contouring's per-cell vertex
+//! split — Schaefer/Ju/Warren 2007 — left as a follow-up.)
+//!
+//! With the cap disabled (`OctreeConfig::cap = false`) only `field == iso` is
+//! contoured (clipped to the domain) — an OPEN bounded sheet.
 //!
 //! The domain boundary is reached only through the [`Boundary`] trait (sign at a
 //! point; Hermite data at a sign-changing edge). The contourer never references
 //! box geometry directly — that is the load-bearing abstraction that lets tilted
-//! faults and triangulated fault meshes drop in later as new `Boundary` impls
-//! with zero contouring-code changes.
+//! faults and triangulated fault meshes drop in as new `Boundary` impls with zero
+//! contouring-code changes.
 //!
 //! Field Hermite data (zero-crossings + analytic gradients) comes from
 //! `Model::scalar_field` / `scalar_field_gradient`. The vertex/QEF machinery is
@@ -383,10 +393,23 @@ pub fn octree_dual_contour(
     octree_dual_contour_bounded(model, &boundary, min, size, isovalue, cfg)
 }
 
-/// Dual-contour `field == isovalue`, closing the mesh against an arbitrary
-/// [`Boundary`]. The interior `field` surface is kept where `boundary.inside`,
-/// and a cap on `b == 0` is contoured where `field < isovalue`; the two pieces
-/// share seam vertices. `[min, min+size]³` is the octree's sampling cube.
+/// Dual-contour `field == isovalue`, closed against an arbitrary [`Boundary`].
+///
+/// With `cfg.cap = true` (the default) this contours the **combined solid field**
+/// `g = max(field − iso, b)` as a SINGLE dual-contouring pass — the standard CSG
+/// intersection-of-SDFs identity (`g < 0` ⟺ `field < iso` AND inside the domain).
+/// Because there is one sign field, the seam where the contact meets the boundary
+/// is just an ordinary crease that DC meshes watertight — no field/cap split, no
+/// seam reconciliation. (This replaced an earlier two-pass field+cap scheme whose
+/// seam could not be made manifold for non-grid-aligned boundaries; see the module
+/// note and `docs/`.) The single QEF vertex per cell already carries both the
+/// field and the boundary Hermite samples, so the crease vertex snaps to the
+/// contact/boundary intersection.
+///
+/// With `cfg.cap = false` this contours just the **field surface clipped to the
+/// domain** — an OPEN sheet (the bounded contact surface), no cap.
+///
+/// `[min, min+size]³` is the octree's sampling cube.
 pub fn octree_dual_contour_bounded(
     model: &Model,
     boundary: &dyn Boundary,
@@ -404,42 +427,25 @@ pub fn octree_dual_contour_bounded(
     balance(&mut tree, model, boundary, isovalue, &cfg);
 
     let mut mesh = Mesh::default();
-    // Emit each surface leaf's joint-QEF vertex; record out_index. One vertex per
-    // leaf, shared by the field pass and the cap pass (the seam-sharing guarantee).
-    assign_vertices(&mut tree, &mut mesh);
-    // Field surface: quads on field minimal edges, clipped to inside the domain.
-    // We collect every emitted field edge (as an out_index pair); the cap pass
-    // uses it to avoid double-covering an edge the field already owns.
-    // Field edges keyed to their incidence (1 = the field surface's boundary,
-    // i.e. the seam; 2 = interior field edge). The cap pass uses this to drop only
-    // INTERIOR field edges and keep seam edges so they pair (1 field + 1 cap).
-    let mut field_edges: std::collections::HashMap<(u32, u32), u32> =
-        std::collections::HashMap::new();
-    contour_field_edges(&tree, boundary, &mut mesh, &mut field_edges);
-    let field_tris_end = mesh.indices.len();
-    // Boundary cap: dual-contour `b == 0` on boundary minimal edges, clipped to
-    // `field < iso`. Same edge-iteration machine, run on the boundary sign field.
-    // A cap triangle that would reuse a field edge is dropped: the seam belongs to
-    // the field surface, and the cap abuts it rather than overlapping (this is what
-    // drives non-manifold edges to zero — see `contour_cap_edges`). Skipped when
-    // `cfg.cap` is false: then the field sheet is emitted open (bounded by, but not
-    // closed against, the domain).
-    if cfg.cap {
-        contour_cap_edges(&tree, model, boundary, isovalue, &field_edges, &mut mesh);
-    }
-
-    // Orient the FIELD triangles toward the field gradient (fixes whole-patch
-    // winding flips that local edge winding can leave). Cap triangles lie on
-    // `b == 0`, where the field gradient is unrelated to their facing, so they are
-    // wound by construction (boundary-sign direction) and excluded here.
-    orient_field_to_gradient(model, &mut mesh, field_tris_end);
+    assign_vertices(&mut tree, &mut mesh, cfg.cap);
+    contour_edges(&tree, boundary, &mut mesh, cfg.cap);
+    orient_outward(model, boundary, isovalue, &mut mesh, cfg.cap);
     mesh
 }
 
-/// Flip each FIELD triangle (indices `0..end`) whose geometric normal opposes the
-/// field gradient at its centroid, so all field faces point toward increasing
-/// field. Cap triangles (after `end`) are left as wound.
-fn orient_field_to_gradient(model: &Model, mesh: &mut Mesh, end: usize) {
+/// Orient every triangle to face OUT of the solid (or, for the open sheet, toward
+/// increasing field).
+///
+/// Sheet (`cap = false`): the only surface is `field == iso`, so face the field
+/// gradient (toward increasing field) — same as before.
+///
+/// Solid (`cap = true`): the surface is the boundary of `{ field < iso AND inside
+/// }`, made of field patches and boundary-cap patches; the field gradient is
+/// unrelated to the cap's facing. Instead, probe the combined sign just off the
+/// centroid along the geometric normal: if stepping `+normal` lands INSIDE the
+/// solid, the normal points inward, so flip. This needs only `field` and
+/// `boundary.inside` — no free-space boundary gradient.
+fn orient_outward(model: &Model, boundary: &dyn Boundary, isovalue: f64, mesh: &mut Mesh, cap: bool) {
     let pos = |i: u32| {
         let b = (i as usize) * 3;
         [
@@ -448,7 +454,9 @@ fn orient_field_to_gradient(model: &Model, mesh: &mut Mesh, end: usize) {
             mesh.positions[b + 2] as f64,
         ]
     };
-    let tri_count = end / 3;
+    // Inside the solid: field < iso AND inside the domain.
+    let inside_solid = |p: [f64; 3]| model.scalar_field(p) - isovalue < 0.0 && boundary.inside(p);
+    let tri_count = mesh.indices.len() / 3;
     for t in 0..tri_count {
         let i0 = mesh.indices[3 * t];
         let i1 = mesh.indices[3 * t + 1];
@@ -468,8 +476,22 @@ fn orient_field_to_gradient(model: &Model, mesh: &mut Mesh, end: usize) {
             (a[1] + b[1] + c[1]) / 3.0,
             (a[2] + b[2] + c[2]) / 3.0,
         ];
-        let g = model.scalar_field_gradient(ctr);
-        if n[0] * g[0] + n[1] * g[1] + n[2] * g[2] < 0.0 {
+        let flip = if cap {
+            // Step a short way along +normal; if that is inside the solid, the
+            // normal points inward → flip.
+            let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt().max(1e-30);
+            let eps = 1e-3 * (1.0 + ctr[0].abs() + ctr[1].abs() + ctr[2].abs());
+            let probe = [
+                ctr[0] + n[0] / len * eps,
+                ctr[1] + n[1] / len * eps,
+                ctr[2] + n[2] / len * eps,
+            ];
+            inside_solid(probe)
+        } else {
+            let g = model.scalar_field_gradient(ctr);
+            n[0] * g[0] + n[1] * g[1] + n[2] * g[2] < 0.0
+        };
+        if flip {
             mesh.indices[3 * t + 1] = i2;
             mesh.indices[3 * t + 2] = i1;
         }
@@ -515,6 +537,30 @@ fn has_boundary_crossing(inside: &[bool; 8]) -> bool {
 /// Is this a surface leaf — does either surface cross it?
 fn is_surface(corners: &[f64; 8], inside: &[bool; 8]) -> bool {
     has_field_crossing(corners) || has_boundary_crossing(inside)
+}
+
+/// The contoured sign at corner `c` of a leaf.
+///
+///   * Solid (`cap = true`): the combined CSG field `g = max(field − iso, b)`.
+///     `g < 0` ⟺ `field < iso` (below the contact) AND inside the domain — i.e.
+///     in the rock. The contoured surface is the boundary of that solid, and a
+///     single sign field means its seam is just a crease (watertight by DC).
+///   * Sheet (`cap = false`): the field sign alone (`field < iso`); the surface
+///     is `field == iso`, later clipped to inside the domain at quad emission.
+#[inline]
+fn corner_sign(corners: &[f64; 8], inside: &[bool; 8], c: usize, cap: bool) -> bool {
+    if cap {
+        corners[c] <= 0.0 && inside[c]
+    } else {
+        corners[c] <= 0.0
+    }
+}
+
+/// Does the contoured sign change across this leaf (any of its 12 edges)?
+fn has_contour_crossing(corners: &[f64; 8], inside: &[bool; 8], cap: bool) -> bool {
+    CELL_EDGES
+        .iter()
+        .any(|&(a, b)| corner_sign(corners, inside, a, cap) != corner_sign(corners, inside, b, cap))
 }
 
 /// World position of corner `c` of the cell `(min, size)`.
@@ -775,11 +821,14 @@ fn split_leaf(
     tree.nodes[leaf_id] = Node::Internal(Box::new(children));
 }
 
-/// Emit each surface leaf's joint-QEF vertex into the mesh, recording out_index.
-fn assign_vertices(tree: &mut Octree, mesh: &mut Mesh) {
+/// Emit the joint-QEF vertex of each leaf the contoured surface crosses, recording
+/// its out_index. The vertex itself (`l.vertex`) already minimizes the joint QEF
+/// of the field AND boundary Hermite samples, so it sits on the contact, the
+/// boundary, or their crease as appropriate.
+fn assign_vertices(tree: &mut Octree, mesh: &mut Mesh, cap: bool) {
     for id in 0..tree.nodes.len() {
         if let Node::Leaf(l) = &mut tree.nodes[id] {
-            if is_surface(&l.corners, &l.inside) {
+            if has_contour_crossing(&l.corners, &l.inside, cap) {
                 let idx = (mesh.positions.len() / 3) as u32;
                 mesh.positions.push(l.vertex[0] as f32);
                 mesh.positions.push(l.vertex[1] as f32);
@@ -793,12 +842,11 @@ fn assign_vertices(tree: &mut Octree, mesh: &mut Mesh) {
 // ---------------------------------------------------------------------------
 // Crack-free contouring by minimal-edge iteration.
 //
-// With a 2:1-balanced octree, every minimal edge that crosses a surface is shared
-// by exactly 4 leaves; we locate them by point sampling the 4 quadrant centers
-// around the edge and emit one quad. Both the FIELD pass (`contour_field_edges`)
-// and the CAP pass (`contour_cap_edges`) are this same machine, differing only in
-// (a) which sign field defines a "crossing" and (b) the clip test on the emitted
-// quad. Both reference `leaf.out_index`, so a seam leaf's single vertex is shared.
+// With a 2:1-balanced octree, every minimal edge that crosses the contoured sign
+// field is shared by exactly 4 leaves; we locate them by point sampling the 4
+// quadrant centers around the edge and emit one quad. One pass over the combined
+// sign (`corner_sign`) handles both the solid (`g = max(field−iso, b)`) and the
+// open sheet (`field`), so there is no field/cap split to reconcile.
 // ---------------------------------------------------------------------------
 
 /// Find the leaf node containing point `p` (or None if outside the tree).
@@ -904,17 +952,13 @@ fn edge_axis(ca: usize, cb: usize) -> Option<usize> {
     }
 }
 
-/// Field surface: a quad per field minimal edge whose 4 quadrant leaves all exist
-/// and whose crossing point is inside the domain (`boundary.inside`). Clipping to
-/// the domain is what makes this the `field == iso, kept where b < 0` piece. Every
-/// emitted triangle edge is recorded in `field_edges` so the cap pass can defer to
-/// the field surface on the seam (no double-covered edges).
-fn contour_field_edges(
-    tree: &Octree,
-    boundary: &dyn Boundary,
-    mesh: &mut Mesh,
-    field_edges: &mut std::collections::HashMap<(u32, u32), u32>,
-) {
+/// Contour the combined sign field (`corner_sign`) by minimal-edge iteration: one
+/// quad per minimal edge across which the sign changes, whose 4 quadrant leaves
+/// all exist (interior edge). A single pass over the combined sign meshes the whole
+/// closed solid (`cap = true`) or, for the open sheet (`cap = false`), the field
+/// surface clipped to inside the domain. Winding is provisional — `orient_outward`
+/// fixes it.
+fn contour_edges(tree: &Octree, boundary: &dyn Boundary, mesh: &mut Mesh, cap: bool) {
     let Some(finest) = finest_leaf_size(tree) else {
         return;
     };
@@ -923,13 +967,15 @@ fn contour_field_edges(
 
     for id in 0..tree.nodes.len() {
         let (lmin, lsize) = tree.bounds[id];
-        let corners = match &tree.nodes[id] {
-            Node::Leaf(l) if has_field_crossing(&l.corners) => l.corners,
+        let (corners, inside) = match &tree.nodes[id] {
+            Node::Leaf(l) if has_contour_crossing(&l.corners, &l.inside, cap) => {
+                (l.corners, l.inside)
+            }
             _ => continue,
         };
 
         for &(ca, cb) in CELL_EDGES.iter() {
-            if (corners[ca] <= 0.0) == (corners[cb] <= 0.0) {
+            if corner_sign(&corners, &inside, ca, cap) == corner_sign(&corners, &inside, cb, cap) {
                 continue;
             }
             let Some(axis) = edge_axis(ca, cb) else {
@@ -945,117 +991,29 @@ fn contour_field_edges(
                 qkey(mid[2], finest),
             );
 
-            let (leaves, ok, this_is_finest) =
-                edge_quad_leaves(tree, mid, axis, lsize, finest);
+            let (leaves, ok, this_is_finest) = edge_quad_leaves(tree, mid, axis, lsize, finest);
             if !ok || !this_is_finest || !seen.insert(key) {
                 continue;
             }
 
-            // Clip: keep the field surface only inside the domain. The field
-            // crossing point on this edge is the natural membership probe.
-            let t = corners[ca] / (corners[ca] - corners[cb]);
-            let pb = corner_pos(lmin, lsize, cb);
-            let cross = [
-                p0[0] + (pb[0] - p0[0]) * t,
-                p0[1] + (pb[1] - p0[1]) * t,
-                p0[2] + (pb[2] - p0[2]) * t,
-            ];
-            if !boundary.inside(cross) {
-                continue;
+            // Open-sheet mode (`cap = false`) contours `field == iso` over the whole
+            // octree cube; clip it to the domain so the sheet ends at the boundary.
+            // (Solid mode needs no clip — the combined sign IS the clip.)
+            if !cap {
+                let t = corners[ca] / (corners[ca] - corners[cb]);
+                let pb = corner_pos(lmin, lsize, cb);
+                let cross = [
+                    p0[0] + (pb[0] - p0[0]) * t,
+                    p0[1] + (pb[1] - p0[1]) * t,
+                    p0[2] + (pb[2] - p0[2]) * t,
+                ];
+                if !boundary.inside(cross) {
+                    continue;
+                }
             }
 
-            emit_edge_quad(tree, &leaves, mesh, field_edges);
+            emit_quad(tree, &leaves, mesh);
         }
-    }
-}
-
-/// Boundary cap: dual-contour `b == 0` on boundary minimal edges, clipped to
-/// `field < iso` (the wall actually inside the rock). Same edge-iteration machine
-/// as the field pass, keyed on boundary sign instead of field sign.
-fn contour_cap_edges(
-    tree: &Octree,
-    model: &Model,
-    boundary: &dyn Boundary,
-    isovalue: f64,
-    field_edges: &std::collections::HashMap<(u32, u32), u32>,
-    mesh: &mut Mesh,
-) {
-    let Some(finest) = finest_leaf_size(tree) else {
-        return;
-    };
-    let mut seen: std::collections::HashSet<(usize, i64, i64, i64)> =
-        std::collections::HashSet::new();
-
-    for id in 0..tree.nodes.len() {
-        let (lmin, lsize) = tree.bounds[id];
-        let inside = match &tree.nodes[id] {
-            Node::Leaf(l) if has_boundary_crossing(&l.inside) => l.inside,
-            _ => continue,
-        };
-
-        let corners = match &tree.nodes[id] {
-            Node::Leaf(l) => l.corners,
-            _ => continue,
-        };
-
-        for &(ca, cb) in CELL_EDGES.iter() {
-            if inside[ca] == inside[cb] {
-                continue;
-            }
-            // Seam edge: a minimal edge crossed by BOTH surfaces is the seam
-            // (`field == iso AND b == 0`). Its 4 incident leaves are all seam
-            // cells, so the field pass already emitted this exact quad of shared
-            // seam vertices. Emitting it again here would double-cover the seam
-            // (every such edge became a non-manifold (2 field, 2 cap) edge). The
-            // field pass owns it; skip it.
-            if (corners[ca] <= 0.0) != (corners[cb] <= 0.0) {
-                continue;
-            }
-            let Some(axis) = edge_axis(ca, cb) else {
-                continue;
-            };
-            let p0 = corner_pos(lmin, lsize, ca);
-            let mut mid = p0;
-            mid[axis] += lsize * 0.5;
-            let key = (
-                axis,
-                qkey(mid[0], finest),
-                qkey(mid[1], finest),
-                qkey(mid[2], finest),
-            );
-
-            let (leaves, ok, this_is_finest) =
-                edge_quad_leaves(tree, mid, axis, lsize, finest);
-            if !ok || !this_is_finest || !seen.insert(key) {
-                continue;
-            }
-
-            // Clip the cap to the rock: keep `b == 0` only where field < iso, using
-            // the boundary crossing point on this edge as the probe.
-            let pb = corner_pos(lmin, lsize, cb);
-            let probe = match boundary.edge_crossing(p0, pb) {
-                Some((p, _)) => p,
-                None => continue,
-            };
-            if model.scalar_field(probe) - isovalue >= 0.0 {
-                continue;
-            }
-
-            // Wind so the cap faces OUT of the domain. `inside[ca] == true` means
-            // corner ca is inside; the boundary normal points from inside→outside,
-            // i.e. along +axis when ca (the low corner on this axis) is inside.
-            let outward_pos_axis = inside[ca];
-            emit_cap_quad(tree, &leaves, outward_pos_axis, field_edges, mesh);
-        }
-    }
-}
-
-/// Undirected edge key (sorted), used to dedup field/cap edges.
-fn edge_key(a: u32, b: u32) -> (u32, u32) {
-    if a < b {
-        (a, b)
-    } else {
-        (b, a)
     }
 }
 
@@ -1071,73 +1029,15 @@ fn quad_vertices(tree: &Octree, leaves: &[NodeId; 4]) -> Option<[u32; 4]> {
     Some(vtx)
 }
 
-/// Emit the field quad (two triangles) from the 4 quadrant leaves' shared
-/// vertices, recording every emitted edge in `field_edges`. Winding here is
-/// provisional — `orient_field_to_gradient` fixes it.
-fn emit_edge_quad(
-    tree: &Octree,
-    leaves: &[NodeId; 4],
-    mesh: &mut Mesh,
-    field_edges: &mut std::collections::HashMap<(u32, u32), u32>,
-) {
+/// Emit the quad (two triangles) from the 4 quadrant leaves' shared vertices.
+fn emit_quad(tree: &Octree, leaves: &[NodeId; 4], mesh: &mut Mesh) {
     let Some(vtx) = quad_vertices(tree, leaves) else {
         return;
     };
     for tri in [[vtx[0], vtx[1], vtx[2]], [vtx[0], vtx[2], vtx[3]]] {
         if tri[0] != tri[1] && tri[1] != tri[2] && tri[0] != tri[2] {
             mesh.indices.extend_from_slice(&tri);
-            *field_edges.entry(edge_key(tri[0], tri[1])).or_insert(0) += 1;
-            *field_edges.entry(edge_key(tri[1], tri[2])).or_insert(0) += 1;
-            *field_edges.entry(edge_key(tri[2], tri[0])).or_insert(0) += 1;
         }
-    }
-}
-
-/// Emit the cap quad from the 4 quadrant leaves' shared vertices, wound so the
-/// face points out of the domain. The quadrant order `edge_quad_leaves` returns
-/// is CCW about +axis (centers at (−,−),(+,−),(+,+),(−,+) in the (u,v) plane);
-/// that winding faces +axis, so we reverse it when the outward normal is −axis.
-///
-/// The seam is shared: a cap triangle is dropped only if it FULLY duplicates a
-/// field triangle (all three edges already field-owned). A seam-straddling quad is
-/// a trapezoid that shares only its ONE top edge with the field; that edge must
-/// PAIR (one field tri + one cap tri), not be dropped, or the seam opens. Dropping
-/// on *any* shared edge (the earlier rule) over-pruned these trapezoids — that,
-/// plus the per-edge clip, was the source of the seam cracks. The "fully
-/// duplicate" rule still kills the box's grid-aligned cap≡field quads (all three
-/// edges shared) that would otherwise be (2,2) non-manifold.
-fn emit_cap_quad(
-    tree: &Octree,
-    leaves: &[NodeId; 4],
-    outward_pos_axis: bool,
-    field_edges: &std::collections::HashMap<(u32, u32), u32>,
-    mesh: &mut Mesh,
-) {
-    let Some(mut vtx) = quad_vertices(tree, leaves) else {
-        return;
-    };
-    if !outward_pos_axis {
-        vtx.reverse();
-    }
-    // Drop a cap triangle whose edge is an INTERIOR field edge (field incidence
-    // >= 2): the field surface already has two triangles there, so a cap triangle
-    // would over-cover it. A field BOUNDARY edge (incidence 1) is the seam — keep
-    // the cap triangle so that edge PAIRS (1 field + 1 cap), closing the seam.
-    // (This incidence-aware rule replaced "drop on any shared edge", which
-    // over-pruned seam-straddling trapezoids and left the seam open — it makes the
-    // flat-contact box solid fully watertight.)
-    let interior = |e: (u32, u32)| field_edges.get(&e).copied().unwrap_or(0) >= 2;
-    for tri in [[vtx[0], vtx[1], vtx[2]], [vtx[0], vtx[2], vtx[3]]] {
-        if tri[0] == tri[1] || tri[1] == tri[2] || tri[0] == tri[2] {
-            continue;
-        }
-        if interior(edge_key(tri[0], tri[1]))
-            || interior(edge_key(tri[1], tri[2]))
-            || interior(edge_key(tri[2], tri[0]))
-        {
-            continue;
-        }
-        mesh.indices.extend_from_slice(&tri);
     }
 }
 
@@ -1161,11 +1061,13 @@ mod tests {
     #[test]
     fn octree_produces_a_sheet_near_z1() {
         let model = flat_model();
+        // Open-sheet view (no cap): just the contact surface, so footprint
+        // vertices sit near the contact at z=1.
         let cfg = OctreeConfig {
             max_depth: 5,
             min_depth: 2,
             qef_threshold: 1e-5,
-            cap: true,
+            cap: false,
         };
         let mesh = octree_dual_contour(&model, [-0.5, -0.5, 0.0], 2.0, 0.0, cfg);
         assert!(mesh.vertex_count() > 0, "no vertices");
@@ -1319,64 +1221,16 @@ mod tests {
                 *undirected.entry(e).or_insert(0) += 1;
             }
         }
+        // STRICTLY watertight closed solid: every edge incidence is exactly 2 —
+        // zero non-manifold (>2), zero open (1). Contouring the single combined
+        // field `g = max(field − iso, b)` makes the CURVED contact-meets-box seam
+        // a plain crease, so it closes watertight (no field/cap seam to reconcile).
         let nonmanifold = undirected.values().filter(|&&c| c > 2).count();
+        let open = undirected.values().filter(|&&c| c == 1).count();
         let total = undirected.len();
+        assert_eq!(nonmanifold, 0, "non-manifold edges: {nonmanifold}/{total}");
+        assert_eq!(open, 0, "open edges (not watertight): {open}/{total}");
 
-        // Interior holes = boundary edges (shared by 1 triangle) whose BOTH
-        // endpoints are off the domain faces. With the field/cap union sharing
-        // seam vertices there should be none.
-        let on_face_v = |i: u32| -> bool {
-            let b = (i as usize) * 3;
-            let x = mesh.positions[b] as f64;
-            let y = mesh.positions[b + 1] as f64;
-            let z = mesh.positions[b + 2] as f64;
-            x.abs() < 1.0
-                || (x - 1000.0).abs() < 1.0
-                || y.abs() < 1.0
-                || (y - 1000.0).abs() < 1.0
-                || z.abs() < 1.0
-                || (z - 1000.0).abs() < 1.0
-        };
-        let interior_holes = undirected
-            .iter()
-            .filter(|(_, &c)| c == 1)
-            .filter(|((a, b), _)| !on_face_v(*a) && !on_face_v(*b))
-            .count();
-        assert_eq!(
-            interior_holes, 0,
-            "interior holes (gaps/unclosed corners): {interior_holes}"
-        );
-        // Watertight: the field surface and the boundary cap share seam vertices
-        // and the cap defers to the field on every shared edge, so NO edge is
-        // covered by more than two triangles. Zero non-manifold edges (step 2).
-        assert_eq!(
-            nonmanifold, 0,
-            "non-manifold edges: {nonmanifold}/{total}"
-        );
-
-        // Every remaining boundary edge (incidence 1) lies ON the domain box —
-        // both endpoints on a face. For this OPEN-sheet view (the field surface
-        // clipped to the box) that is the legitimate rim.
-        //
-        // CAVEAT / known residual: with `cap = true` this same paraboloid leaves a
-        // band of open edges along the field/cap seam where the CURVED contact
-        // meets the box walls. Those open edges are face-resident, so they pass
-        // this rim check too — i.e. this assertion does NOT certify the curved
-        // closed solid as watertight. The flat-contact closed solid IS watertight
-        // (`flat_contact_closed_solid_is_watertight`); the curved-contact seam is
-        // the remaining manifold-DC residual. Don't read this passing test as
-        // "curved closed solid is watertight".
-        let bad_rim = undirected
-            .iter()
-            .filter(|(_, &c)| c == 1)
-            .filter(|((a, b), _)| !on_face_v(*a) || !on_face_v(*b))
-            .count();
-        assert_eq!(bad_rim, 0, "boundary edges off the domain rim: {bad_rim}");
-
-        // Field-normal orientation is enforced at emission by
-        // `orient_field_to_gradient`; the field/cap split is not recoverable from
-        // the final mesh, so we don't re-assert per-triangle gradient agreement
-        // here. `dir` is retained for a possible future edge-pairing check.
         let _ = &dir;
     }
 
@@ -1457,26 +1311,22 @@ mod tests {
         );
     }
 
-    /// Step 3: the `Boundary` trait generalizes off the box with ZERO contouring-
-    /// code changes — a `TriMesh` (closed polyhedron) drops in as a new impl. A
-    /// tilted-plane field is closed against an octahedron mesh that the plane cuts
-    /// through (a real seam on tilted, grid-misaligned faces).
+    /// The `Boundary` trait generalizes off the box with ZERO contouring-code
+    /// changes — a `TriMesh` (closed polyhedron) drops in as a new impl. A tilted-
+    /// plane contact is closed against an octahedron mesh the plane cuts through (a
+    /// real seam on tilted, grid-misaligned faces).
     ///
-    /// What this asserts holds today: the trait produces a non-trivial mesh; the
-    /// vertices respect the mesh boundary; and there are ZERO non-manifold
-    /// (over-incident) edges — the field/cap edge-dedup from step 2 carries over.
+    /// Contouring the combined field `g = max(field − iso, b)` (one DC pass) makes
+    /// the contact-meets-boundary seam a watertight crease — ZERO open edges, even
+    /// on the tilted faces that the earlier two-pass scheme could not stitch.
     ///
-    /// What it does NOT yet assert: full watertightness (zero open edges). Unlike
-    /// the axis-aligned box — whose cap lies on grid-aligned cube faces, so the
-    /// seam runs along cell faces and stitches cleanly — a general INTERIOR cap
-    /// (tilted, offset from the grid) leaves a band of open edges exactly at the
-    /// field seam (`field ≈ iso`). The field-pass clip (`inside(crossing)`) and
-    /// the cap-pass clip (`field < iso`) disagree by one cell right at the seam,
-    /// so a thin strip is dropped by both. Closing it cleanly needs the manifold
-    /// dual-contouring seam handling (Schaefer/Zhang) — splitting cells where the
-    /// field sheet and the cap pass through one cell — which is the flagged STEP 4.
-    /// The count is asserted as a regression *ceiling*, not zero, so the limitation
-    /// is visible and a step-4 fix is measured against it.
+    /// Residual: the octahedron's sharp CREASES (where two coarse mesh faces meet
+    /// at a hard edge) are a genuine "two surface components in one cell" case that
+    /// a single QEF vertex per cell cannot resolve — it leaves a tiny number of
+    /// non-manifold edges (a handful out of thousands). That is the one case the
+    /// CSG-union approach does NOT cover; the textbook fix is Manifold Dual
+    /// Contouring's per-cell vertex split (Schaefer/Ju/Warren 2007), tracked as a
+    /// possible follow-up. We assert a small ceiling, not zero, and log the count.
     #[test]
     fn trimesh_boundary_generalizes_off_the_box() {
         use std::collections::HashMap;
@@ -1508,9 +1358,6 @@ mod tests {
             mesh.triangle_count()
         );
 
-        // Zero non-manifold edges (the step-2 edge-dedup guarantee carries to mesh
-        // boundaries). This is the one watertightness property that holds today for
-        // a general interior cap.
         let mut undirected: HashMap<(u32, u32), u32> = HashMap::new();
         for t in mesh.indices.chunks_exact(3) {
             for &(a, b) in &[(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
@@ -1519,36 +1366,19 @@ mod tests {
             }
         }
         let nonmanifold = undirected.values().filter(|&&c| c > 2).count();
-        assert_eq!(nonmanifold, 0, "non-manifold edges: {nonmanifold}");
+        let open = undirected.values().filter(|&&c| c == 1).count();
+        let total = undirected.len();
 
-        // KNOWN LIMITATION (step-4 territory), measured but not yet zero:
-        //   * open edges at the interior-cap seam — the per-edge clip drops a thin
-        //     seam strip that neither the field pass nor the cap pass keeps;
-        //   * field vertices reaching just outside the cap — the per-edge clip
-        //     keeps a quad whose far vertices straddle the tilted boundary.
-        // Both stem from clipping the field/cap surfaces at a single per-edge probe
-        // instead of clipping the quads against the boundary. The grid-aligned box
-        // avoids both because its cap lies on cell faces; a general (tilted, offset)
-        // mesh cap does not. The clean fix is manifold dual contouring with proper
-        // clipping at the seam (Schaefer/Zhang) — the flagged STEP 4. These counts
-        // are logged (run with --nocapture) so a step-4 fix has a baseline to beat.
-        let open_edges = undirected.values().filter(|&&c| c == 1).count();
-        let referenced: std::collections::HashSet<u32> = mesh.indices.iter().copied().collect();
-        let escaped = referenced
-            .iter()
-            .filter(|&&i| {
-                let b = (i as usize) * 3;
-                boundary.winding([
-                    mesh.positions[b] as f64,
-                    mesh.positions[b + 1] as f64,
-                    mesh.positions[b + 2] as f64,
-                ]) <= 0.35
-            })
-            .count();
-        eprintln!(
-            "[step-3 baseline] tris={} open_edges={open_edges} escaped_verts={escaped}/{}",
-            mesh.triangle_count(),
-            referenced.len()
+        // The contact/boundary seam closes watertight — zero open edges.
+        assert_eq!(open, 0, "open edges at the seam: {open}/{total}");
+
+        // The only residual is at the octahedron's sharp creases (true two-
+        // components-in-one-cell). Bound it small; it should be a handful, not a
+        // band. (Manifold DC vertex-split would drive it to zero — see the doc.)
+        assert!(
+            nonmanifold <= 8,
+            "non-manifold edges beyond the sharp-crease residual: {nonmanifold}/{total}"
         );
+        eprintln!("[trimesh] tris={} open={open} crease_nm={nonmanifold}", mesh.triangle_count());
     }
 }
