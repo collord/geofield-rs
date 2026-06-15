@@ -685,6 +685,17 @@ fn is_surface(corners: &[f64; 8], inside: &[bool; 8]) -> bool {
 /// Returns `(comp, ncomp)`: `comp[c]` is the component id of corner `c` if it is a
 /// minority corner, else `u8::MAX`; `ncomp` is the number of components. A surface-
 /// crossing cell always has `ncomp >= 1`; the common case is exactly 1.
+///
+/// LATENT for smooth implicit geology. Empirically, CSG combinations of smooth
+/// cokriging fields (erosion truncating a contact, faults offsetting a contact,
+/// crossing contacts) produce a CREASE — one connected component per cell — which
+/// the CSG-union contour already meshes watertight; they do NOT produce the two-
+/// disconnected-sheets-in-one-cell case (`ncomp >= 2`). That case arises from
+/// marching-cubes ambiguous faces and from sharp creases in an explicit INPUT mesh
+/// boundary (e.g. a faceted fault / the test octahedron's edges). This split is
+/// kept as the correct, unit-tested handling for those — but for the smooth-field
+/// path it (correctly) never fires. The thin-grazing-layer case that DOES break is
+/// sub-cell undersampling, addressed by refinement, not by this split.
 fn minority_components(sign: &[bool; 8]) -> ([u8; 8], usize) {
     let inside_count = sign.iter().filter(|&&b| b).count();
     let minority = inside_count <= 4; // rarer sign; tie → inside
@@ -1678,12 +1689,100 @@ mod tests {
         // routing where a crease coincides with a 2:1 transition). Bound it small —
         // a few edges out of thousands, not a band. The smooth two-field truncation
         // (the geologic target) is asserted strictly watertight in
-        // `two_field_truncation_is_watertight`; this coarse-polyhedron crease is a
+        // `csg_truncation_is_watertight`; this coarse-polyhedron crease is a
         // synthetic worst case kept as a small non-zero ceiling on purpose.
         assert!(
             open + nonmanifold <= 8,
             "crease residual grew beyond a handful: open={open} nm={nonmanifold} / {total}"
         );
         eprintln!("[trimesh] tris={} open={open} crease_nm={nonmanifold}", mesh.triangle_count());
+    }
+
+    /// A planar contact `z = z0 + sx*(x-500) + sy*(y-500)` as a fitted Model. The
+    /// field increases upward, so `field < iso0` (iso0 = the recovered isovalue) is
+    /// below the contact.
+    fn dipping_plane(z0: f64, sx: f64, sy: f64) -> (Model, f64) {
+        let mut sps = Vec::new();
+        for i in 0..4 {
+            for j in 0..4 {
+                let x = i as f64 * 300.0 + 50.0;
+                let y = j as f64 * 300.0 + 50.0;
+                let z = z0 + sx * (x - 500.0) + sy * (y - 500.0);
+                sps.push(SurfacePoint::new([x, y, z], 0));
+            }
+        }
+        let oris = vec![Orientation::new([500.0, 500.0, z0], normalize([-sx, -sy, 1.0]))];
+        let model = Model::fit(&Series::new(sps, oris), KernelOptions::default());
+        let iso = model.lithology().interfaces[0].isovalue;
+        (model, iso)
+    }
+
+    /// An erosion/unconformity contact truncating a conformable contact — two
+    /// surfaces intersecting inside the domain, combined as one CSG `Scene` solid
+    /// `{ below primary } ∩ { below erosion } ∩ { in box }` and contoured in one
+    /// pass. The mesh must be watertight (every edge incidence exactly 2) at both a
+    /// STEEP and a LOW-ANGLE crossing.
+    ///
+    /// NOTE on what this does and does NOT exercise: the boundary of the CSG
+    /// intersection at the contacts' meeting line is a CREASE (one sheet bending),
+    /// not two disconnected sheets in a cell — so the combined-sign cells stay
+    /// single-component and the CSG-union contour already closes them watertight
+    /// (confirmed: this geometry produces zero multi-component cells at this
+    /// resolution). The per-component Manifold-DC split (`minority_components` /
+    /// per-component `cell_vertices`) is therefore NOT what makes this pass; it is
+    /// latent here. (Smooth-geologic CSG combinations were found not to produce the
+    /// two-disconnected-sheets-in-one-cell case the split fixes — that arises from
+    /// MC ambiguous faces and sharp INPUT-MESH creases, e.g. a faceted fault. The
+    /// genuinely hard thin-grazing-layer case is sub-cell undersampling, addressed
+    /// by refinement, not vertex-splitting.) This test guards the CSG-truncation
+    /// watertightness that geology actually relies on.
+    #[test]
+    fn csg_truncation_is_watertight() {
+        use std::collections::HashMap;
+
+        // Two contacts crossing near the domain center. `primary` dips gently one
+        // way; `erosion` dips the OTHER way by `slope`, so they intersect along a
+        // line through z≈600. Small `slope` → low crossing angle (wider two-sheet
+        // band); large `slope` → steep.
+        let check = |slope: f64, label: &str| {
+            let (m_primary, iso_p) = dipping_plane(600.0, 0.05, 0.0);
+            let (m_erosion, iso_e) = dipping_plane(600.0, -slope, 0.0);
+            let box_b = AxisBox::new([0.0, 0.0, 0.0], 1000.0);
+            let erosion = ContactSurface::new(&m_erosion, iso_e);
+            let scene = Scene::new(&m_primary, iso_p, vec![&box_b, &erosion]);
+
+            let cfg = OctreeConfig {
+                max_depth: 6,
+                min_depth: 3,
+                qef_threshold: 1e-6,
+                cap: true,
+            };
+            let mesh = octree_dual_contour_scene(&scene, [0.0, 0.0, 0.0], 1000.0, cfg);
+            assert!(
+                mesh.triangle_count() > 100,
+                "{label}: trivial mesh ({} tris) — surfaces didn't intersect in-domain",
+                mesh.triangle_count()
+            );
+
+            let mut undirected: HashMap<(u32, u32), u32> = HashMap::new();
+            for t in mesh.indices.chunks_exact(3) {
+                for &(a, b) in &[(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+                    let e = if a < b { (a, b) } else { (b, a) };
+                    *undirected.entry(e).or_insert(0) += 1;
+                }
+            }
+            let nonmanifold = undirected.values().filter(|&&c| c > 2).count();
+            let open = undirected.values().filter(|&&c| c == 1).count();
+            let total = undirected.len();
+            eprintln!(
+                "[truncation {label}] slope={slope} tris={} nm={nonmanifold} open={open}/{total}",
+                mesh.triangle_count()
+            );
+            assert_eq!(nonmanifold, 0, "{label}: non-manifold edges {nonmanifold}/{total}");
+            assert_eq!(open, 0, "{label}: open edges {open}/{total}");
+        };
+
+        check(0.7, "steep");
+        check(0.08, "low-angle");
     }
 }
