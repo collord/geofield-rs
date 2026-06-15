@@ -158,23 +158,12 @@ impl<'a> Scene<'a> {
         self.model.scalar_field(p) - self.isovalue
     }
 
-    /// Is `p` inside the primary contact (below it)?
-    fn primary_inside(&self, p: [f64; 3]) -> bool {
-        self.primary(p) < 0.0
-    }
-
     /// Is `p` inside every contributor (the domain ∩ all truncating surfaces)?
     fn contributors_inside(&self, p: [f64; 3]) -> bool {
         self.contributors.iter().all(|c| c.inside(p))
     }
 
-    /// Is `p` inside the combined solid (below the contact AND inside all
-    /// contributors)? This is `g < 0`.
-    fn inside_solid(&self, p: [f64; 3]) -> bool {
-        self.primary_inside(p) && self.contributors_inside(p)
-    }
-
-    /// Primary-contact gradient at `p` (orients the open sheet).
+    /// Primary-contact gradient at `p`.
     fn primary_gradient(&self, p: [f64; 3]) -> [f64; 3] {
         self.model.scalar_field_gradient(p)
     }
@@ -604,69 +593,22 @@ pub fn octree_dual_contour_scene(
     refine_double_crossed(&mut tree, scene, &cfg);
     balance(&mut tree, scene, &cfg);
 
+    // Always contour the watertight closed SOLID — its boundary closure handles the
+    // contact-meets-domain seam cleanly (a bare open sheet has no such closure and
+    // tears at the boundary). For the open-sheet view (`cap = false`) we then keep
+    // only the contact (field-crossing) faces, leaving the contact surface flush
+    // along the boundary. Each triangle is tagged at emission as a contact face
+    // (the primary field crosses its minimal edge) or a cap face (a contributor
+    // surface crosses it) — unambiguous, unlike a post-hoc geometric test.
     let mut mesh = Mesh::default();
-    assign_vertices(&mut tree, scene, &mut mesh, cfg.cap);
-    contour_edges(&tree, scene, &mut mesh, cfg.cap);
-    orient_outward(scene, &mut mesh, cfg.cap);
+    let mut contact_face: Vec<bool> = Vec::new();
+    assign_vertices(&mut tree, scene, &mut mesh, true);
+    contour_edges(&tree, scene, &mut mesh, &mut contact_face);
+    orient_closed_outward(&mut mesh);
+    if !cfg.cap {
+        keep_contact_faces(&mut mesh, &contact_face);
+    }
     mesh
-}
-
-/// Orient triangles to face OUT of the solid (closed cap) or toward increasing
-/// field (open sheet).
-///
-/// Sheet (`cap = false`): one smooth surface; face each triangle along the field
-/// gradient (toward increasing field). The gradient is a reliable per-face signal
-/// for a smooth contact.
-///
-/// Solid (`cap = true`): the surface is a closed manifold but its facing can't be
-/// reliably read per-face (an ε-probe along the normal lands on the wrong side near
-/// thin/edge cap regions, leaving a band of inconsistently-wound triangles that
-/// render as back-faces). Instead: **flood-fill** a single consistent winding
-/// across shared edges (so no two neighbors disagree — 0 inconsistent edges by
-/// construction), then flip the whole mesh once if its signed volume is negative
-/// (exact, parameter-free outward test).
-fn orient_outward(scene: &Scene, mesh: &mut Mesh, cap: bool) {
-    if cap {
-        orient_closed_outward(mesh);
-    } else {
-        orient_sheet_to_gradient(scene, mesh);
-    }
-}
-
-/// Per-face gradient orientation for the open sheet.
-fn orient_sheet_to_gradient(scene: &Scene, mesh: &mut Mesh) {
-    let pos = |i: u32| {
-        let b = (i as usize) * 3;
-        [
-            mesh.positions[b] as f64,
-            mesh.positions[b + 1] as f64,
-            mesh.positions[b + 2] as f64,
-        ]
-    };
-    let tri_count = mesh.indices.len() / 3;
-    for t in 0..tri_count {
-        let (i1, i2) = (mesh.indices[3 * t + 1], mesh.indices[3 * t + 2]);
-        let a = pos(mesh.indices[3 * t]);
-        let b = pos(i1);
-        let c = pos(i2);
-        let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
-        let ac = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
-        let n = [
-            ab[1] * ac[2] - ab[2] * ac[1],
-            ab[2] * ac[0] - ab[0] * ac[2],
-            ab[0] * ac[1] - ab[1] * ac[0],
-        ];
-        let ctr = [
-            (a[0] + b[0] + c[0]) / 3.0,
-            (a[1] + b[1] + c[1]) / 3.0,
-            (a[2] + b[2] + c[2]) / 3.0,
-        ];
-        let g = scene.primary_gradient(ctr);
-        if n[0] * g[0] + n[1] * g[1] + n[2] * g[2] < 0.0 {
-            mesh.indices[3 * t + 1] = i2;
-            mesh.indices[3 * t + 2] = i1;
-        }
-    }
 }
 
 /// Flood-fill a globally consistent winding across a closed mesh's shared edges,
@@ -1332,13 +1274,14 @@ fn edge_axis(ca: usize, cb: usize) -> Option<usize> {
     }
 }
 
-/// Contour the combined sign field (`corner_sign`) by minimal-edge iteration: one
-/// quad per minimal edge across which the sign changes, whose 4 quadrant leaves
-/// all exist (interior edge). A single pass over the combined sign meshes the whole
-/// closed solid (`cap = true`) or, for the open sheet (`cap = false`), the field
-/// surface clipped to inside the domain. Winding is provisional — `orient_outward`
-/// fixes it.
-fn contour_edges(tree: &Octree, scene: &Scene, mesh: &mut Mesh, cap: bool) {
+/// Contour the combined-solid sign field (`g`) by minimal-edge iteration: one quad
+/// per minimal edge across which the sign changes, whose 4 quadrant leaves all
+/// exist (interior edge). Meshes the watertight closed solid. Each emitted triangle
+/// is tagged in `contact_face`: `true` if the PRIMARY contact field crosses this
+/// minimal edge (a contact-surface face), `false` if only a contributor surface
+/// crosses it (a domain-cap face). Winding is provisional — orientation fixes it.
+fn contour_edges(tree: &Octree, scene: &Scene, mesh: &mut Mesh, contact_face: &mut Vec<bool>) {
+    let _ = scene;
     let Some(finest) = finest_leaf_size(tree) else {
         return;
     };
@@ -1348,14 +1291,14 @@ fn contour_edges(tree: &Octree, scene: &Scene, mesh: &mut Mesh, cap: bool) {
     for id in 0..tree.nodes.len() {
         let (lmin, lsize) = tree.bounds[id];
         let (corners, inside) = match &tree.nodes[id] {
-            Node::Leaf(l) if has_contour_crossing(&l.corners, &l.inside, cap) => {
+            Node::Leaf(l) if has_contour_crossing(&l.corners, &l.inside, true) => {
                 (l.corners, l.inside)
             }
             _ => continue,
         };
 
         for &(ca, cb) in CELL_EDGES.iter() {
-            if corner_sign(&corners, &inside, ca, cap) == corner_sign(&corners, &inside, cb, cap) {
+            if corner_sign(&corners, &inside, ca, true) == corner_sign(&corners, &inside, cb, true) {
                 continue;
             }
             let Some(axis) = edge_axis(ca, cb) else {
@@ -1376,23 +1319,11 @@ fn contour_edges(tree: &Octree, scene: &Scene, mesh: &mut Mesh, cap: bool) {
                 continue;
             }
 
-            // Open-sheet mode (`cap = false`) contours `field == iso` over the whole
-            // octree cube; clip it to the domain so the sheet ends at the boundary.
-            // (Solid mode needs no clip — the combined sign IS the clip.)
-            if !cap {
-                let t = corners[ca] / (corners[ca] - corners[cb]);
-                let pb = corner_pos(lmin, lsize, cb);
-                let cross = [
-                    p0[0] + (pb[0] - p0[0]) * t,
-                    p0[1] + (pb[1] - p0[1]) * t,
-                    p0[2] + (pb[2] - p0[2]) * t,
-                ];
-                if !scene.contributors_inside(cross) {
-                    continue;
-                }
-            }
-
-            emit_quad(tree, &leaves, axis, mid, finest, mesh);
+            // A contact face: the primary contact field crosses this minimal edge.
+            // (Otherwise the combined sign flipped only because a contributor surface
+            // crossed — a domain-cap face.)
+            let is_contact = (corners[ca] <= 0.0) != (corners[cb] <= 0.0);
+            emit_quad(tree, &leaves, axis, mid, mesh, is_contact, contact_face);
         }
     }
 }
@@ -1474,8 +1405,9 @@ fn emit_quad(
     leaves: &[NodeId; 4],
     axis: usize,
     mid: [f64; 3],
-    _finest: f64,
     mesh: &mut Mesh,
+    is_contact: bool,
+    contact_face: &mut Vec<bool>,
 ) {
     let Some(vtx) = quad_vertices(tree, leaves, axis, mid) else {
         return;
@@ -1483,8 +1415,21 @@ fn emit_quad(
     for tri in [[vtx[0], vtx[1], vtx[2]], [vtx[0], vtx[2], vtx[3]]] {
         if tri[0] != tri[1] && tri[1] != tri[2] && tri[0] != tri[2] {
             mesh.indices.extend_from_slice(&tri);
+            contact_face.push(is_contact);
         }
     }
+}
+
+/// Keep only the contact-surface faces (drop domain-cap faces), turning the closed
+/// solid into the bounded open contact sheet. `contact_face[t]` tags triangle `t`.
+fn keep_contact_faces(mesh: &mut Mesh, contact_face: &[bool]) {
+    let mut kept: Vec<u32> = Vec::new();
+    for (t, &is_contact) in contact_face.iter().enumerate() {
+        if is_contact {
+            kept.extend_from_slice(&mesh.indices[3 * t..3 * t + 3]);
+        }
+    }
+    mesh.indices = kept;
 }
 
 #[cfg(test)]
@@ -1522,12 +1467,23 @@ mod tests {
         let vmax = mesh.vertex_count() as u32;
         assert!(mesh.indices.iter().all(|&i| i < vmax), "dangling index");
 
-        // Vertices that lie within the data footprint should sit near z=1.
-        let near: Vec<f64> = mesh
-            .positions
-            .chunks_exact(3)
+        // REFERENCED vertices within the data footprint should sit near z=1. (The
+        // sheet is derived from the closed solid by keeping contact faces, so the
+        // solid's now-orphaned cap-vertex positions remain in `positions` but aren't
+        // referenced — count only referenced ones.)
+        let referenced: std::collections::HashSet<u32> = mesh.indices.iter().copied().collect();
+        let near: Vec<f64> = referenced
+            .iter()
+            .map(|&i| {
+                let b = (i as usize) * 3;
+                [
+                    mesh.positions[b] as f64,
+                    mesh.positions[b + 1] as f64,
+                    mesh.positions[b + 2] as f64,
+                ]
+            })
             .filter(|p| p[0] >= 0.0 && p[0] <= 1.0 && p[1] >= 0.0 && p[1] <= 1.0)
-            .map(|p| p[2] as f64)
+            .map(|p| p[2])
             .collect();
         assert!(!near.is_empty(), "no vertices in data footprint");
         let mean = near.iter().sum::<f64>() / near.len() as f64;
@@ -2175,5 +2131,64 @@ mod tests {
                 + a[2] * (b[0] * c[1] - b[1] * c[0]);
         }
         assert!(vol6 > 0.0, "closed solid wound inward (negative signed volume)");
+    }
+
+    /// The OPEN sheet (`cap = false`) of a CURVED contact must terminate flush along
+    /// the domain box with no torn perimeter. (The sheet is derived from the closed
+    /// solid by keeping contact faces, so it inherits the solid's clean boundary
+    /// closure instead of tearing where curved minimal-edges meet the wall.) The
+    /// only boundary edges allowed are the perimeter where the contact daylights on
+    /// a box face — both endpoints on the box.
+    #[test]
+    fn open_sheet_boundary_is_flush_on_curved_contact() {
+        use std::collections::HashMap;
+        let mut sps = Vec::new();
+        for i in 0..5 {
+            for j in 0..5 {
+                let x = i as f64 * 250.0;
+                let y = j as f64 * 250.0;
+                let z = 500.0 + 0.0008 * ((x - 500.0).powi(2) + (y - 500.0).powi(2));
+                sps.push(SurfacePoint::new([x, y, z], 0));
+            }
+        }
+        let model = Model::fit(
+            &Series::new(sps, vec![Orientation::new([500.0, 500.0, 500.0], [0.0, 0.0, 1.0])]),
+            KernelOptions::default(),
+        );
+        let cfg = OctreeConfig {
+            max_depth: 6,
+            min_depth: 2,
+            qef_threshold: 1e-4,
+            cap: false,
+        };
+        let mesh = octree_dual_contour(&model, [0.0, 0.0, 0.0], 1000.0, 0.0, cfg);
+        assert!(mesh.triangle_count() > 100);
+
+        let p = |i: u32| {
+            let b = (i as usize) * 3;
+            [
+                mesh.positions[b] as f64,
+                mesh.positions[b + 1] as f64,
+                mesh.positions[b + 2] as f64,
+            ]
+        };
+        let on_box = |q: [f64; 3]| {
+            (0..3).any(|d| q[d].abs() < 1.0 || (q[d] - 1000.0).abs() < 1.0)
+        };
+        let mut undirected: HashMap<(u32, u32), u32> = HashMap::new();
+        for t in mesh.indices.chunks_exact(3) {
+            for &(a, b) in &[(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+                let e = if a < b { (a, b) } else { (b, a) };
+                *undirected.entry(e).or_insert(0) += 1;
+            }
+        }
+        // A boundary edge (incidence 1) is allowed only on the box rim (both
+        // endpoints on a box face). An interior boundary edge is a torn perimeter.
+        let torn = undirected
+            .iter()
+            .filter(|(_, &c)| c == 1)
+            .filter(|((a, b), _)| !(on_box(p(*a)) && on_box(p(*b))))
+            .count();
+        assert_eq!(torn, 0, "open sheet has a torn (non-flush) perimeter: {torn}");
     }
 }
