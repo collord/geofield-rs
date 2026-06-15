@@ -89,6 +89,126 @@ pub trait Boundary {
     fn edge_crossing(&self, a: [f64; 3], b: [f64; 3]) -> Option<([f64; 3], [f64; 3])>;
 }
 
+/// A geologic contact (a `Model` field thresholded at an isovalue) expressed as a
+/// [`Boundary`] contributor, so it can join other surfaces in a [`Scene`]'s CSG
+/// combine. "Inside" is below the contact (`field < iso`); the crossing normal is
+/// the field gradient. This is how a second contact (e.g. an erosion surface that
+/// truncates a stack) enters the combined field as just-another-`Boundary`.
+pub struct ContactSurface<'a> {
+    model: &'a Model,
+    isovalue: f64,
+}
+
+impl<'a> ContactSurface<'a> {
+    pub fn new(model: &'a Model, isovalue: f64) -> Self {
+        Self { model, isovalue }
+    }
+}
+
+impl Boundary for ContactSurface<'_> {
+    fn inside(&self, p: [f64; 3]) -> bool {
+        self.model.scalar_field(p) - self.isovalue < 0.0
+    }
+
+    fn edge_crossing(&self, a: [f64; 3], b: [f64; 3]) -> Option<([f64; 3], [f64; 3])> {
+        let fa = self.model.scalar_field(a) - self.isovalue;
+        let fb = self.model.scalar_field(b) - self.isovalue;
+        if (fa < 0.0) == (fb < 0.0) {
+            return None;
+        }
+        let t = fa / (fa - fb);
+        let p = [
+            a[0] + (b[0] - a[0]) * t,
+            a[1] + (b[1] - a[1]) * t,
+            a[2] + (b[2] - a[2]) * t,
+        ];
+        Some((p, normalize(self.model.scalar_field_gradient(p))))
+    }
+}
+
+/// The combined implicit solid the contourer meshes: the PRIMARY contact (`model`
+/// at `isovalue`) intersected with a list of additional [`Boundary`] contributors
+/// (the domain box, erosion/truncation surfaces, …). A point is INSIDE the solid
+/// iff it is below the primary contact AND inside every contributor — the CSG
+/// intersection (`g = max` of the signed fields), expressed purely at the sign +
+/// edge-crossing level so no contributor needs a free-space scalar.
+///
+/// The primary contact is distinguished only because its gradient orients the open
+/// sheet (`cap = false`); for the closed solid all contributors are symmetric.
+pub struct Scene<'a> {
+    model: &'a Model,
+    isovalue: f64,
+    /// Additional surfaces intersected with the primary contact. The first is
+    /// conventionally the domain boundary; further entries are truncating contacts.
+    contributors: Vec<&'a dyn Boundary>,
+}
+
+impl<'a> Scene<'a> {
+    pub fn new(model: &'a Model, isovalue: f64, contributors: Vec<&'a dyn Boundary>) -> Self {
+        Self {
+            model,
+            isovalue,
+            contributors,
+        }
+    }
+
+    /// Field-minus-isovalue of the primary contact at `p` (for the open-sheet sign
+    /// and clip). Negative = below the contact.
+    fn primary(&self, p: [f64; 3]) -> f64 {
+        self.model.scalar_field(p) - self.isovalue
+    }
+
+    /// Is `p` inside the primary contact (below it)?
+    fn primary_inside(&self, p: [f64; 3]) -> bool {
+        self.primary(p) < 0.0
+    }
+
+    /// Is `p` inside every contributor (the domain ∩ all truncating surfaces)?
+    fn contributors_inside(&self, p: [f64; 3]) -> bool {
+        self.contributors.iter().all(|c| c.inside(p))
+    }
+
+    /// Is `p` inside the combined solid (below the contact AND inside all
+    /// contributors)? This is `g < 0`.
+    fn inside_solid(&self, p: [f64; 3]) -> bool {
+        self.primary_inside(p) && self.contributors_inside(p)
+    }
+
+    /// Primary-contact gradient at `p` (orients the open sheet).
+    fn primary_gradient(&self, p: [f64; 3]) -> [f64; 3] {
+        self.model.scalar_field_gradient(p)
+    }
+
+    /// All Hermite crossings on the cell edge `pa..pb` (each `(point, unit
+    /// normal)`): the primary contact crossing (if the contact field changes sign,
+    /// `va`/`vb` being its corner values) plus every contributor's `edge_crossing`.
+    /// Together these pin a component's QEF vertex to the contact, a contributor
+    /// surface, or their crease. Appended into `out`.
+    fn edge_crossings(
+        &self,
+        pa: [f64; 3],
+        pb: [f64; 3],
+        va: f64,
+        vb: f64,
+        out: &mut Vec<([f64; 3], [f64; 3])>,
+    ) {
+        if (va <= 0.0) != (vb <= 0.0) {
+            let t = va / (va - vb);
+            let p = [
+                pa[0] + (pb[0] - pa[0]) * t,
+                pa[1] + (pb[1] - pa[1]) * t,
+                pa[2] + (pb[2] - pa[2]) * t,
+            ];
+            out.push((p, normalize(self.primary_gradient(p))));
+        }
+        for c in &self.contributors {
+            if let Some((p, n)) = c.edge_crossing(pa, pb) {
+                out.push((p, normalize(n)));
+            }
+        }
+    }
+}
+
 /// Axis-aligned box boundary: the domain is the cube `[min, min+size]³` (an
 /// extruded rectangle in Z, matching the original hardcoded extent). `b < 0`
 /// strictly inside; the cap `b == 0` is the six faces.
@@ -422,18 +542,34 @@ pub fn octree_dual_contour_bounded(
     isovalue: f64,
     cfg: OctreeConfig,
 ) -> Mesh {
+    let scene = Scene::new(model, isovalue, vec![boundary]);
+    octree_dual_contour_scene(&scene, min, size, cfg)
+}
+
+/// Dual-contour the combined [`Scene`] solid (primary contact ∩ all contributors)
+/// over the cube `[min, min+size]³`. This is the general entry point: a single
+/// contributor is the bounded-contact case; adding a truncating `ContactSurface`
+/// contributor meshes an erosion/unconformity cutting the primary contact. The
+/// two-sheet cells where surfaces intersect are split per component (Manifold DC)
+/// so the result stays watertight.
+pub fn octree_dual_contour_scene(
+    scene: &Scene,
+    min: [f64; 3],
+    size: f64,
+    cfg: OctreeConfig,
+) -> Mesh {
     let mut tree = Octree {
         nodes: Vec::new(),
         bounds: Vec::new(),
         root: 0,
     };
-    tree.root = build(&mut tree, model, boundary, min, size, 0, isovalue, &cfg);
-    balance(&mut tree, model, boundary, isovalue, &cfg);
+    tree.root = build(&mut tree, scene, min, size, 0, &cfg);
+    balance(&mut tree, scene, &cfg);
 
     let mut mesh = Mesh::default();
-    assign_vertices(&mut tree, model, boundary, &mut mesh, cfg.cap);
-    contour_edges(&tree, boundary, &mut mesh, cfg.cap);
-    orient_outward(model, boundary, isovalue, &mut mesh, cfg.cap);
+    assign_vertices(&mut tree, scene, &mut mesh, cfg.cap);
+    contour_edges(&tree, scene, &mut mesh, cfg.cap);
+    orient_outward(scene, &mut mesh, cfg.cap);
     mesh
 }
 
@@ -449,7 +585,7 @@ pub fn octree_dual_contour_bounded(
 /// centroid along the geometric normal: if stepping `+normal` lands INSIDE the
 /// solid, the normal points inward, so flip. This needs only `field` and
 /// `boundary.inside` — no free-space boundary gradient.
-fn orient_outward(model: &Model, boundary: &dyn Boundary, isovalue: f64, mesh: &mut Mesh, cap: bool) {
+fn orient_outward(scene: &Scene, mesh: &mut Mesh, cap: bool) {
     let pos = |i: u32| {
         let b = (i as usize) * 3;
         [
@@ -458,8 +594,6 @@ fn orient_outward(model: &Model, boundary: &dyn Boundary, isovalue: f64, mesh: &
             mesh.positions[b + 2] as f64,
         ]
     };
-    // Inside the solid: field < iso AND inside the domain.
-    let inside_solid = |p: [f64; 3]| model.scalar_field(p) - isovalue < 0.0 && boundary.inside(p);
     let tri_count = mesh.indices.len() / 3;
     for t in 0..tri_count {
         let i0 = mesh.indices[3 * t];
@@ -490,9 +624,9 @@ fn orient_outward(model: &Model, boundary: &dyn Boundary, isovalue: f64, mesh: &
                 ctr[1] + n[1] / len * eps,
                 ctr[2] + n[2] / len * eps,
             ];
-            inside_solid(probe)
+            scene.inside_solid(probe)
         } else {
-            let g = model.scalar_field_gradient(ctr);
+            let g = scene.primary_gradient(ctr);
             n[0] * g[0] + n[1] * g[1] + n[2] * g[2] < 0.0
         };
         if flip {
@@ -502,15 +636,11 @@ fn orient_outward(model: &Model, boundary: &dyn Boundary, isovalue: f64, mesh: &
     }
 }
 
-/// Sample the field at a node's 8 corners (field − isovalue) and the boundary
-/// membership at each.
-fn sample_corners(
-    model: &Model,
-    boundary: &dyn Boundary,
-    min: [f64; 3],
-    size: f64,
-    isovalue: f64,
-) -> ([f64; 8], [bool; 8]) {
+/// Sample the scene at a node's 8 corners: `corners[c]` = primary contact field −
+/// isovalue (negative below the contact); `inside[c]` = inside EVERY contributor
+/// (the domain ∩ all truncating surfaces). The combined solid sign at a corner is
+/// `corners[c] <= 0 && inside[c]` (see `corner_sign`).
+fn sample_corners(scene: &Scene, min: [f64; 3], size: f64) -> ([f64; 8], [bool; 8]) {
     let mut c = [0.0; 8];
     let mut ins = [false; 8];
     for i in 0..8 {
@@ -520,8 +650,8 @@ fn sample_corners(
             min[1] + dy as f64 * size,
             min[2] + dz as f64 * size,
         ];
-        c[i] = model.scalar_field(p) - isovalue;
-        ins[i] = boundary.inside(p);
+        c[i] = scene.primary(p);
+        ins[i] = scene.contributors_inside(p);
     }
     (c, ins)
 }
@@ -628,36 +758,16 @@ fn corner_pos(min: [f64; 3], size: f64, c: usize) -> [f64; 3] {
 /// intersection of both surfaces. Returns `(vertex, error)` or `None` if neither
 /// surface crosses.
 fn cell_vertex(
-    model: &Model,
-    boundary: &dyn Boundary,
+    scene: &Scene,
     min: [f64; 3],
     size: f64,
     corners: &[f64; 8],
-    inside: &[bool; 8],
 ) -> Option<([f64; 3], f64)> {
     let mut crossings: Vec<([f64; 3], [f64; 3])> = Vec::new();
     for &(a, b) in CELL_EDGES.iter() {
-        // Field crossing on this edge.
-        let (va, vb) = (corners[a], corners[b]);
-        if (va <= 0.0) != (vb <= 0.0) {
-            let t = va / (va - vb);
-            let pa = corner_pos(min, size, a);
-            let pb = corner_pos(min, size, b);
-            let p = [
-                pa[0] + (pb[0] - pa[0]) * t,
-                pa[1] + (pb[1] - pa[1]) * t,
-                pa[2] + (pb[2] - pa[2]) * t,
-            ];
-            crossings.push((p, normalize(model.scalar_field_gradient(p))));
-        }
-        // Boundary crossing on this edge (from the trait, never a free-space grad).
-        if inside[a] != inside[b] {
-            let pa = corner_pos(min, size, a);
-            let pb = corner_pos(min, size, b);
-            if let Some((p, n)) = boundary.edge_crossing(pa, pb) {
-                crossings.push((p, normalize(n)));
-            }
-        }
+        let pa = corner_pos(min, size, a);
+        let pb = corner_pos(min, size, b);
+        scene.edge_crossings(pa, pb, corners[a], corners[b], &mut crossings);
     }
     if crossings.is_empty() {
         return None;
@@ -676,8 +786,7 @@ fn cell_vertex(
 /// if edge `e` does not change the contoured sign). `verts` is empty if the cell
 /// has no contoured crossing.
 fn cell_vertices(
-    model: &Model,
-    boundary: &dyn Boundary,
+    scene: &Scene,
     min: [f64; 3],
     size: f64,
     corners: &[f64; 8],
@@ -712,25 +821,10 @@ fn cell_vertices(
 
         let pa = corner_pos(min, size, a);
         let pb = corner_pos(min, size, b);
-        // The combined-sign crossing is driven by whichever surface flips on this
-        // edge. Add the field crossing and/or the boundary crossing present here to
-        // this component's QEF — together they pin the vertex to the contact, the
-        // boundary, or their crease.
-        let (va, vb) = (corners[a], corners[b]);
-        if (va <= 0.0) != (vb <= 0.0) {
-            let t = va / (va - vb);
-            let p = [
-                pa[0] + (pb[0] - pa[0]) * t,
-                pa[1] + (pb[1] - pa[1]) * t,
-                pa[2] + (pb[2] - pa[2]) * t,
-            ];
-            buckets[cid].push((p, normalize(model.scalar_field_gradient(p))));
-        }
-        if inside[a] != inside[b] {
-            if let Some((p, n)) = boundary.edge_crossing(pa, pb) {
-                buckets[cid].push((p, normalize(n)));
-            }
-        }
+        // All surface crossings on this edge (primary contact + every contributor)
+        // pin this component's QEF — to the contact, a contributor surface, or
+        // their crease.
+        scene.edge_crossings(pa, pb, corners[a], corners[b], &mut buckets[cid]);
     }
 
     let hi = [min[0] + size, min[1] + size, min[2] + size];
@@ -753,15 +847,13 @@ fn cell_vertices(
 /// error is under threshold.
 fn build(
     tree: &mut Octree,
-    model: &Model,
-    boundary: &dyn Boundary,
+    scene: &Scene,
     min: [f64; 3],
     size: f64,
     depth: u32,
-    isovalue: f64,
     cfg: &OctreeConfig,
 ) -> NodeId {
-    let (corners, inside) = sample_corners(model, boundary, min, size, isovalue);
+    let (corners, inside) = sample_corners(scene, min, size);
     let crossing = is_surface(&corners, &inside);
 
     let make_leaf = |tree: &mut Octree| -> NodeId {
@@ -786,7 +878,7 @@ fn build(
         if !crossing {
             return make_leaf(tree);
         }
-        if let Some((_, err)) = cell_vertex(model, boundary, min, size, &corners, &inside) {
+        if let Some((_, err)) = cell_vertex(scene, min, size, &corners) {
             if err <= cfg.qef_threshold {
                 return make_leaf(tree);
             }
@@ -803,9 +895,7 @@ fn build(
             min[1] + dy as f64 * half,
             min[2] + dz as f64 * half,
         ];
-        children[c] = Some(build(
-            tree, model, boundary, cmin, half, depth + 1, isovalue, cfg,
-        ));
+        children[c] = Some(build(tree, scene, cmin, half, depth + 1, cfg));
     }
     let id = tree.nodes.len();
     tree.nodes.push(Node::Internal(Box::new(children)));
@@ -816,13 +906,7 @@ fn build(
 /// 2:1 balance: ensure no surface leaf is more than one level coarser than a leaf
 /// touching it, so each minimal surface edge is shared by exactly 4 leaves.
 /// Implemented as a fixpoint: repeatedly subdivide offending leaves until stable.
-fn balance(
-    tree: &mut Octree,
-    model: &Model,
-    boundary: &dyn Boundary,
-    isovalue: f64,
-    cfg: &OctreeConfig,
-) {
+fn balance(tree: &mut Octree, scene: &Scene, cfg: &OctreeConfig) {
     loop {
         let mut to_split: Vec<NodeId> = Vec::new();
         let mut leaf_depth: std::collections::HashMap<NodeId, u32> =
@@ -862,15 +946,7 @@ fn balance(
         to_split.sort_unstable();
         to_split.dedup();
         for leaf_id in to_split {
-            split_leaf(
-                tree,
-                model,
-                boundary,
-                leaf_id,
-                leaf_depth[&leaf_id],
-                isovalue,
-                cfg,
-            );
+            split_leaf(tree, scene, leaf_id, leaf_depth[&leaf_id], cfg);
         }
     }
 }
@@ -917,15 +993,7 @@ fn leaf_depth_at(tree: &Octree, id: NodeId, depth: u32, p: [f64; 3]) -> Option<u
 
 /// Replace a leaf with an internal node of 8 freshly-built children one level
 /// finer (used by balancing).
-fn split_leaf(
-    tree: &mut Octree,
-    model: &Model,
-    boundary: &dyn Boundary,
-    leaf_id: NodeId,
-    depth: u32,
-    isovalue: f64,
-    cfg: &OctreeConfig,
-) {
+fn split_leaf(tree: &mut Octree, scene: &Scene, leaf_id: NodeId, depth: u32, cfg: &OctreeConfig) {
     let (min, size) = tree.bounds[leaf_id];
     let half = size * 0.5;
     let mut children: [Option<NodeId>; 8] = [None; 8];
@@ -936,16 +1004,7 @@ fn split_leaf(
             min[1] + dy as f64 * half,
             min[2] + dz as f64 * half,
         ];
-        children[c] = Some(build(
-            tree,
-            model,
-            boundary,
-            cmin,
-            half,
-            depth + 1,
-            isovalue,
-            cfg,
-        ));
+        children[c] = Some(build(tree, scene, cmin, half, depth + 1, cfg));
     }
     tree.nodes[leaf_id] = Node::Internal(Box::new(children));
 }
@@ -955,13 +1014,7 @@ fn split_leaf(
 /// (used by quad emission to route a shared edge to the owning component's vertex).
 /// A single-sheet cell gets exactly one vertex (identical to the old single-vertex
 /// behavior); a two-sheet cell gets one per sheet (Manifold DC).
-fn assign_vertices(
-    tree: &mut Octree,
-    model: &Model,
-    boundary: &dyn Boundary,
-    mesh: &mut Mesh,
-    cap: bool,
-) {
+fn assign_vertices(tree: &mut Octree, scene: &Scene, mesh: &mut Mesh, cap: bool) {
     for id in 0..tree.nodes.len() {
         let (min, size) = tree.bounds[id];
         let (corners, inside) = match &tree.nodes[id] {
@@ -970,8 +1023,7 @@ fn assign_vertices(
             }
             _ => continue,
         };
-        let (verts, edge_owner) =
-            cell_vertices(model, boundary, min, size, &corners, &inside, cap);
+        let (verts, edge_owner) = cell_vertices(scene, min, size, &corners, &inside, cap);
         let mut out = Vec::with_capacity(verts.len());
         for v in &verts {
             let idx = (mesh.positions.len() / 3) as u32;
@@ -1106,7 +1158,7 @@ fn edge_axis(ca: usize, cb: usize) -> Option<usize> {
 /// closed solid (`cap = true`) or, for the open sheet (`cap = false`), the field
 /// surface clipped to inside the domain. Winding is provisional — `orient_outward`
 /// fixes it.
-fn contour_edges(tree: &Octree, boundary: &dyn Boundary, mesh: &mut Mesh, cap: bool) {
+fn contour_edges(tree: &Octree, scene: &Scene, mesh: &mut Mesh, cap: bool) {
     let Some(finest) = finest_leaf_size(tree) else {
         return;
     };
@@ -1155,7 +1207,7 @@ fn contour_edges(tree: &Octree, boundary: &dyn Boundary, mesh: &mut Mesh, cap: b
                     p0[1] + (pb[1] - p0[1]) * t,
                     p0[2] + (pb[2] - p0[2]) * t,
                 ];
-                if !boundary.inside(cross) {
+                if !scene.contributors_inside(cross) {
                     continue;
                 }
             }
