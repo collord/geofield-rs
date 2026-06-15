@@ -611,19 +611,30 @@ pub fn octree_dual_contour_scene(
     mesh
 }
 
-/// Orient every triangle to face OUT of the solid (or, for the open sheet, toward
-/// increasing field).
+/// Orient triangles to face OUT of the solid (closed cap) or toward increasing
+/// field (open sheet).
 ///
-/// Sheet (`cap = false`): the only surface is `field == iso`, so face the field
-/// gradient (toward increasing field) — same as before.
+/// Sheet (`cap = false`): one smooth surface; face each triangle along the field
+/// gradient (toward increasing field). The gradient is a reliable per-face signal
+/// for a smooth contact.
 ///
-/// Solid (`cap = true`): the surface is the boundary of `{ field < iso AND inside
-/// }`, made of field patches and boundary-cap patches; the field gradient is
-/// unrelated to the cap's facing. Instead, probe the combined sign just off the
-/// centroid along the geometric normal: if stepping `+normal` lands INSIDE the
-/// solid, the normal points inward, so flip. This needs only `field` and
-/// `boundary.inside` — no free-space boundary gradient.
+/// Solid (`cap = true`): the surface is a closed manifold but its facing can't be
+/// reliably read per-face (an ε-probe along the normal lands on the wrong side near
+/// thin/edge cap regions, leaving a band of inconsistently-wound triangles that
+/// render as back-faces). Instead: **flood-fill** a single consistent winding
+/// across shared edges (so no two neighbors disagree — 0 inconsistent edges by
+/// construction), then flip the whole mesh once if its signed volume is negative
+/// (exact, parameter-free outward test).
 fn orient_outward(scene: &Scene, mesh: &mut Mesh, cap: bool) {
+    if cap {
+        orient_closed_outward(mesh);
+    } else {
+        orient_sheet_to_gradient(scene, mesh);
+    }
+}
+
+/// Per-face gradient orientation for the open sheet.
+fn orient_sheet_to_gradient(scene: &Scene, mesh: &mut Mesh) {
     let pos = |i: u32| {
         let b = (i as usize) * 3;
         [
@@ -634,10 +645,8 @@ fn orient_outward(scene: &Scene, mesh: &mut Mesh, cap: bool) {
     };
     let tri_count = mesh.indices.len() / 3;
     for t in 0..tri_count {
-        let i0 = mesh.indices[3 * t];
-        let i1 = mesh.indices[3 * t + 1];
-        let i2 = mesh.indices[3 * t + 2];
-        let a = pos(i0);
+        let (i1, i2) = (mesh.indices[3 * t + 1], mesh.indices[3 * t + 2]);
+        let a = pos(mesh.indices[3 * t]);
         let b = pos(i1);
         let c = pos(i2);
         let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
@@ -652,24 +661,101 @@ fn orient_outward(scene: &Scene, mesh: &mut Mesh, cap: bool) {
             (a[1] + b[1] + c[1]) / 3.0,
             (a[2] + b[2] + c[2]) / 3.0,
         ];
-        let flip = if cap {
-            // Step a short way along +normal; if that is inside the solid, the
-            // normal points inward → flip.
-            let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt().max(1e-30);
-            let eps = 1e-3 * (1.0 + ctr[0].abs() + ctr[1].abs() + ctr[2].abs());
-            let probe = [
-                ctr[0] + n[0] / len * eps,
-                ctr[1] + n[1] / len * eps,
-                ctr[2] + n[2] / len * eps,
-            ];
-            scene.inside_solid(probe)
-        } else {
-            let g = scene.primary_gradient(ctr);
-            n[0] * g[0] + n[1] * g[1] + n[2] * g[2] < 0.0
-        };
-        if flip {
+        let g = scene.primary_gradient(ctr);
+        if n[0] * g[0] + n[1] * g[1] + n[2] * g[2] < 0.0 {
             mesh.indices[3 * t + 1] = i2;
             mesh.indices[3 * t + 2] = i1;
+        }
+    }
+}
+
+/// Flood-fill a globally consistent winding across a closed mesh's shared edges,
+/// then flip the whole mesh outward by signed volume. No per-face probe, so no
+/// back-face band.
+fn orient_closed_outward(mesh: &mut Mesh) {
+    let tris = mesh.indices.len() / 3;
+    if tris == 0 {
+        return;
+    }
+    let tri = |t: usize| {
+        [
+            mesh.indices[3 * t],
+            mesh.indices[3 * t + 1],
+            mesh.indices[3 * t + 2],
+        ]
+    };
+
+    // Undirected edge → triangles sharing it, each with the directed pair as that
+    // triangle currently traverses it.
+    let mut edge_tris: std::collections::HashMap<(u32, u32), Vec<(usize, (u32, u32))>> =
+        std::collections::HashMap::new();
+    for t in 0..tris {
+        let v = tri(t);
+        for &(a, b) in &[(v[0], v[1]), (v[1], v[2]), (v[2], v[0])] {
+            let e = if a < b { (a, b) } else { (b, a) };
+            edge_tris.entry(e).or_default().push((t, (a, b)));
+        }
+    }
+
+    // BFS each connected component, flipping a neighbor when it traverses a shared
+    // edge in the SAME direction as us (inconsistent winding).
+    let mut flip = vec![false; tris];
+    let mut visited = vec![false; tris];
+    for start in 0..tris {
+        if visited[start] {
+            continue;
+        }
+        visited[start] = true;
+        let mut stack = vec![start];
+        while let Some(t) = stack.pop() {
+            let v = tri(t);
+            for &(a, b) in &[(v[0], v[1]), (v[1], v[2]), (v[2], v[0])] {
+                let e = if a < b { (a, b) } else { (b, a) };
+                for &(nt, (na, nb)) in &edge_tris[&e] {
+                    if nt == t || visited[nt] {
+                        continue;
+                    }
+                    let our = if flip[t] { (b, a) } else { (a, b) };
+                    let theirs = if flip[nt] { (nb, na) } else { (na, nb) };
+                    // Consistent iff we traverse the edge opposite to them.
+                    if our != (theirs.1, theirs.0) {
+                        flip[nt] = true;
+                    }
+                    visited[nt] = true;
+                    stack.push(nt);
+                }
+            }
+        }
+    }
+
+    // Signed volume (×6) under the now-consistent winding; flip all if it's < 0.
+    let pos = |i: u32| {
+        let b = (i as usize) * 3;
+        [
+            mesh.positions[b] as f64,
+            mesh.positions[b + 1] as f64,
+            mesh.positions[b + 2] as f64,
+        ]
+    };
+    let mut vol6 = 0.0;
+    for t in 0..tris {
+        let v0 = tri(t);
+        let v = if flip[t] {
+            [v0[0], v0[2], v0[1]]
+        } else {
+            v0
+        };
+        let a = pos(v[0]);
+        let b = pos(v[1]);
+        let c = pos(v[2]);
+        vol6 += a[0] * (b[1] * c[2] - b[2] * c[1]) - a[1] * (b[0] * c[2] - b[2] * c[0])
+            + a[2] * (b[0] * c[1] - b[1] * c[0]);
+    }
+    let global_flip = vol6 < 0.0;
+
+    for t in 0..tris {
+        if flip[t] ^ global_flip {
+            mesh.indices.swap(3 * t + 1, 3 * t + 2);
         }
     }
 }
@@ -2019,5 +2105,75 @@ mod tests {
         eprintln!("[erosion-bed] tris={} nm={nonmanifold} open={open}/{total}", mesh.triangle_count());
         assert_eq!(nonmanifold, 0, "truncated-bed non-manifold {nonmanifold}/{total}");
         assert_eq!(open, 0, "truncated-bed open edges {open}/{total}");
+    }
+
+    /// The closed solid (`cap = true`) must be CONSISTENTLY WOUND OUTWARD: every
+    /// shared edge is traversed once per direction (no two neighbors disagree), and
+    /// the overall winding is outward (positive signed volume). A curved contact
+    /// previously left a band of inward-wound triangles (the per-face ε-probe
+    /// mis-flipped near the box edges), rendering as back-faces / "missing"
+    /// triangles. Flood-fill orientation makes inconsistency zero by construction.
+    #[test]
+    fn closed_solid_is_consistently_wound_outward() {
+        use std::collections::HashMap;
+        // Curved (paraboloid) contact in a box — the case that showed the back-face
+        // band in the harness.
+        let mut sps = Vec::new();
+        for i in 0..5 {
+            for j in 0..5 {
+                let x = i as f64 * 250.0;
+                let y = j as f64 * 250.0;
+                let z = 500.0 + 0.0008 * ((x - 500.0).powi(2) + (y - 500.0).powi(2));
+                sps.push(SurfacePoint::new([x, y, z], 0));
+            }
+        }
+        let model = Model::fit(
+            &Series::new(sps, vec![Orientation::new([500.0, 500.0, 500.0], [0.0, 0.0, 1.0])]),
+            KernelOptions::default(),
+        );
+        let cfg = OctreeConfig {
+            max_depth: 6,
+            min_depth: 2,
+            qef_threshold: 1e-4,
+            cap: true,
+        };
+        let mesh = octree_dual_contour(&model, [0.0, 0.0, 0.0], 1000.0, 0.0, cfg);
+        let tris = mesh.indices.len() / 3;
+        assert!(tris > 100);
+
+        // Consistent winding: for every directed edge, the reverse appears the same
+        // number of times (a closed, consistently-wound manifold).
+        let mut dir: HashMap<(u32, u32), i32> = HashMap::new();
+        for t in 0..tris {
+            let v = [mesh.indices[3 * t], mesh.indices[3 * t + 1], mesh.indices[3 * t + 2]];
+            for &(a, b) in &[(v[0], v[1]), (v[1], v[2]), (v[2], v[0])] {
+                *dir.entry((a, b)).or_insert(0) += 1;
+            }
+        }
+        let inconsistent = dir
+            .iter()
+            .filter(|(&(a, b), &n)| a < b && n != *dir.get(&(b, a)).unwrap_or(&0))
+            .count();
+        assert_eq!(inconsistent, 0, "inconsistently-wound edges (back-face band): {inconsistent}");
+
+        // Outward: signed volume positive.
+        let p = |i: u32| {
+            let b = (i as usize) * 3;
+            [
+                mesh.positions[b] as f64,
+                mesh.positions[b + 1] as f64,
+                mesh.positions[b + 2] as f64,
+            ]
+        };
+        let mut vol6 = 0.0;
+        for t in 0..tris {
+            let v = [mesh.indices[3 * t], mesh.indices[3 * t + 1], mesh.indices[3 * t + 2]];
+            let a = p(v[0]);
+            let b = p(v[1]);
+            let c = p(v[2]);
+            vol6 += a[0] * (b[1] * c[2] - b[2] * c[1]) - a[1] * (b[0] * c[2] - b[2] * c[0])
+                + a[2] * (b[0] * c[1] - b[1] * c[0]);
+        }
+        assert!(vol6 > 0.0, "closed solid wound inward (negative signed volume)");
     }
 }
