@@ -410,8 +410,11 @@ pub fn octree_dual_contour_bounded(
     // Field surface: quads on field minimal edges, clipped to inside the domain.
     // We collect every emitted field edge (as an out_index pair); the cap pass
     // uses it to avoid double-covering an edge the field already owns.
-    let mut field_edges: std::collections::HashSet<(u32, u32)> =
-        std::collections::HashSet::new();
+    // Field edges keyed to their incidence (1 = the field surface's boundary,
+    // i.e. the seam; 2 = interior field edge). The cap pass uses this to drop only
+    // INTERIOR field edges and keep seam edges so they pair (1 field + 1 cap).
+    let mut field_edges: std::collections::HashMap<(u32, u32), u32> =
+        std::collections::HashMap::new();
     contour_field_edges(&tree, boundary, &mut mesh, &mut field_edges);
     let field_tris_end = mesh.indices.len();
     // Boundary cap: dual-contour `b == 0` on boundary minimal edges, clipped to
@@ -910,7 +913,7 @@ fn contour_field_edges(
     tree: &Octree,
     boundary: &dyn Boundary,
     mesh: &mut Mesh,
-    field_edges: &mut std::collections::HashSet<(u32, u32)>,
+    field_edges: &mut std::collections::HashMap<(u32, u32), u32>,
 ) {
     let Some(finest) = finest_leaf_size(tree) else {
         return;
@@ -974,7 +977,7 @@ fn contour_cap_edges(
     model: &Model,
     boundary: &dyn Boundary,
     isovalue: f64,
-    field_edges: &std::collections::HashSet<(u32, u32)>,
+    field_edges: &std::collections::HashMap<(u32, u32), u32>,
     mesh: &mut Mesh,
 ) {
     let Some(finest) = finest_leaf_size(tree) else {
@@ -1027,7 +1030,7 @@ fn contour_cap_edges(
                 continue;
             }
 
-            // Clip the cap to the rock: keep `b == 0` only where field < iso. Use
+            // Clip the cap to the rock: keep `b == 0` only where field < iso, using
             // the boundary crossing point on this edge as the probe.
             let pb = corner_pos(lmin, lsize, cb);
             let probe = match boundary.edge_crossing(p0, pb) {
@@ -1075,7 +1078,7 @@ fn emit_edge_quad(
     tree: &Octree,
     leaves: &[NodeId; 4],
     mesh: &mut Mesh,
-    field_edges: &mut std::collections::HashSet<(u32, u32)>,
+    field_edges: &mut std::collections::HashMap<(u32, u32), u32>,
 ) {
     let Some(vtx) = quad_vertices(tree, leaves) else {
         return;
@@ -1083,9 +1086,9 @@ fn emit_edge_quad(
     for tri in [[vtx[0], vtx[1], vtx[2]], [vtx[0], vtx[2], vtx[3]]] {
         if tri[0] != tri[1] && tri[1] != tri[2] && tri[0] != tri[2] {
             mesh.indices.extend_from_slice(&tri);
-            field_edges.insert(edge_key(tri[0], tri[1]));
-            field_edges.insert(edge_key(tri[1], tri[2]));
-            field_edges.insert(edge_key(tri[2], tri[0]));
+            *field_edges.entry(edge_key(tri[0], tri[1])).or_insert(0) += 1;
+            *field_edges.entry(edge_key(tri[1], tri[2])).or_insert(0) += 1;
+            *field_edges.entry(edge_key(tri[2], tri[0])).or_insert(0) += 1;
         }
     }
 }
@@ -1095,16 +1098,19 @@ fn emit_edge_quad(
 /// is CCW about +axis (centers at (−,−),(+,−),(+,+),(−,+) in the (u,v) plane);
 /// that winding faces +axis, so we reverse it when the outward normal is −axis.
 ///
-/// The seam is shared: a cap triangle that would reuse an edge the field surface
-/// already owns is dropped. The seam belongs to the field surface (it has the
-/// joint-QEF vertices), and the cap abuts it instead of overlapping — this is the
-/// step that drives non-manifold (over-incident) edges to zero. A cap quad that
-/// straddles the seam thus loses its seam-side triangle but keeps the rest.
+/// The seam is shared: a cap triangle is dropped only if it FULLY duplicates a
+/// field triangle (all three edges already field-owned). A seam-straddling quad is
+/// a trapezoid that shares only its ONE top edge with the field; that edge must
+/// PAIR (one field tri + one cap tri), not be dropped, or the seam opens. Dropping
+/// on *any* shared edge (the earlier rule) over-pruned these trapezoids — that,
+/// plus the per-edge clip, was the source of the seam cracks. The "fully
+/// duplicate" rule still kills the box's grid-aligned cap≡field quads (all three
+/// edges shared) that would otherwise be (2,2) non-manifold.
 fn emit_cap_quad(
     tree: &Octree,
     leaves: &[NodeId; 4],
     outward_pos_axis: bool,
-    field_edges: &std::collections::HashSet<(u32, u32)>,
+    field_edges: &std::collections::HashMap<(u32, u32), u32>,
     mesh: &mut Mesh,
 ) {
     let Some(mut vtx) = quad_vertices(tree, leaves) else {
@@ -1113,15 +1119,22 @@ fn emit_cap_quad(
     if !outward_pos_axis {
         vtx.reverse();
     }
+    // Drop a cap triangle whose edge is an INTERIOR field edge (field incidence
+    // >= 2): the field surface already has two triangles there, so a cap triangle
+    // would over-cover it. A field BOUNDARY edge (incidence 1) is the seam — keep
+    // the cap triangle so that edge PAIRS (1 field + 1 cap), closing the seam.
+    // (This incidence-aware rule replaced "drop on any shared edge", which
+    // over-pruned seam-straddling trapezoids and left the seam open — it makes the
+    // flat-contact box solid fully watertight.)
+    let interior = |e: (u32, u32)| field_edges.get(&e).copied().unwrap_or(0) >= 2;
     for tri in [[vtx[0], vtx[1], vtx[2]], [vtx[0], vtx[2], vtx[3]]] {
         if tri[0] == tri[1] || tri[1] == tri[2] || tri[0] == tri[2] {
             continue;
         }
-        // Defer to the field surface on any edge it already owns (the seam).
-        let reuses_field_edge = field_edges.contains(&edge_key(tri[0], tri[1]))
-            || field_edges.contains(&edge_key(tri[1], tri[2]))
-            || field_edges.contains(&edge_key(tri[2], tri[0]));
-        if reuses_field_edge {
+        if interior(edge_key(tri[0], tri[1]))
+            || interior(edge_key(tri[1], tri[2]))
+            || interior(edge_key(tri[2], tri[0]))
+        {
             continue;
         }
         mesh.indices.extend_from_slice(&tri);
@@ -1180,6 +1193,64 @@ mod tests {
         // crossing; the box boundary alone produces no cap inside the rock here.
         let mesh = octree_dual_contour(&model, [0.0, 0.0, 1.5], 0.5, 0.0, OctreeConfig::default());
         assert_eq!(mesh.triangle_count(), 0);
+    }
+
+    /// The closed solid (`cap = true`) is STRICTLY watertight for a planar contact
+    /// meeting the box — every edge has incidence exactly 2: zero non-manifold,
+    /// zero open edges, anywhere on the mesh including the box faces.
+    ///
+    /// This is the gempy model1 case the web harness renders (a flat contact at
+    /// z=600 in a [0,1000]³ box). The incidence-aware cap dedup (drop a cap
+    /// triangle only on an INTERIOR field edge, pair on a field BOUNDARY/seam edge)
+    /// closes the field/cap seam that the earlier "drop on any shared edge" rule
+    /// left open. Asserted at several depths since the seam config is resolution-
+    /// dependent.
+    ///
+    /// (A CURVED contact meeting the box walls still leaves seam open edges — see
+    /// the note in `curved_surface_is_crack_free_wound_and_oriented`. That is the
+    /// remaining manifold-DC residual; this test guards the flat case it solved.)
+    #[test]
+    fn flat_contact_closed_solid_is_watertight() {
+        use std::collections::HashMap;
+        // gempy model1: a flat contact at z=600 in a [0,1000]³ box.
+        let mut sps = Vec::new();
+        for &(x, y) in &[
+            (100.0, 200.0),
+            (500.0, 200.0),
+            (900.0, 200.0),
+            (100.0, 800.0),
+            (500.0, 800.0),
+            (900.0, 800.0),
+        ] {
+            sps.push(SurfacePoint::new([x, y, 600.0], 0));
+        }
+        let oris = vec![Orientation::new([500.0, 500.0, 600.0], [0.0, 0.0, 1.0])];
+        let model = Model::fit(&Series::new(sps, oris), KernelOptions::default());
+        let iso = model.lithology().interfaces[0].isovalue;
+
+        for depth in [3, 4, 5, 6] {
+            let cfg = OctreeConfig {
+                max_depth: depth,
+                min_depth: 2,
+                qef_threshold: 1e-6,
+                cap: true,
+            };
+            let mesh = octree_dual_contour(&model, [0.0, 0.0, 0.0], 1000.0, iso, cfg);
+            assert!(mesh.triangle_count() > 0, "depth {depth}: empty mesh");
+
+            let mut undirected: HashMap<(u32, u32), u32> = HashMap::new();
+            for t in mesh.indices.chunks_exact(3) {
+                for &(a, b) in &[(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+                    let e = if a < b { (a, b) } else { (b, a) };
+                    *undirected.entry(e).or_insert(0) += 1;
+                }
+            }
+            // Watertight closed solid: EVERY edge incidence is exactly 2.
+            let nonmanifold = undirected.values().filter(|&&c| c > 2).count();
+            let open = undirected.values().filter(|&&c| c == 1).count();
+            assert_eq!(nonmanifold, 0, "depth {depth}: non-manifold edges {nonmanifold}");
+            assert_eq!(open, 0, "depth {depth}: open edges {open}");
+        }
     }
 
     /// Regression for the missing-triangle / winding bugs: on a CURVED surface
@@ -1283,10 +1354,18 @@ mod tests {
             "non-manifold edges: {nonmanifold}/{total}"
         );
 
-        // Every remaining boundary edge (incidence 1) is the legitimate open rim
-        // where the mesh meets the domain-box extent — both endpoints lie on a
-        // domain face. There are no interior boundary edges (those would be holes,
-        // already asserted zero above).
+        // Every remaining boundary edge (incidence 1) lies ON the domain box —
+        // both endpoints on a face. For this OPEN-sheet view (the field surface
+        // clipped to the box) that is the legitimate rim.
+        //
+        // CAVEAT / known residual: with `cap = true` this same paraboloid leaves a
+        // band of open edges along the field/cap seam where the CURVED contact
+        // meets the box walls. Those open edges are face-resident, so they pass
+        // this rim check too — i.e. this assertion does NOT certify the curved
+        // closed solid as watertight. The flat-contact closed solid IS watertight
+        // (`flat_contact_closed_solid_is_watertight`); the curved-contact seam is
+        // the remaining manifold-DC residual. Don't read this passing test as
+        // "curved closed solid is watertight".
         let bad_rim = undirected
             .iter()
             .filter(|(_, &c)| c == 1)
