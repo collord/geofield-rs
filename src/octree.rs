@@ -1152,6 +1152,14 @@ fn assign_vertices(tree: &mut Octree, scene: &Scene, mesh: &mut Mesh, cap: bool)
             mesh.positions.push(v[0] as f32);
             mesh.positions.push(v[1] as f32);
             mesh.positions.push(v[2] as f32);
+            // Exact per-vertex normal from the analytic field gradient (the vertex
+            // lies on the contact for sheet faces). Smooth shading without face
+            // averaging. Cap-only vertices of the closed solid get a gradient normal
+            // too — approximate for them, but they are dropped in sheet mode.
+            let g = normalize(scene.primary_gradient(*v));
+            mesh.normals.push(g[0] as f32);
+            mesh.normals.push(g[1] as f32);
+            mesh.normals.push(g[2] as f32);
             out.push(idx);
         }
         if let Node::Leaf(l) = &mut tree.nodes[id] {

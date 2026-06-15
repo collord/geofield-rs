@@ -120,7 +120,14 @@ export function Viewer({ mesh, surfacePoints, orientations }: Props) {
         new THREE.BufferAttribute(surf.positions, 3),
       );
       geom.setIndex(new THREE.BufferAttribute(surf.indices, 1));
-      geom.computeVertexNormals();
+      // Exact per-vertex normals from the analytic field gradient (smooth shading
+      // without the faceting of face-averaged normals). Fall back to computed
+      // normals only if the contourer didn't supply them.
+      if (surf.normals && surf.normals.length === surf.positions.length) {
+        geom.setAttribute("normal", new THREE.BufferAttribute(surf.normals, 3));
+      } else {
+        geom.computeVertexNormals();
+      }
 
       const color = FORMATION_COLORS[surf.formation] ?? colorFor(surf.formation);
       const mat = new THREE.MeshStandardMaterial({

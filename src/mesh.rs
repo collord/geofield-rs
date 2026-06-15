@@ -47,6 +47,11 @@ impl MeshGrid {
 pub struct Mesh {
     /// `3 * vertex_count` positions (x,y,z, …) in world coordinates.
     pub positions: Vec<f32>,
+    /// `3 * vertex_count` per-vertex unit normals, parallel to `positions`. Empty
+    /// unless the producer fills them (the octree contourer does, from the analytic
+    /// field gradient — exact and smooth, so renderers should prefer these over
+    /// face-averaged normals). The uniform `dual_contour` leaves this empty.
+    pub normals: Vec<f32>,
     /// `3 * triangle_count` indices into `positions`.
     pub indices: Vec<u32>,
 }

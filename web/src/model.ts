@@ -40,6 +40,7 @@ export interface SurfaceMesh {
   formation: string; // formation name for this interface id (best-effort)
   isovalue: number;
   positions: Float32Array; // 3 * V
+  normals: Float32Array; // 3 * V — exact per-vertex normals (field gradient)
   indices: Uint32Array; // 3 * T
   triangleCount: number;
 }
@@ -149,6 +150,7 @@ export function solveAndMesh(
       formation: nameOf(ids[s]),
       isovalue: isovalues[s],
       positions: wm.positions(),
+      normals: wm.normals(),
       indices: wm.indices(),
       triangleCount: wm.triangle_count,
     });

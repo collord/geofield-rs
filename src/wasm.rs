@@ -21,6 +21,7 @@ use crate::Model;
 #[wasm_bindgen]
 pub struct WasmMesh {
     positions: Vec<f32>,
+    normals: Vec<f32>,
     indices: Vec<u32>,
 }
 
@@ -29,6 +30,12 @@ impl WasmMesh {
     /// `3 * vertexCount` world-space positions (x,y,z, …) as a `Float32Array`.
     pub fn positions(&self) -> Vec<f32> {
         self.positions.clone()
+    }
+    /// `3 * vertexCount` per-vertex unit normals (from the analytic field gradient)
+    /// as a `Float32Array`, parallel to positions. Empty if the contourer didn't
+    /// produce them. Prefer these over face-averaged normals for smooth shading.
+    pub fn normals(&self) -> Vec<f32> {
+        self.normals.clone()
     }
     /// `3 * triangleCount` triangle indices as a `Uint32Array`.
     pub fn indices(&self) -> Vec<u32> {
@@ -151,6 +158,7 @@ impl WasmModel {
         let m = dual_contour(&self.inner, &grid, isovalue);
         WasmMesh {
             positions: m.positions,
+            normals: m.normals,
             indices: m.indices,
         }
     }
@@ -192,6 +200,7 @@ impl WasmModel {
         let m = octree_dual_contour(&self.inner, [min_x, min_y, min_z], size, isovalue, cfg);
         WasmMesh {
             positions: m.positions,
+            normals: m.normals,
             indices: m.indices,
         }
     }
