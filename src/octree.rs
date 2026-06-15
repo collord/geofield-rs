@@ -87,6 +87,14 @@ pub trait Boundary {
     /// when `inside(a) != inside(b)`; may return `None` if the implementor
     /// cannot resolve a crossing (treated as "no boundary detail on this edge").
     fn edge_crossing(&self, a: [f64; 3], b: [f64; 3]) -> Option<([f64; 3], [f64; 3])>;
+
+    /// The (unit) outward normal of the boundary surface at a point `p` ON or near
+    /// `b == 0`. Used to project a seam vertex (a contact-meets-boundary vertex)
+    /// ALONG the boundary onto the contact, smoothing it without leaving the wall —
+    /// the field gradient is projected into this normal's tangent plane. Returns
+    /// `None` if the implementor cannot give a normal there (then the seam vertex is
+    /// left where the QEF placed it).
+    fn surface_normal(&self, p: [f64; 3]) -> Option<[f64; 3]>;
 }
 
 /// A geologic contact (a `Model` field thresholded at an isovalue) expressed as a
@@ -123,6 +131,10 @@ impl Boundary for ContactSurface<'_> {
             a[2] + (b[2] - a[2]) * t,
         ];
         Some((p, normalize(self.model.scalar_field_gradient(p))))
+    }
+
+    fn surface_normal(&self, p: [f64; 3]) -> Option<[f64; 3]> {
+        Some(normalize(self.model.scalar_field_gradient(p)))
     }
 }
 
@@ -166,6 +178,14 @@ impl<'a> Scene<'a> {
     /// Primary-contact gradient at `p`.
     fn primary_gradient(&self, p: [f64; 3]) -> [f64; 3] {
         self.model.scalar_field_gradient(p)
+    }
+
+    /// Outward normal of the contributor (domain) surface a seam vertex at `p` sits
+    /// on — for constraining seam-vertex projection to stay on the boundary. Picks
+    /// the first contributor that can supply a normal (the convention is contributor
+    /// 0 is the domain). `None` if none can.
+    fn seam_boundary_normal(&self, p: [f64; 3]) -> Option<[f64; 3]> {
+        self.contributors.iter().find_map(|c| c.surface_normal(p))
     }
 
     /// All Hermite crossings on the cell edge `pa..pb` (each `(point, unit
@@ -301,6 +321,24 @@ impl Boundary for AxisBox {
         n[best.0] = best.2;
         Some((p, n))
     }
+
+    fn surface_normal(&self, p: [f64; 3]) -> Option<[f64; 3]> {
+        // Outward normal of the box face `p` is closest to (the dominant slab axis).
+        let mut best = (0usize, f64::NEG_INFINITY, 1.0_f64);
+        for ax in 0..3 {
+            let lo = (self.min[ax] - p[ax]).abs();
+            let hi = (p[ax] - self.max[ax]).abs();
+            if -lo > best.1 {
+                best = (ax, -lo, -1.0);
+            }
+            if -hi > best.1 {
+                best = (ax, -hi, 1.0);
+            }
+        }
+        let mut n = [0.0; 3];
+        n[best.0] = best.2;
+        Some(n)
+    }
 }
 
 /// Triangulated-mesh boundary: the domain is the inside of a closed triangle
@@ -397,6 +435,29 @@ impl Boundary for TriMesh {
             }
         }
         hit
+    }
+
+    fn surface_normal(&self, p: [f64; 3]) -> Option<[f64; 3]> {
+        // Normal of the nearest triangle (by centroid distance — enough to pick the
+        // facet a near-surface seam vertex sits on).
+        let mut best = (f64::INFINITY, 0usize);
+        for ti in 0..self.triangles.len() {
+            let (a, b, c) = self.tri(ti);
+            let ctr = [
+                (a[0] + b[0] + c[0]) / 3.0,
+                (a[1] + b[1] + c[1]) / 3.0,
+                (a[2] + b[2] + c[2]) / 3.0,
+            ];
+            let d = norm(sub(p, ctr));
+            if d < best.0 {
+                best = (d, ti);
+            }
+        }
+        if best.0.is_finite() {
+            Some(self.tri_normal(best.1))
+        } else {
+            None
+        }
     }
 }
 
@@ -878,7 +939,7 @@ fn cell_vertices(
     corners: &[f64; 8],
     inside: &[bool; 8],
     cap: bool,
-) -> (Vec<[f64; 3]>, [u8; 12]) {
+) -> (Vec<[f64; 3]>, [u8; 12], Vec<VertKind>) {
     // Combined sign at the 8 corners, then its connected components.
     let mut sign = [false; 8];
     for c in 0..8 {
@@ -887,7 +948,7 @@ fn cell_vertices(
     let (comp, ncomp) = minority_components(&sign);
     let mut edge_owner = [u8::MAX; 12];
     if ncomp == 0 {
-        return (Vec::new(), edge_owner);
+        return (Vec::new(), edge_owner, Vec::new());
     }
 
     // Gather Hermite crossings per component. The owner of a crossing edge is the
@@ -896,6 +957,14 @@ fn cell_vertices(
     let inside_count = sign.iter().filter(|&&b| b).count();
     let minority = inside_count <= 4;
     let mut buckets: Vec<Vec<([f64; 3], [f64; 3])>> = vec![Vec::new(); ncomp];
+    // Per component, two flags: does the PRIMARY CONTACT field cross an edge, and
+    // does a CONTRIBUTOR (domain boundary) cross an edge? A PURE-contact component
+    // (contact yes, boundary no) gets its vertex projected onto the contact — the
+    // QEF can place it off-surface on a coarse cell spanning a steep ramp, which
+    // terraces. A component touching the boundary (a cap or seam vertex) must NOT be
+    // projected, or it would leave the domain wall and tear the flush closure.
+    let mut has_contact = vec![false; ncomp];
+    let mut has_boundary = vec![false; ncomp];
 
     for (ei, &(a, b)) in CELL_EDGES.iter().enumerate() {
         if sign[a] == sign[b] {
@@ -904,6 +973,12 @@ fn cell_vertices(
         let m = if sign[a] == minority { a } else { b };
         let cid = comp[m] as usize;
         edge_owner[ei] = comp[m];
+        if (corners[a] <= 0.0) != (corners[b] <= 0.0) {
+            has_contact[cid] = true;
+        }
+        if inside[a] != inside[b] {
+            has_boundary[cid] = true;
+        }
 
         let pa = corner_pos(min, size, a);
         let pb = corner_pos(min, size, b);
@@ -915,7 +990,7 @@ fn cell_vertices(
 
     let hi = [min[0] + size, min[1] + size, min[2] + size];
     let center = [min[0] + size * 0.5, min[1] + size * 0.5, min[2] + size * 0.5];
-    let verts = buckets
+    let verts: Vec<[f64; 3]> = buckets
         .iter()
         .map(|cr| {
             if cr.is_empty() {
@@ -925,7 +1000,75 @@ fn cell_vertices(
             }
         })
         .collect();
-    (verts, edge_owner)
+    // Project only pure-contact components (contact crossing, no boundary crossing).
+    // Per-component projection kind: `Cap` (boundary only — leave it), `Interior`
+    // (contact only — project freely onto the contact), `Seam` (contact AND boundary
+    // — project onto the contact CONSTRAINED to the boundary surface, so it smooths
+    // without leaving the wall).
+    let kind: Vec<VertKind> = (0..ncomp)
+        .map(|c| match (has_contact[c], has_boundary[c]) {
+            (true, false) => VertKind::Interior,
+            (true, true) => VertKind::Seam,
+            _ => VertKind::Cap,
+        })
+        .collect();
+    (verts, edge_owner, kind)
+}
+
+/// How a component's vertex relates to the surfaces, deciding how it may be moved
+/// onto the contact for smoothing (see `project_to_contact`).
+#[derive(Clone, Copy, PartialEq)]
+enum VertKind {
+    /// Boundary only (a domain-cap vertex) — leave it on the boundary.
+    Cap,
+    /// Contact only — project freely onto the contact.
+    Interior,
+    /// Contact AND boundary (a seam vertex) — project onto the contact CONSTRAINED
+    /// to the boundary surface (stays flush on the wall).
+    Seam,
+}
+
+/// Project a contact vertex onto the contact (`field == iso`) with a few Newton
+/// steps along the field gradient, clamped to the cell `[min, min+size]` (a vertex
+/// must stay in its own cell to keep the minimal-edge contour crack-free). The QEF
+/// can place a vertex off the contact on a coarse cell spanning a steep ramp, which
+/// terraces; this pins it back on the smooth surface.
+///
+/// For a `Seam` vertex the field gradient is projected into the boundary's tangent
+/// plane (the component along `boundary.surface_normal` is removed), so the vertex
+/// slides ALONG the boundary onto the contact without leaving it — preserving the
+/// flush domain closure.
+fn project_to_contact(
+    scene: &Scene,
+    v: [f64; 3],
+    min: [f64; 3],
+    size: f64,
+    kind: VertKind,
+) -> [f64; 3] {
+    let mut p = v;
+    for _ in 0..6 {
+        let f = scene.primary(p);
+        let mut g = scene.primary_gradient(p);
+        // Seam: remove the boundary-normal component so the step stays on the wall.
+        if kind == VertKind::Seam {
+            if let Some(n) = scene.seam_boundary_normal(p) {
+                let dot = g[0] * n[0] + g[1] * n[1] + g[2] * n[2];
+                g = [g[0] - dot * n[0], g[1] - dot * n[1], g[2] - dot * n[2]];
+            }
+        }
+        let g2 = g[0] * g[0] + g[1] * g[1] + g[2] * g[2];
+        if g2 < 1e-12 {
+            break;
+        }
+        let s = f / g2;
+        let np = [p[0] - s * g[0], p[1] - s * g[1], p[2] - s * g[2]];
+        p = [
+            np[0].clamp(min[0], min[0] + size),
+            np[1].clamp(min[1], min[1] + size),
+            np[2].clamp(min[2], min[2] + size),
+        ];
+    }
+    p
 }
 
 /// Recursively build the octree. A cell becomes a leaf when: it is at max depth,
@@ -1145,18 +1288,25 @@ fn assign_vertices(tree: &mut Octree, scene: &Scene, mesh: &mut Mesh, cap: bool)
             }
             _ => continue,
         };
-        let (verts, edge_owner) = cell_vertices(scene, min, size, &corners, &inside, cap);
+        let (verts, edge_owner, kinds) = cell_vertices(scene, min, size, &corners, &inside, cap);
         let mut out = Vec::with_capacity(verts.len());
-        for v in &verts {
+        for (ci, v) in verts.iter().enumerate() {
+            // Project contact vertices onto the contact (smoothing the terraced steps
+            // from coarse-cell QEF placement). Interior vertices project freely; seam
+            // vertices project CONSTRAINED to the boundary (stay flush on the wall);
+            // cap-only vertices are left untouched. See `project_to_contact`.
+            let kind = kinds.get(ci).copied().unwrap_or(VertKind::Cap);
+            let p = match kind {
+                VertKind::Cap => *v,
+                _ => project_to_contact(scene, *v, min, size, kind),
+            };
             let idx = (mesh.positions.len() / 3) as u32;
-            mesh.positions.push(v[0] as f32);
-            mesh.positions.push(v[1] as f32);
-            mesh.positions.push(v[2] as f32);
+            mesh.positions.push(p[0] as f32);
+            mesh.positions.push(p[1] as f32);
+            mesh.positions.push(p[2] as f32);
             // Exact per-vertex normal from the analytic field gradient (the vertex
-            // lies on the contact for sheet faces). Smooth shading without face
-            // averaging. Cap-only vertices of the closed solid get a gradient normal
-            // too — approximate for them, but they are dropped in sheet mode.
-            let g = normalize(scene.primary_gradient(*v));
+            // lies on the contact). Smooth shading without face averaging.
+            let g = normalize(scene.primary_gradient(p));
             mesh.normals.push(g[0] as f32);
             mesh.normals.push(g[1] as f32);
             mesh.normals.push(g[2] as f32);
@@ -1950,6 +2100,9 @@ mod tests {
             ];
             Some((p, normalize(self.m.scalar_field_gradient(p))))
         }
+        fn surface_normal(&self, p: [f64; 3]) -> Option<[f64; 3]> {
+            Some(normalize(self.m.scalar_field_gradient(p)))
+        }
     }
 
     #[test]
@@ -2198,5 +2351,78 @@ mod tests {
             .filter(|((a, b), _)| !(on_box(p(*a)) && on_box(p(*b))))
             .count();
         assert_eq!(torn, 0, "open sheet has a torn (non-flush) perimeter: {torn}");
+    }
+
+    /// Contact vertices are projected onto the contact (`field == iso`) — interior
+    /// freely, seam vertices constrained to the boundary — so the sheet hugs the
+    /// smooth surface instead of terracing from coarse-cell QEF placement. Assert the
+    /// referenced sheet vertices sit close to the contact AND the flush boundary is
+    /// preserved (seam projection stays on the wall). Uses the harness data (one
+    /// raised corner) at a moderate depth.
+    #[test]
+    fn contact_vertices_lie_on_the_contact() {
+        use std::collections::{HashMap, HashSet};
+        let pts = [
+            (100.0, 200.0, 600.0),
+            (500.0, 200.0, 600.0),
+            (900.0, 200.0, 800.0), // raised corner
+            (100.0, 800.0, 600.0),
+            (500.0, 800.0, 600.0),
+            (900.0, 800.0, 600.0),
+        ];
+        let sps: Vec<_> = pts
+            .iter()
+            .map(|&(x, y, z)| SurfacePoint::new([x, y, z], 0))
+            .collect();
+        let model = Model::fit(
+            &Series::new(sps, vec![Orientation::new([500.0, 500.0, 600.0], [0.0, 0.0, 1.0])]),
+            KernelOptions::default(),
+        );
+        let iso = model.lithology().interfaces[0].isovalue;
+        let cfg = OctreeConfig {
+            max_depth: 6,
+            min_depth: 2,
+            qef_threshold: 1e-6,
+            cap: false,
+        };
+        let mesh = octree_dual_contour(&model, [0.0, 0.0, 0.0], 1000.0, iso, cfg);
+
+        let p = |i: u32| {
+            let b = (i as usize) * 3;
+            [
+                mesh.positions[b] as f64,
+                mesh.positions[b + 1] as f64,
+                mesh.positions[b + 2] as f64,
+            ]
+        };
+        // Every referenced sheet vertex sits near the contact (distance = |field-iso|
+        // / |grad|). With projection this is a fraction of a cell.
+        let referenced: HashSet<u32> = mesh.indices.iter().copied().collect();
+        let mut off_max = 0.0_f64;
+        for &i in &referenced {
+            let pv = p(i);
+            let f = model.scalar_field(pv) - iso;
+            let g = model.scalar_field_gradient(pv);
+            let gm = (g[0] * g[0] + g[1] * g[1] + g[2] * g[2]).sqrt().max(1e-9);
+            off_max = off_max.max((f / gm).abs());
+        }
+        // cell at depth 6 ≈ 15.6; vertices should be within ~half a cell of the contact.
+        assert!(off_max < 8.0, "sheet vertices stray off the contact: {off_max:.1}");
+
+        // Flush boundary preserved (seam projection stayed on the wall): no torn edge.
+        let on_box = |q: [f64; 3]| (0..3).any(|d| q[d].abs() < 1.0 || (q[d] - 1000.0).abs() < 1.0);
+        let mut undirected: HashMap<(u32, u32), u32> = HashMap::new();
+        for t in mesh.indices.chunks_exact(3) {
+            for &(a, b) in &[(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+                let e = if a < b { (a, b) } else { (b, a) };
+                *undirected.entry(e).or_insert(0) += 1;
+            }
+        }
+        let torn = undirected
+            .iter()
+            .filter(|(_, &c)| c == 1)
+            .filter(|((a, b), _)| !(on_box(p(*a)) && on_box(p(*b))))
+            .count();
+        assert_eq!(torn, 0, "seam projection un-flushed the boundary: {torn} torn");
     }
 }
