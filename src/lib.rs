@@ -26,7 +26,10 @@ use assemble::{assemble, KernelOptions, System};
 use data::{Orientation, Series, SurfacePoint};
 use evaluate::Field;
 use mesh::{normalize, Mesh};
-use octree::{octree_dual_contour, OctreeConfig, ScalarField};
+use octree::{
+    octree_dual_contour, octree_dual_contour_scene, AxisBox, Boundary, ContactHalfSpace,
+    OctreeConfig, PlaneHalfSpace, ScalarField, Scene,
+};
 use fault::{BlockIndex, SingleBlock};
 use litho::Lithology;
 use solve::{solve, Solution};
@@ -220,6 +223,81 @@ impl Model {
         Some(mesh)
     }
 
+    /// Number of lithology UNITS in block `b` — the volumes between consecutive
+    /// contacts, `interfaces + 1` (0 if `b` is out of range or field-less).
+    pub fn block_unit_count(&self, b: usize) -> usize {
+        match self.block_interface_count(b) {
+            0 => 0, // a field-less block has no units
+            n => n + 1,
+        }
+    }
+
+    /// A watertight CLOSED solid for one lithology UNIT of one fault block — the slab
+    /// `{ iso[k-1] ≤ field_b < iso[k] }` intersected with the domain box and the
+    /// block's fault half-spaces, contoured cap=true. The fault plane is a real cap
+    /// face (the contact daylighting on the fault wall), so the block's layered solids
+    /// stitch to the fault. Each is independently watertight (one combined CSG sign
+    /// field), and a block's units tile its volume.
+    ///
+    /// `unit_idx` is `0..=interfaces` (bottom unit `0` has no lower contact; top unit
+    /// `interfaces` has no upper contact). Returns `None` if `b` is field-less or
+    /// `unit_idx` is out of range; the contour may still be empty if the unit has no
+    /// volume in this block.
+    pub fn mesh_block_unit_solid(
+        &self,
+        b: usize,
+        unit_idx: usize,
+        min: [f64; 3],
+        size: f64,
+        cfg: OctreeConfig,
+    ) -> Option<Mesh> {
+        let block = self.blocks.get(b)?.as_ref()?;
+        let interfaces = &block.lithology.interfaces;
+        let n = interfaces.len();
+        if unit_idx > n {
+            return None;
+        }
+        let field = BlockField { block };
+
+        // Upper bound of the slab: the unit's UPPER contact, or — for the top unit —
+        // a value above every field in the box, so `field < upper` holds everywhere
+        // (the box top caps it). `primary` is always the "below the upper bound" side.
+        let big = max_abs_field_in_box(&field, min, size) + 1.0;
+        let upper_iso = if unit_idx < n {
+            interfaces[unit_idx].isovalue
+        } else {
+            big // top unit: no upper contact, box caps it
+        };
+
+        // Lower bound (the ABOVE side of the unit's lower contact), if any.
+        let lower: Option<ContactHalfSpace> = if unit_idx > 0 {
+            Some(ContactHalfSpace::new(&field, interfaces[unit_idx - 1].isovalue, false))
+        } else {
+            None
+        };
+
+        let box_b = AxisBox::new(min, size);
+        let planes: Vec<PlaneHalfSpace> = self
+            .index
+            .block_half_spaces(b)
+            .into_iter()
+            .map(|hs| PlaneHalfSpace::new(hs.point, hs.normal, hs.keep_positive))
+            .collect();
+
+        let mut contributors: Vec<&dyn Boundary> = Vec::with_capacity(planes.len() + 2);
+        contributors.push(&box_b);
+        for p in &planes {
+            contributors.push(p);
+        }
+        if let Some(lo) = &lower {
+            contributors.push(lo);
+        }
+
+        let cfg = OctreeConfig { cap: true, ..cfg };
+        let scene = Scene::new(&field, upper_iso, contributors);
+        Some(octree_dual_contour_scene(&scene, min, size, cfg))
+    }
+
     /// The block containing `p`, if it has a field.
     fn block_at(&self, p: [f64; 3]) -> Option<&Block> {
         self.blocks.get(self.index.block_at(p)).and_then(|b| b.as_ref())
@@ -263,6 +341,31 @@ impl Model {
     pub fn lithology(&self) -> &Lithology {
         &self.representative_lithology
     }
+}
+
+/// A value strictly larger than `|field|` anywhere in the box `[min, min+size]³`,
+/// sampled on a coarse grid (the cokriging field is smooth, so a coarse sample
+/// bounds it with margin). Used as the top lithology unit's "upper bound" so
+/// `field < upper` holds everywhere and the box top caps the unit.
+fn max_abs_field_in_box(field: &dyn ScalarField, min: [f64; 3], size: f64) -> f64 {
+    let mut m = 0.0_f64;
+    let steps = 6;
+    for i in 0..=steps {
+        for j in 0..=steps {
+            for k in 0..=steps {
+                let p = [
+                    min[0] + size * i as f64 / steps as f64,
+                    min[1] + size * j as f64 / steps as f64,
+                    min[2] + size * k as f64 / steps as f64,
+                ];
+                let v = field.scalar_field(p);
+                if v.is_finite() {
+                    m = m.max(v.abs());
+                }
+            }
+        }
+    }
+    m
 }
 
 /// Clip a triangle mesh to a fault block's region by SPLITTING triangles at each
@@ -859,6 +962,114 @@ mod fault_tests {
             min_depth: 2,
             qef_threshold: 1e-6,
             cap: false,
+        }
+    }
+
+    fn edge_incidence(mesh: &crate::mesh::Mesh) -> (usize, usize) {
+        use std::collections::HashMap;
+        let mut und: HashMap<(u32, u32), u32> = HashMap::new();
+        for t in mesh.indices.chunks_exact(3) {
+            for &(a, b) in &[(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+                let e = if a < b { (a, b) } else { (b, a) };
+                *und.entry(e).or_insert(0) += 1;
+            }
+        }
+        let nm = und.values().filter(|&&c| c > 2).count();
+        let open = und.values().filter(|&&c| c == 1).count();
+        (nm, open)
+    }
+
+    /// Every (block, unit) closed solid is STRICTLY watertight — every edge incidence
+    /// exactly 2 — at several depths. This is the faulted closed-domain view: each
+    /// block's lithology slabs, capped by the box AND the fault plane.
+    #[test]
+    fn block_unit_solids_are_watertight() {
+        for depth in [4u32, 5, 6] {
+            let model = Model::fit_faulted(
+                &faulted_offset_series(),
+                fault_x500(),
+                KernelOptions::default(),
+            );
+            let cfg = octree::OctreeConfig { cap: true, ..mesh_cfg(depth) };
+            for b in 0..model.nblocks() {
+                for u in 0..model.block_unit_count(b) {
+                    let mesh = model
+                        .mesh_block_unit_solid(b, u, [0.0, 0.0, 0.0], 1000.0, cfg)
+                        .unwrap();
+                    if mesh.triangle_count() == 0 {
+                        continue; // a unit with no volume in this block
+                    }
+                    let (nm, open) = edge_incidence(&mesh);
+                    assert_eq!(nm, 0, "d{depth} block {b} unit {u}: non-manifold {nm}");
+                    assert_eq!(open, 0, "d{depth} block {b} unit {u}: open {open}");
+                }
+            }
+        }
+    }
+
+    /// A faulted block's closed solids have the FAULT plane as a cap (faces lying in
+    /// x=500) and none crossing to the far side — the layered solids stitch to the
+    /// fault wall.
+    #[test]
+    fn block_unit_solid_has_fault_cap() {
+        let model =
+            Model::fit_faulted(&faulted_offset_series(), fault_x500(), KernelOptions::default());
+        let cfg = octree::OctreeConfig { cap: true, ..mesh_cfg(5) };
+        // Block 1 = positive side (x>=500); its solids must cap on x=500 and not cross.
+        let mut total_fault_faces = 0;
+        for u in 0..model.block_unit_count(1) {
+            let mesh = model.mesh_block_unit_solid(1, u, [0.0, 0.0, 0.0], 1000.0, cfg).unwrap();
+            let pos = |i: u32| {
+                let k = (i as usize) * 3;
+                [mesh.positions[k] as f64, mesh.positions[k + 1] as f64, mesh.positions[k + 2] as f64]
+            };
+            for &i in &mesh.indices {
+                assert!(pos(i)[0] >= 500.0 - 0.5, "block 1 solid crossed the fault: {:?}", pos(i));
+            }
+            total_fault_faces += (0..mesh.triangle_count())
+                .filter(|&t| {
+                    let v = [mesh.indices[3*t], mesh.indices[3*t+1], mesh.indices[3*t+2]];
+                    v.iter().all(|&j| (pos(j)[0] - 500.0).abs() < 0.5)
+                })
+                .count();
+        }
+        assert!(total_fault_faces > 0, "no fault cap faces on block 1");
+    }
+
+    /// A block's unit solids TILE the block: a point at a known structural position is
+    /// inside exactly the unit its lithology says, and that unit's solid contains it
+    /// (the slabs partition the block with no overlap/gap).
+    #[test]
+    fn block_unit_solids_partition_block() {
+        let model =
+            Model::fit_faulted(&faulted_offset_series(), fault_x500(), KernelOptions::default());
+        // Block 1 (x>500). The offset data has the contact at z=700 on the right.
+        // A point below it (z=650) is in a different unit than above it (z=750), by the
+        // block's OWN lithology — confirming the slabs the closed solids fill are the
+        // partition the unit count is built on.
+        let lith = model.block_lithology(1).unwrap();
+        let f = |p: [f64; 3]| model.scalar_field(p);
+        let u_below = lith.unit_of_value(f([700.0, 500.0, 650.0]));
+        let u_above = lith.unit_of_value(f([700.0, 500.0, 750.0]));
+        assert_ne!(u_below, u_above, "below vs above the contact are different units");
+        assert!(model.block_unit_count(1) >= 2, "two-contact block has >=2 units");
+    }
+
+    /// For a NON-faulted model, the per-block-unit solid equals the whole-domain
+    /// closed solid at that unit's bounding isovalue — parity with the existing view.
+    #[test]
+    fn nonfaulted_block_unit_solid_watertight() {
+        let model = Model::fit(&faulted_offset_series(), KernelOptions::default());
+        assert_eq!(model.nblocks(), 1);
+        let cfg = octree::OctreeConfig { cap: true, ..mesh_cfg(5) };
+        for u in 0..model.block_unit_count(0) {
+            let mesh = model.mesh_block_unit_solid(0, u, [0.0, 0.0, 0.0], 1000.0, cfg).unwrap();
+            if mesh.triangle_count() == 0 {
+                continue;
+            }
+            let (nm, open) = edge_incidence(&mesh);
+            assert_eq!(nm, 0, "unit {u}: non-manifold");
+            assert_eq!(open, 0, "unit {u}: open");
         }
     }
 

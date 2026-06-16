@@ -384,6 +384,57 @@ impl WasmModel {
         }
     }
 
+    /// Number of lithology UNITS (volumes between contacts) in fault `block` — the
+    /// closed-solid count for the faulted close-domain view. `0` if out of range.
+    pub fn block_unit_count(&self, block: usize) -> usize {
+        self.inner.block_unit_count(block)
+    }
+
+    /// A watertight CLOSED solid for one lithology UNIT of one fault block — the slab
+    /// between consecutive contacts, capped by the box AND the fault plane (so the
+    /// layered solids stitch to the fault). The faulted close-domain view loops
+    /// `block × unit`. Octree params mirror [`WasmModel::mesh_block_interface_octree`];
+    /// `cap` is forced true. EMPTY mesh for a field-less block / out-of-range unit.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mesh_block_unit_solid_octree(
+        &self,
+        block: usize,
+        unit_idx: usize,
+        min_x: f64,
+        min_y: f64,
+        min_z: f64,
+        size: f64,
+        max_depth: u32,
+        min_depth: u32,
+        qef_threshold: f64,
+    ) -> WasmMesh {
+        let cfg = OctreeConfig {
+            max_depth: max_depth.max(1),
+            min_depth: min_depth.min(max_depth),
+            qef_threshold: if qef_threshold.is_finite() && qef_threshold > 0.0 {
+                qef_threshold
+            } else {
+                OctreeConfig::default().qef_threshold
+            },
+            cap: true,
+        };
+        match self
+            .inner
+            .mesh_block_unit_solid(block, unit_idx, [min_x, min_y, min_z], size, cfg)
+        {
+            Some(m) => WasmMesh {
+                positions: m.positions,
+                normals: m.normals,
+                indices: m.indices,
+            },
+            None => WasmMesh {
+                positions: Vec::new(),
+                normals: Vec::new(),
+                indices: Vec::new(),
+            },
+        }
+    }
+
     /// Recovered per-interface isovalues, ascending by isovalue, as a
     /// `Float64Array`. These are the scalar-field levels at which each interface's
     /// contact lives — mesh each one to render the actual geological surfaces (as

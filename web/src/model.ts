@@ -42,6 +42,9 @@ export interface SurfaceMesh {
   /** Fault block this surface belongs to (undefined when not faulted). Each block's
    *  copy of a contact is a SEPARATE, unconnected surface (Leapfrog-style). */
   block?: number;
+  /** Lithology unit index, for the faulted CLOSED-domain view (a watertight slab per
+   *  block per unit). Undefined for contact-surface meshes. */
+  unit?: number;
   positions: Float32Array; // 3 * V
   normals: Float32Array; // 3 * V — exact per-vertex normals (field gradient)
   indices: Uint32Array; // 3 * T
@@ -165,24 +168,31 @@ export function solveAndMesh(
   const surfaces: SurfaceMesh[] = [];
   let totalTris = 0;
 
-  // A faulted model in the OPEN-SHEET view renders each block's copy of a contact as
-  // a SEPARATE, unconnected surface clipped to that block (Leapfrog-style) — so the
-  // contact does not stitch crumpled triangles across the fault. The closed-solid
-  // (cap) view stays on the whole-domain path for now.
+  // A faulted model renders per-block to avoid the cross-fault field discontinuity
+  // crumpling the contour. OPEN-SHEET (cap off): one clean clipped contact surface per
+  // (block, interface) (Leapfrog-style). CLOSED (cap on): one watertight solid per
+  // (block, lithology unit), capped by the box AND the fault plane — the layered
+  // solids stitch to the fault.
   const blockCount = model.block_count;
-  const faulted = blockCount > 1 && !cap;
+  const faultedOpen = blockCount > 1 && !cap;
+  const faultedClosed = blockCount > 1 && cap;
 
   const pushSurface = (
     wm: ReturnType<WasmModel["mesh_isosurface_octree"]>,
     interfaceId: number,
     isovalue: number,
     block: number | undefined,
+    unit?: number,
   ) => {
+    // Closed-solid units color by unit (a distinct stable color per lithology layer);
+    // contact surfaces color by their interface's formation.
+    const formation = unit !== undefined ? `unit ${unit}` : nameOf(interfaceId);
     surfaces.push({
       interfaceId,
-      formation: nameOf(interfaceId),
+      formation,
       isovalue,
       block,
+      unit,
       positions: wm.positions(),
       normals: wm.normals(),
       indices: wm.indices(),
@@ -192,7 +202,7 @@ export function solveAndMesh(
     wm.free();
   };
 
-  if (faulted) {
+  if (faultedOpen) {
     // One surface per (block, interface), each clipped to its block's region.
     for (let b = 0; b < blockCount; b++) {
       const bIds = Array.from(model.block_interface_ids(b));
@@ -211,6 +221,33 @@ export function solveAndMesh(
         );
         if (wm.triangle_count > 0) {
           pushSurface(wm, bIds[s], bIsos[s] ?? 0, b);
+        } else {
+          wm.free();
+        }
+      }
+    }
+  } else if (faultedClosed) {
+    // One watertight solid per (block, lithology unit), capped by box + fault plane.
+    for (let b = 0; b < blockCount; b++) {
+      const units = model.block_unit_count(b);
+      // Name a unit by the contact below it (its lower bounding interface), best-effort.
+      const bIds = Array.from(model.block_interface_ids(b));
+      for (let u = 0; u < units; u++) {
+        const wm = model.mesh_block_unit_solid_octree(
+          b,
+          u,
+          minX,
+          minY,
+          minZ,
+          size,
+          maxDepth,
+          minDepth,
+          QEF_EPS,
+        );
+        if (wm.triangle_count > 0) {
+          // Unit u sits above interface u-1; tag it with that interface id when present.
+          const lowerId = u > 0 ? bIds[u - 1] : -1;
+          pushSurface(wm, lowerId, 0, b, u);
         } else {
           wm.free();
         }
