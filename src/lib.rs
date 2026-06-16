@@ -16,6 +16,7 @@ pub mod litho;
 pub mod mesh;
 pub mod octree;
 pub mod solve;
+pub mod stack;
 
 #[cfg(feature = "wasm")]
 pub mod wasm;
@@ -25,6 +26,8 @@ use data::Series;
 use evaluate::Field;
 use litho::Lithology;
 use solve::{solve, Solution};
+
+pub use stack::{Relation, Stack, StackedSeries};
 
 /// A fitted single-series potential-field model: owns the assembled system, the
 /// solved dual weights, and the recovered lithology isovalues. Self-contained so

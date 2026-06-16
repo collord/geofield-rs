@@ -138,6 +138,63 @@ impl Boundary for ContactSurface<'_> {
     }
 }
 
+/// One side of a `Model` field's contact `field == iso`, as a [`Boundary`].
+///
+/// `inside` is the BELOW side (`field < iso`) when `below`, else the ABOVE side
+/// (`field > iso`); the crossing normal is the field gradient. Unlike
+/// [`ContactSurface`] (which is fixed to the below side), this carries an explicit
+/// side flag — needed by the multi-series [`crate::stack`] to clip an older series'
+/// surface to the half OUTSIDE a younger eroding body (`below = false`, the
+/// `field >= iso` side), and to build slabs (`below(hi) ∩ above(lo)`) from one field.
+pub struct ContactHalfSpace<'a> {
+    model: &'a Model,
+    isovalue: f64,
+    /// `true` keeps the below side (`field < iso`) inside; `false` the above side.
+    below: bool,
+}
+
+impl<'a> ContactHalfSpace<'a> {
+    /// A half-space of `model`'s contact at `isovalue`. `below = true` → the
+    /// `field < iso` side is inside; `below = false` → the `field > iso` side.
+    pub fn new(model: &'a Model, isovalue: f64, below: bool) -> Self {
+        Self {
+            model,
+            isovalue,
+            below,
+        }
+    }
+}
+
+impl Boundary for ContactHalfSpace<'_> {
+    fn inside(&self, p: [f64; 3]) -> bool {
+        let f = self.model.scalar_field(p) - self.isovalue;
+        if self.below {
+            f < 0.0
+        } else {
+            f > 0.0
+        }
+    }
+
+    fn edge_crossing(&self, a: [f64; 3], b: [f64; 3]) -> Option<([f64; 3], [f64; 3])> {
+        let fa = self.model.scalar_field(a) - self.isovalue;
+        let fb = self.model.scalar_field(b) - self.isovalue;
+        if (fa < 0.0) == (fb < 0.0) {
+            return None;
+        }
+        let t = fa / (fa - fb);
+        let p = [
+            a[0] + (b[0] - a[0]) * t,
+            a[1] + (b[1] - a[1]) * t,
+            a[2] + (b[2] - a[2]) * t,
+        ];
+        Some((p, normalize(self.model.scalar_field_gradient(p))))
+    }
+
+    fn surface_normal(&self, p: [f64; 3]) -> Option<[f64; 3]> {
+        Some(normalize(self.model.scalar_field_gradient(p)))
+    }
+}
+
 /// The combined implicit solid the contourer meshes: the PRIMARY contact (`model`
 /// at `isovalue`) intersected with a list of additional [`Boundary`] contributors
 /// (the domain box, erosion/truncation surfaces, …). A point is INSIDE the solid
@@ -2101,40 +2158,11 @@ mod tests {
         check(0.08, "low-angle");
     }
 
-    /// A half-space contact from a `Model`: `inside` is below (`field < iso`) when
-    /// `below`, else above. The crossing normal is the field gradient. Used to build
-    /// a slab (`below(hi) ∩ above(lo)`) from one field.
-    struct HalfSpace<'a> {
-        m: &'a Model,
-        iso: f64,
-        below: bool,
-    }
-    impl Boundary for HalfSpace<'_> {
-        fn inside(&self, p: [f64; 3]) -> bool {
-            let f = self.m.scalar_field(p) - self.iso;
-            if self.below {
-                f < 0.0
-            } else {
-                f > 0.0
-            }
-        }
-        fn edge_crossing(&self, a: [f64; 3], b: [f64; 3]) -> Option<([f64; 3], [f64; 3])> {
-            let fa = self.m.scalar_field(a) - self.iso;
-            let fb = self.m.scalar_field(b) - self.iso;
-            if (fa < 0.0) == (fb < 0.0) {
-                return None;
-            }
-            let t = fa / (fa - fb);
-            let p = [
-                a[0] + (b[0] - a[0]) * t,
-                a[1] + (b[1] - a[1]) * t,
-                a[2] + (b[2] - a[2]) * t,
-            ];
-            Some((p, normalize(self.m.scalar_field_gradient(p))))
-        }
-        fn surface_normal(&self, p: [f64; 3]) -> Option<[f64; 3]> {
-            Some(normalize(self.m.scalar_field_gradient(p)))
-        }
+    /// Test alias for the public [`ContactHalfSpace`]: `inside` is below
+    /// (`field < iso`) when `below`, else above. Used to build a slab
+    /// (`below(hi) ∩ above(lo)`) from one field.
+    fn half_space(m: &Model, iso: f64, below: bool) -> ContactHalfSpace<'_> {
+        ContactHalfSpace::new(m, iso, below)
     }
 
     #[test]
@@ -2144,8 +2172,8 @@ mod tests {
         let (m, _) = dipping_plane(500.0, 0.0, 0.0); // flat, field ∝ z
         let lo = m.scalar_field([500.0, 500.0, 480.0]);
         let hi = m.scalar_field([500.0, 500.0, 520.0]);
-        let below_hi = HalfSpace { m: &m, iso: hi, below: true };
-        let above_lo = HalfSpace { m: &m, iso: lo, below: false };
+        let below_hi = half_space(&m, hi, true);
+        let above_lo = half_space(&m, lo, false);
         let box_b = AxisBox::new([0.0, 0.0, 0.0], 1000.0);
         let scene = Scene::new(&m, hi, vec![&box_b, &above_lo]);
         let _ = below_hi;
@@ -2180,7 +2208,7 @@ mod tests {
         let f_at = |z: f64| m.scalar_field([500.0, 500.0, z]);
         let lo = f_at(500.0).min(f_at(620.0));
         let hi = f_at(500.0).max(f_at(620.0));
-        let above_lo = HalfSpace { m: &m, iso: lo, below: false };
+        let above_lo = half_space(&m, lo, false);
         let box_b = AxisBox::new([0.0, 0.0, 0.0], 1000.0);
         // primary = below-hi (Model m at iso hi); contributors = box ∩ above-lo.
         let scene = Scene::new(&m, hi, vec![&box_b, &above_lo]);
@@ -2222,11 +2250,11 @@ mod tests {
         let f_at = |z: f64| bed.scalar_field([500.0, 500.0, z]);
         let lo = f_at(450.0).min(f_at(550.0));
         let hi = f_at(450.0).max(f_at(550.0));
-        let above_lo = HalfSpace { m: &bed, iso: lo, below: false };
+        let above_lo = half_space(&bed, lo, false);
         // Erosion: a separate contact dipping the OTHER way at low angle, cutting the
         // bed near the middle of the domain.
         let (ero, iso_e) = dipping_plane(520.0, -0.06, 0.02);
-        let erosion = HalfSpace { m: &ero, iso: iso_e, below: true };
+        let erosion = half_space(&ero, iso_e, true);
         let box_b = AxisBox::new([0.0, 0.0, 0.0], 1000.0);
         // primary = below-hi (the bed's upper contact); contributors = box, above-lo
         // (bed's lower contact), erosion.

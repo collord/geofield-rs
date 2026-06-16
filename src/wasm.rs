@@ -15,7 +15,65 @@ use crate::assemble::KernelOptions;
 use crate::data::{Orientation, Series, SurfacePoint};
 use crate::mesh::{dual_contour, MeshGrid};
 use crate::octree::{octree_dual_contour, OctreeConfig};
+use crate::stack::{Relation, Stack, StackedSeries};
 use crate::Model;
+
+/// Build (validate + marshal + fit) a single-series [`Model`] from the flat typed
+/// arrays the JS side passes. Shared by [`WasmModel::new`] and [`WasmStack::add_series`].
+/// Kernel options default (mirroring `OctreeConfig`/`KernelOptions::default`) where a
+/// value is NaN / `uni_degree == 0`.
+#[allow(clippy::too_many_arguments)]
+fn fit_from_flat(
+    sp_xyz: &[f64],
+    sp_interface: &[f64],
+    ori_xyz: &[f64],
+    ori_pole: &[f64],
+    range: f64,
+    c_o: f64,
+    i_res: f64,
+    gi_res: f64,
+    uni_degree: u32,
+    nugget: f64,
+) -> Result<Model, JsError> {
+    if !sp_xyz.len().is_multiple_of(3)
+        || !ori_xyz.len().is_multiple_of(3)
+        || !ori_pole.len().is_multiple_of(3)
+    {
+        return Err(JsError::new("xyz/pole arrays must have length divisible by 3"));
+    }
+    if sp_xyz.len() / 3 != sp_interface.len() {
+        return Err(JsError::new("sp_interface length must equal sp count"));
+    }
+    if ori_xyz.len() != ori_pole.len() {
+        return Err(JsError::new("ori_xyz and ori_pole must have equal length"));
+    }
+
+    let surface_points: Vec<SurfacePoint> = sp_xyz
+        .chunks_exact(3)
+        .zip(sp_interface.iter())
+        .map(|(c, &id)| SurfacePoint::new([c[0], c[1], c[2]], id as u32))
+        .collect();
+    let orientations: Vec<Orientation> = ori_xyz
+        .chunks_exact(3)
+        .zip(ori_pole.chunks_exact(3))
+        .map(|(c, p)| Orientation::new([c[0], c[1], c[2]], [p[0], p[1], p[2]]))
+        .collect();
+
+    let d = KernelOptions::default();
+    let or = |v: f64, dflt: f64| if v.is_nan() { dflt } else { v };
+    let opts = KernelOptions {
+        range: or(range, d.range),
+        c_o: or(c_o, d.c_o),
+        i_res: or(i_res, d.i_res),
+        gi_res: or(gi_res, d.gi_res),
+        uni_degree: if uni_degree == 0 { d.uni_degree } else { uni_degree },
+        grad_nugget: or(nugget, d.grad_nugget),
+        sp_nugget: or(nugget, d.sp_nugget),
+    };
+
+    let series = Series::new(surface_points, orientations);
+    Ok(Model::fit(&series, opts))
+}
 
 /// A dual-contoured triangle mesh handed to JS: flat position + index buffers.
 #[wasm_bindgen]
@@ -76,43 +134,19 @@ impl WasmModel {
         uni_degree: u32,
         nugget: f64,
     ) -> Result<WasmModel, JsError> {
-        if sp_xyz.len() % 3 != 0 || ori_xyz.len() % 3 != 0 || ori_pole.len() % 3 != 0 {
-            return Err(JsError::new("xyz/pole arrays must have length divisible by 3"));
-        }
-        if sp_xyz.len() / 3 != sp_interface.len() {
-            return Err(JsError::new("sp_interface length must equal sp count"));
-        }
-        if ori_xyz.len() != ori_pole.len() {
-            return Err(JsError::new("ori_xyz and ori_pole must have equal length"));
-        }
-
-        let surface_points: Vec<SurfacePoint> = sp_xyz
-            .chunks_exact(3)
-            .zip(sp_interface.iter())
-            .map(|(c, &id)| SurfacePoint::new([c[0], c[1], c[2]], id as u32))
-            .collect();
-        let orientations: Vec<Orientation> = ori_xyz
-            .chunks_exact(3)
-            .zip(ori_pole.chunks_exact(3))
-            .map(|(c, p)| Orientation::new([c[0], c[1], c[2]], [p[0], p[1], p[2]]))
-            .collect();
-
-        let d = KernelOptions::default();
-        let or = |v: f64, dflt: f64| if v.is_nan() { dflt } else { v };
-        let opts = KernelOptions {
-            range: or(range, d.range),
-            c_o: or(c_o, d.c_o),
-            i_res: or(i_res, d.i_res),
-            gi_res: or(gi_res, d.gi_res),
-            uni_degree: if uni_degree == 0 { d.uni_degree } else { uni_degree },
-            grad_nugget: or(nugget, d.grad_nugget),
-            sp_nugget: or(nugget, d.sp_nugget),
-        };
-
-        let series = Series::new(surface_points, orientations);
-        Ok(WasmModel {
-            inner: Model::fit(&series, opts),
-        })
+        let inner = fit_from_flat(
+            sp_xyz,
+            sp_interface,
+            ori_xyz,
+            ori_pole,
+            range,
+            c_o,
+            i_res,
+            gi_res,
+            uni_degree,
+            nugget,
+        )?;
+        Ok(WasmModel { inner })
     }
 
     /// Scalar field at a single world point.
@@ -237,5 +271,155 @@ impl WasmModel {
     /// Largest within-interface isovalue spread at fit time (diagnostic).
     pub fn isovalue_spread(&self) -> f64 {
         self.inner.isovalue_spread
+    }
+}
+
+/// Map a JS relation code to a [`Relation`]. `0=Erode 1=Onlap 2=Conformable
+/// 3=Basement`; anything else falls back to `Erode` (GemPy's default).
+fn relation_from_code(code: u32) -> Relation {
+    match code {
+        1 => Relation::Onlap,
+        2 => Relation::Conformable,
+        3 => Relation::Basement,
+        _ => Relation::Erode,
+    }
+}
+
+/// A multi-series stack exposed to JS (GemPy-style unconformities).
+///
+/// Build it by repeatedly calling [`WasmStack::add_series`] **youngest series
+/// first**, each with its own surface points/orientations and a relation code, then
+/// query per-point lithology ([`WasmStack::lithology_unit`]) or mesh a single
+/// interface clipped to its series' visible region ([`WasmStack::mesh_interface_octree`]).
+#[wasm_bindgen]
+pub struct WasmStack {
+    inner: Stack,
+}
+
+#[wasm_bindgen]
+impl WasmStack {
+    /// An empty stack. Add series youngest→oldest with [`WasmStack::add_series`].
+    #[wasm_bindgen(constructor)]
+    pub fn new() -> WasmStack {
+        WasmStack {
+            inner: Stack::new(Vec::new()),
+        }
+    }
+
+    /// Fit and append one series (the next-oldest). Arrays and kernel options match
+    /// [`WasmModel::new`]; `relation` is the code in [`relation_from_code`]
+    /// (`0=Erode 1=Onlap 2=Conformable 3=Basement`). Appends in call order, so the
+    /// FIRST `add_series` is the youngest.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_series(
+        &mut self,
+        sp_xyz: &[f64],
+        sp_interface: &[f64],
+        ori_xyz: &[f64],
+        ori_pole: &[f64],
+        range: f64,
+        c_o: f64,
+        i_res: f64,
+        gi_res: f64,
+        uni_degree: u32,
+        nugget: f64,
+        relation: u32,
+    ) -> Result<(), JsError> {
+        let model = fit_from_flat(
+            sp_xyz,
+            sp_interface,
+            ori_xyz,
+            ori_pole,
+            range,
+            c_o,
+            i_res,
+            gi_res,
+            uni_degree,
+            nugget,
+        )?;
+        self.inner
+            .series
+            .push(StackedSeries::new(model, relation_from_code(relation)));
+        Ok(())
+    }
+
+    /// Number of series in the stack.
+    #[wasm_bindgen(getter)]
+    pub fn series_count(&self) -> usize {
+        self.inner.len()
+    }
+
+    /// Number of interfaces (meshable contacts) in series `series`. `0` if out of range.
+    pub fn interface_count(&self, series: usize) -> usize {
+        self.inner
+            .series
+            .get(series)
+            .map(|s| s.model.lithology().interfaces.len())
+            .unwrap_or(0)
+    }
+
+    /// The flattened global lithology label at a point, encoding the
+    /// `(series, unit_within_series)` pair as `series * 1000 + unit`. JS can decode
+    /// with `Math.floor(v/1000)` and `v % 1000`. (1000 units/series is far above any
+    /// realistic interface count.)
+    pub fn lithology_label(&self, x: f64, y: f64, z: f64) -> u32 {
+        let (s, u) = self.inner.global_unit([x, y, z]);
+        (s as u32) * 1000 + (u as u32)
+    }
+
+    /// Just the winning series index at a point (which series is visible there).
+    pub fn series_at(&self, x: f64, y: f64, z: f64) -> usize {
+        self.inner.global_unit([x, y, z]).0
+    }
+
+    /// Adaptive octree mesh of interface `interface_idx` of series `series`, clipped
+    /// to that series' visible region (the domain box ∩ outside every younger
+    /// erosion). Returns an EMPTY mesh if indices are out of range. Octree params
+    /// mirror [`WasmModel::mesh_isosurface_octree`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn mesh_interface_octree(
+        &self,
+        series: usize,
+        interface_idx: usize,
+        min_x: f64,
+        min_y: f64,
+        min_z: f64,
+        size: f64,
+        max_depth: u32,
+        min_depth: u32,
+        qef_threshold: f64,
+        cap: bool,
+    ) -> WasmMesh {
+        let cfg = OctreeConfig {
+            max_depth: max_depth.max(1),
+            min_depth: min_depth.min(max_depth),
+            qef_threshold: if qef_threshold.is_finite() && qef_threshold > 0.0 {
+                qef_threshold
+            } else {
+                OctreeConfig::default().qef_threshold
+            },
+            cap,
+        };
+        match self
+            .inner
+            .mesh_one(series, interface_idx, [min_x, min_y, min_z], size, cfg)
+        {
+            Some(m) => WasmMesh {
+                positions: m.positions,
+                normals: m.normals,
+                indices: m.indices,
+            },
+            None => WasmMesh {
+                positions: Vec::new(),
+                normals: Vec::new(),
+                indices: Vec::new(),
+            },
+        }
+    }
+}
+
+impl Default for WasmStack {
+    fn default() -> Self {
+        Self::new()
     }
 }
