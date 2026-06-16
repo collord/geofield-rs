@@ -1,7 +1,7 @@
 import { useEffect, useRef } from "react";
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
-import { MeshData } from "./model";
+import { MeshData, SurfaceMesh } from "./model";
 import {
   SurfacePointRow,
   OrientationRow,
@@ -20,6 +20,32 @@ const FORMATION_COLORS: Record<string, number> = {
   rock1: 0xe07b39,
   rock2: 0x3d9be9,
 };
+
+/** Color for one surface. Contacts use the formation palette (rock1/rock2). Closed
+ *  lithology-unit solids use an evenly-spaced HSL hue per unit (so adjacent layers are
+ *  maximally distinct, unlike a string hash where "unit 1"/"unit 2" collide), shifted
+ *  in lightness per fault block so block A's and block B's layers also differ. */
+function pickColor(surf: SurfaceMesh): number {
+  if (surf.unit === undefined) {
+    return FORMATION_COLORS[surf.formation] ?? colorFor(surf.formation);
+  }
+  // Golden-angle hue spacing → well-separated colors for any unit count.
+  const hue = (surf.unit * 0.61803398875) % 1;
+  // Per-block lightness shift: block 0 darker, block 1 lighter (and so on).
+  const block = surf.block ?? 0;
+  const light = 0.45 + 0.12 * (block % 3);
+  return hslToHex(hue, 0.6, light);
+}
+
+function hslToHex(h: number, s: number, l: number): number {
+  const f = (n: number) => {
+    const k = (n + h * 12) % 12;
+    const a = s * Math.min(l, 1 - l);
+    const c = l - a * Math.max(-1, Math.min(k - 3, 9 - k, 1));
+    return Math.round(c * 255);
+  };
+  return (f(0) << 16) | (f(8) << 8) | f(4);
+}
 
 export function Viewer({ mesh, surfacePoints, orientations }: Props) {
   const mountRef = useRef<HTMLDivElement>(null);
@@ -129,7 +155,7 @@ export function Viewer({ mesh, surfacePoints, orientations }: Props) {
         geom.computeVertexNormals();
       }
 
-      const color = FORMATION_COLORS[surf.formation] ?? colorFor(surf.formation);
+      const color = pickColor(surf);
       const mat = new THREE.MeshStandardMaterial({
         color,
         metalness: 0.1,
