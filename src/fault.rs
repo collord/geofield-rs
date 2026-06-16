@@ -26,6 +26,24 @@ pub trait BlockIndex {
     fn block_at(&self, p: [f64; 3]) -> usize;
     /// Total number of blocks (so the fitter can allocate per-block buckets).
     fn nblocks(&self) -> usize;
+    /// The plane half-spaces whose intersection IS block `block`'s region — used to
+    /// CLIP a per-block contact mesh to that block (so a faulted contact renders as
+    /// separate, unconnected sheets, not one stitched across the fault). Returns
+    /// plain plane data (no mesh-layer dependency); the contourer turns each into a
+    /// clip `Boundary`. An empty result means "no clip" (the whole domain — the
+    /// non-faulted block 0).
+    fn block_half_spaces(&self, block: usize) -> Vec<HalfSpace>;
+}
+
+/// A plane half-space, as plain geometry: the side of `point`+`normal` to KEEP.
+/// `keep_positive` keeps `(p − point)·normal >= 0`, else the negative side. Returned
+/// by [`BlockIndex::block_half_spaces`] and turned into a clip `Boundary` by the
+/// contourer (`octree::PlaneHalfSpace`).
+#[derive(Debug, Clone, Copy)]
+pub struct HalfSpace {
+    pub point: [f64; 3],
+    pub normal: [f64; 3],
+    pub keep_positive: bool,
 }
 
 /// The trivial single-block index — everything is block 0. The non-faulted default,
@@ -38,6 +56,9 @@ impl BlockIndex for SingleBlock {
     }
     fn nblocks(&self) -> usize {
         1
+    }
+    fn block_half_spaces(&self, _block: usize) -> Vec<HalfSpace> {
+        Vec::new() // whole domain, no clip
     }
 }
 
@@ -77,6 +98,15 @@ impl PlanarFault {
     pub fn positive_side(&self, p: [f64; 3]) -> bool {
         self.signed(p) >= 0.0
     }
+
+    /// A point on the plane.
+    pub fn point(&self) -> [f64; 3] {
+        self.point
+    }
+    /// The plane's unit normal (points toward the positive side).
+    pub fn normal(&self) -> [f64; 3] {
+        self.normal
+    }
 }
 
 /// One planar fault → two blocks: block 0 is the negative side, block 1 the positive.
@@ -96,6 +126,14 @@ impl BlockIndex for OneFault {
     }
     fn nblocks(&self) -> usize {
         2
+    }
+    fn block_half_spaces(&self, block: usize) -> Vec<HalfSpace> {
+        // Block 1 is the positive side, block 0 the negative.
+        vec![HalfSpace {
+            point: self.fault.point(),
+            normal: self.fault.normal(),
+            keep_positive: block == 1,
+        }]
     }
 }
 
@@ -130,6 +168,18 @@ impl BlockIndex for FaultStack {
     }
     fn nblocks(&self) -> usize {
         1 << self.faults.len()
+    }
+    fn block_half_spaces(&self, block: usize) -> Vec<HalfSpace> {
+        // One clip per fault; keep the side matching this block's sign-tuple bit.
+        self.faults
+            .iter()
+            .enumerate()
+            .map(|(i, f)| HalfSpace {
+                point: f.point(),
+                normal: f.normal(),
+                keep_positive: (block >> i) & 1 == 1,
+            })
+            .collect()
     }
 }
 

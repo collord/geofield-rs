@@ -174,10 +174,40 @@ once step 4 lands.
 3. ✅ Test: a planar fault offsetting a flat contact — discontinuous across the
    plane, continuous within each block, each block reproduces its own contact.
 4. ✅ Multi-fault `FaultStack` (sign-tuple → block).
-5. ⬜ (Later, optional) wire a fault mesh as an `octree::Boundary` to split the
-   rendered mesh too. NOTE: for a faulted **field**, the contact mesh ALREADY shows
-   the lateral offset (the octree contours the discontinuous `scalar_field`). Step 5
-   is only needed if we want a fault *surface* meshed/closed as its own face.
+5. ✅ (open-sheet) Render each block's contact as a SEPARATE, unconnected surface
+   clipped to that block, instead of one mesh stitched across the fault. Contouring
+   the discontinuous field over the whole domain stitched crumpled triangles in the
+   fault zone (the field jumps at the plane and the contour bridges it). Fixed by
+   meshing each block as its own clipped `Scene` (Leapfrog-style separate surfaces) —
+   see "Per-block surface rendering" below.
+6. ⬜ (Later, optional) wire a fault mesh as an `octree::Boundary` to split / CLOSE
+   the rendered mesh in the cap=true solid too — the closed faulted solid needs the
+   fault plane meshed as a wall closing each block's volume. The open-sheet split
+   (step 5) does not need this. Also the future **fault fill / dike** (a modeled
+   volume between the displaced blocks) builds on the same per-block clip machinery.
+
+## Per-block surface rendering (open-sheet, step 5)
+
+The open-sheet (`cap = false`) view renders one surface per **(block, interface)**,
+each contoured as a single clipped `Scene` and left UNCONNECTED to the other block's
+copy — matching Leapfrog (the rock1–rock2 contact in block A and in block B are
+separate things). Pieces:
+
+* `BlockIndex::block_half_spaces(block) -> Vec<HalfSpace>` (`fault.rs`): the plane
+  half-spaces whose intersection is that block's region (one per bounding fault).
+  Plain plane data — no mesh-layer dependency.
+* `octree::PlaneHalfSpace` — a geometric plane clip `Boundary` (exact segment/plane
+  `edge_crossing`), the contributor that clips a contour to one side of a fault.
+* `Model::mesh_block_interface(block, iface, …)` — `Scene { primary: self (per-block
+  dispatch), contributors: [box, plane clips…] }`, contoured `cap=false`. The clip
+  guarantees every in-region point is in `block`, so the per-block field is what gets
+  contoured; no cross-block leakage. For a non-faulted model (`block_half_spaces`
+  empty) this is exactly the old whole-domain open sheet.
+* WASM `mesh_block_interface_octree` / `block_interface_count` / `block_interface_ids`,
+  and the web loops block × interface when faulted + open-sheet.
+
+The **cap=true** faulted solid still uses the whole-domain path (its watertight
+closure across the fault is the deferred step-6 work).
 
 ## Deviations from this design, as built
 

@@ -39,6 +39,9 @@ export interface SurfaceMesh {
   interfaceId: number;
   formation: string; // formation name for this interface id (best-effort)
   isovalue: number;
+  /** Fault block this surface belongs to (undefined when not faulted). Each block's
+   *  copy of a contact is a SEPARATE, unconnected surface (Leapfrog-style). */
+  block?: number;
   positions: Float32Array; // 3 * V
   normals: Float32Array; // 3 * V — exact per-vertex normals (field gradient)
   indices: Uint32Array; // 3 * T
@@ -155,34 +158,31 @@ export function solveAndMesh(
   // Octree needs a cube; use the largest extent span and anchor at the min corner.
   const size = Math.max(maxX - minX, maxY - minY, maxZ - minZ);
 
-  // Mesh ONE surface per interface, at its recovered isovalue. These pass
-  // through the input surface points (the geological contacts), matching gempy —
-  // not an arbitrary level set.
-  const isovalues = Array.from(model.interface_isovalues());
-  const ids = Array.from(model.interface_ids());
   const nameOf = (id: number): string => SERIES_ORDER[id] ?? `interface ${id}`;
-
   const minDepth = Math.min(2, maxDepth);
   const QEF_EPS = 1e-6;
 
   const surfaces: SurfaceMesh[] = [];
   let totalTris = 0;
-  for (let s = 0; s < isovalues.length; s++) {
-    const wm = model.mesh_isosurface_octree(
-      minX,
-      minY,
-      minZ,
-      size,
-      isovalues[s],
-      maxDepth,
-      minDepth,
-      QEF_EPS,
-      cap,
-    );
+
+  // A faulted model in the OPEN-SHEET view renders each block's copy of a contact as
+  // a SEPARATE, unconnected surface clipped to that block (Leapfrog-style) — so the
+  // contact does not stitch crumpled triangles across the fault. The closed-solid
+  // (cap) view stays on the whole-domain path for now.
+  const blockCount = model.block_count;
+  const faulted = blockCount > 1 && !cap;
+
+  const pushSurface = (
+    wm: ReturnType<WasmModel["mesh_isosurface_octree"]>,
+    interfaceId: number,
+    isovalue: number,
+    block: number | undefined,
+  ) => {
     surfaces.push({
-      interfaceId: ids[s],
-      formation: nameOf(ids[s]),
-      isovalue: isovalues[s],
+      interfaceId,
+      formation: nameOf(interfaceId),
+      isovalue,
+      block,
       positions: wm.positions(),
       normals: wm.normals(),
       indices: wm.indices(),
@@ -190,9 +190,53 @@ export function solveAndMesh(
     });
     totalTris += wm.triangle_count;
     wm.free();
+  };
+
+  if (faulted) {
+    // One surface per (block, interface), each clipped to its block's region.
+    for (let b = 0; b < blockCount; b++) {
+      const bIds = Array.from(model.block_interface_ids(b));
+      const bIsos = Array.from(model.interface_isovalues()); // representative; per-block uses own iso internally
+      for (let s = 0; s < bIds.length; s++) {
+        const wm = model.mesh_block_interface_octree(
+          b,
+          s,
+          minX,
+          minY,
+          minZ,
+          size,
+          maxDepth,
+          minDepth,
+          QEF_EPS,
+        );
+        if (wm.triangle_count > 0) {
+          pushSurface(wm, bIds[s], bIsos[s] ?? 0, b);
+        } else {
+          wm.free();
+        }
+      }
+    }
+  } else {
+    // Non-faulted (or closed-solid) path: one surface per interface over the whole
+    // domain at its recovered isovalue.
+    const isovalues = Array.from(model.interface_isovalues());
+    const ids = Array.from(model.interface_ids());
+    for (let s = 0; s < isovalues.length; s++) {
+      const wm = model.mesh_isosurface_octree(
+        minX,
+        minY,
+        minZ,
+        size,
+        isovalues[s],
+        maxDepth,
+        minDepth,
+        QEF_EPS,
+        cap,
+      );
+      pushSurface(wm, ids[s], isovalues[s], undefined);
+    }
   }
 
-  const blockCount = model.block_count;
   const mesh: MeshData = {
     surfaces,
     triangleCount: totalTris,

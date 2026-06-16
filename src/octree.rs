@@ -195,6 +195,77 @@ impl Boundary for ContactHalfSpace<'_> {
     }
 }
 
+/// A pure geometric plane half-space, as a [`Boundary`]. `inside` keeps the chosen
+/// side of the plane (`(p − point)·normal >= 0` when `keep_positive`, else the
+/// negative side); `edge_crossing` is the exact segment/plane intersection. Unlike
+/// [`ContactHalfSpace`] (a `Model`-field level set) this is a fixed plane — used to
+/// clip a per-block contact mesh to one side of a planar fault, so a faulted contact
+/// renders as separate, unconnected sheets. Built from a [`crate::fault::HalfSpace`].
+pub struct PlaneHalfSpace {
+    point: [f64; 3],
+    normal: [f64; 3],
+    keep_positive: bool,
+}
+
+impl PlaneHalfSpace {
+    pub fn new(point: [f64; 3], normal: [f64; 3], keep_positive: bool) -> Self {
+        Self {
+            point,
+            normal: normalize(normal),
+            keep_positive,
+        }
+    }
+
+    /// Signed perpendicular distance `(p − point)·normal` (positive on the +normal side).
+    fn signed(&self, p: [f64; 3]) -> f64 {
+        (p[0] - self.point[0]) * self.normal[0]
+            + (p[1] - self.point[1]) * self.normal[1]
+            + (p[2] - self.point[2]) * self.normal[2]
+    }
+}
+
+impl Boundary for PlaneHalfSpace {
+    fn inside(&self, p: [f64; 3]) -> bool {
+        let s = self.signed(p);
+        // Inside the KEPT side; `b < 0` is the inside convention, so "kept" maps to
+        // s>=0 (keep_positive) or s<=0 (else).
+        if self.keep_positive {
+            s >= 0.0
+        } else {
+            s <= 0.0
+        }
+    }
+
+    fn edge_crossing(&self, a: [f64; 3], b: [f64; 3]) -> Option<([f64; 3], [f64; 3])> {
+        let sa = self.signed(a);
+        let sb = self.signed(b);
+        if (sa < 0.0) == (sb < 0.0) {
+            return None;
+        }
+        let t = sa / (sa - sb);
+        let p = [
+            a[0] + (b[0] - a[0]) * t,
+            a[1] + (b[1] - a[1]) * t,
+            a[2] + (b[2] - a[2]) * t,
+        ];
+        // Outward normal points OUT of the kept side.
+        let n = if self.keep_positive {
+            self.normal
+        } else {
+            [-self.normal[0], -self.normal[1], -self.normal[2]]
+        };
+        Some((p, n))
+    }
+
+    fn surface_normal(&self, _p: [f64; 3]) -> Option<[f64; 3]> {
+        Some(if self.keep_positive {
+            self.normal
+        } else {
+            [-self.normal[0], -self.normal[1], -self.normal[2]]
+        })
+    }
+}
+
 /// The combined implicit solid the contourer meshes: the PRIMARY contact (`model`
 /// at `isovalue`) intersected with a list of additional [`Boundary`] contributors
 /// (the domain box, erosion/truncation surfaces, …). A point is INSIDE the solid

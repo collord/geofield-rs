@@ -25,7 +25,10 @@ pub mod wasm;
 use assemble::{assemble, KernelOptions, System};
 use data::{Orientation, Series, SurfacePoint};
 use evaluate::Field;
-use mesh::normalize;
+use mesh::{normalize, Mesh};
+use octree::{
+    octree_dual_contour_scene, AxisBox, Boundary, OctreeConfig, PlaneHalfSpace, Scene,
+};
 use fault::{BlockIndex, SingleBlock};
 use litho::Lithology;
 use solve::{solve, Solution};
@@ -170,6 +173,57 @@ impl Model {
     /// Number of fault-bounded blocks (1 if non-faulted).
     pub fn nblocks(&self) -> usize {
         self.blocks.len()
+    }
+
+    /// Number of meshable interfaces in block `b` (0 if `b` is out of range or
+    /// field-less).
+    pub fn block_interface_count(&self, b: usize) -> usize {
+        self.block_lithology(b).map_or(0, |l| l.interfaces.len())
+    }
+
+    /// Mesh ONE interface of ONE block's contact, **clipped to that block's region**
+    /// — the open-sheet (cap=false) view. For a faulted model this renders the
+    /// rock1–rock2 contact in each block as a SEPARATE, unconnected sheet that stops
+    /// at the fault plane (Leapfrog-style), instead of one mesh stitched across the
+    /// discontinuity.
+    ///
+    /// The clip region is the block's fault half-spaces ([`BlockIndex::block_half_spaces`])
+    /// intersected with the domain box. The primary field is the whole model's
+    /// `scalar_field`, which dispatches per block — but the clip guarantees every
+    /// in-region point is in block `b`, so it evaluates block `b`'s field there.
+    ///
+    /// Returns `None` if `b` is field-less or `interface_idx` is out of range.
+    /// `[min, min+size]³` is the octree cube.
+    pub fn mesh_block_interface(
+        &self,
+        b: usize,
+        interface_idx: usize,
+        min: [f64; 3],
+        size: f64,
+        cfg: OctreeConfig,
+    ) -> Option<Mesh> {
+        let iv = *self.block_lithology(b)?.interfaces.get(interface_idx)?;
+
+        let box_b = AxisBox::new(min, size);
+        // One PlaneHalfSpace per fault bounding this block.
+        let planes: Vec<PlaneHalfSpace> = self
+            .index
+            .block_half_spaces(b)
+            .into_iter()
+            .map(|hs| PlaneHalfSpace::new(hs.point, hs.normal, hs.keep_positive))
+            .collect();
+
+        let mut contributors: Vec<&dyn Boundary> = Vec::with_capacity(planes.len() + 1);
+        contributors.push(&box_b);
+        for p in &planes {
+            contributors.push(p);
+        }
+
+        // The per-block view is always the OPEN sheet (cap=false), so the contact
+        // stops flush at the clip planes / box without a closing cap.
+        let cfg = OctreeConfig { cap: false, ..cfg };
+        let scene = Scene::new(self, iv.isovalue, contributors);
+        Some(octree_dual_contour_scene(&scene, min, size, cfg))
     }
 
     /// The block containing `p`, if it has a field.
@@ -675,5 +729,89 @@ mod fault_tests {
         // And a point ABOVE each contact is a different unit from below it.
         let above_left = model.lithology_unit([300.0, 500.0, 650.0]); // above z=600
         assert_ne!(unit_left, above_left, "above vs below the contact must differ");
+    }
+
+    fn mesh_cfg(depth: u32) -> octree::OctreeConfig {
+        octree::OctreeConfig {
+            max_depth: depth,
+            min_depth: 2,
+            qef_threshold: 1e-6,
+            cap: false,
+        }
+    }
+
+    /// Per-block meshes are SEPARATE and CLIPPED: each block's contact mesh lies
+    /// entirely on its own side of the fault plane (x=500), so the two never stitch
+    /// across the discontinuity. This is the Leapfrog-style render — the fix for the
+    /// crumpled fault-zone triangles.
+    #[test]
+    fn block_meshes_are_separate_and_clipped() {
+        let model =
+            Model::fit_faulted(&faulted_offset_series(), fault_x500(), KernelOptions::default());
+        assert_eq!(model.nblocks(), 2);
+
+        let pos = |m: &crate::mesh::Mesh, i: u32| {
+            let b = (i as usize) * 3;
+            [m.positions[b] as f64, m.positions[b + 1] as f64, m.positions[b + 2] as f64]
+        };
+        // Interface 0 of each block (both blocks have the rock2 + rock1 contacts).
+        let m0 = model
+            .mesh_block_interface(0, 0, [0.0, 0.0, 0.0], 1000.0, mesh_cfg(5))
+            .expect("block 0 interface 0");
+        let m1 = model
+            .mesh_block_interface(1, 0, [0.0, 0.0, 0.0], 1000.0, mesh_cfg(5))
+            .expect("block 1 interface 0");
+        assert!(m0.triangle_count() > 0 && m1.triangle_count() > 0, "both blocks mesh");
+
+        // Block 0 = negative side (x <= 500), block 1 = positive (x >= 500). Allow a
+        // small epsilon for vertices that land exactly on the clip plane.
+        let referenced = |m: &crate::mesh::Mesh| -> std::collections::HashSet<u32> {
+            m.indices.iter().copied().collect()
+        };
+        for &i in &referenced(&m0) {
+            assert!(pos(&m0, i)[0] <= 500.0 + 1.0, "block 0 vertex crossed the fault: {:?}", pos(&m0, i));
+        }
+        for &i in &referenced(&m1) {
+            assert!(pos(&m1, i)[0] >= 500.0 - 1.0, "block 1 vertex crossed the fault: {:?}", pos(&m1, i));
+        }
+    }
+
+    /// For a NON-faulted model, `mesh_block_interface(0, …)` is the ordinary
+    /// whole-domain open sheet — the unified path doesn't regress the common case.
+    #[test]
+    fn nonfaulted_block_mesh_matches_whole_domain() {
+        use crate::octree::octree_dual_contour;
+        let model = Model::fit(&faulted_offset_series(), KernelOptions::default());
+        assert_eq!(model.nblocks(), 1);
+        let iso = model.lithology().interfaces[0].isovalue;
+
+        let block = model
+            .mesh_block_interface(0, 0, [0.0, 0.0, 0.0], 1000.0, mesh_cfg(5))
+            .expect("single block");
+        let whole = octree_dual_contour(&model, [0.0, 0.0, 0.0], 1000.0, iso, mesh_cfg(5));
+        // Same mesh: no clip planes for a single block, so identical triangle count.
+        assert_eq!(
+            block.triangle_count(),
+            whole.triangle_count(),
+            "single-block mesh should equal the whole-domain open sheet"
+        );
+    }
+
+    /// A field-less block (no contact) yields no mesh, and out-of-range indices None.
+    #[test]
+    fn mesh_block_interface_handles_missing() {
+        // Right-only data → block 0 (negative side) is field-less.
+        let mut sps = Vec::new();
+        for &(x, y) in &[(600.0, 200.0), (800.0, 200.0), (600.0, 800.0), (800.0, 800.0)] {
+            sps.push(SurfacePoint::new([x, y, 600.0], 0));
+        }
+        let oris = vec![Orientation::new([700.0, 500.0, 600.0], [0.0, 0.0, 1.0])];
+        let series = Series::new(sps, oris);
+        let fault = Box::new(OneFault::new(PlanarFault::new([500.0, 0.0, 0.0], [1.0, 0.0, 0.0])));
+        let model = Model::fit_faulted(&series, fault, KernelOptions::default());
+
+        assert!(model.mesh_block_interface(0, 0, [0.0, 0.0, 0.0], 1000.0, mesh_cfg(4)).is_none());
+        assert!(model.mesh_block_interface(1, 9, [0.0, 0.0, 0.0], 1000.0, mesh_cfg(4)).is_none());
+        assert!(model.mesh_block_interface(1, 0, [0.0, 0.0, 0.0], 1000.0, mesh_cfg(4)).is_some());
     }
 }

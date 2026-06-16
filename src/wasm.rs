@@ -331,6 +331,59 @@ impl WasmModel {
         }
     }
 
+    /// Number of meshable interfaces (contacts) in fault block `block`. For a faulted
+    /// model each block has its own contacts; for a non-faulted model block 0 holds
+    /// them all. `0` if `block` is out of range or field-less.
+    pub fn block_interface_count(&self, block: usize) -> usize {
+        self.inner.block_interface_count(block)
+    }
+
+    /// Mesh interface `interface_idx` of fault block `block`, **clipped to that
+    /// block's region** (the open-sheet view) — so a faulted contact renders as
+    /// SEPARATE, unconnected sheets per block (Leapfrog-style), not one mesh stitched
+    /// across the fault. Octree params mirror [`WasmModel::mesh_isosurface_octree`];
+    /// `cap` is forced off (the per-block view is always the open sheet). Returns an
+    /// EMPTY mesh for a field-less block / out-of-range interface.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mesh_block_interface_octree(
+        &self,
+        block: usize,
+        interface_idx: usize,
+        min_x: f64,
+        min_y: f64,
+        min_z: f64,
+        size: f64,
+        max_depth: u32,
+        min_depth: u32,
+        qef_threshold: f64,
+    ) -> WasmMesh {
+        let cfg = OctreeConfig {
+            max_depth: max_depth.max(1),
+            min_depth: min_depth.min(max_depth),
+            qef_threshold: if qef_threshold.is_finite() && qef_threshold > 0.0 {
+                qef_threshold
+            } else {
+                OctreeConfig::default().qef_threshold
+            },
+            cap: false,
+        };
+        match self
+            .inner
+            .mesh_block_interface(block, interface_idx, [min_x, min_y, min_z], size, cfg)
+        {
+            Some(m) => WasmMesh {
+                positions: m.positions,
+                normals: m.normals,
+                indices: m.indices,
+            },
+            None => WasmMesh {
+                positions: Vec::new(),
+                normals: Vec::new(),
+                indices: Vec::new(),
+            },
+        }
+    }
+
     /// Recovered per-interface isovalues, ascending by isovalue, as a
     /// `Float64Array`. These are the scalar-field levels at which each interface's
     /// contact lives — mesh each one to render the actual geological surfaces (as
@@ -353,6 +406,17 @@ impl WasmModel {
             .iter()
             .map(|iv| iv.interface_id as f64)
             .collect()
+    }
+
+    /// Interface ids of fault `block` (parallel to `mesh_block_interface_octree`'s
+    /// `interface_idx` for that block), as a `Float64Array`. Empty if the block is
+    /// out of range or field-less. Lets the web name a block's contacts (e.g. the
+    /// rock2 contact in each block).
+    pub fn block_interface_ids(&self, block: usize) -> Vec<f64> {
+        match self.inner.block_lithology(block) {
+            Some(l) => l.interfaces.iter().map(|iv| iv.interface_id as f64).collect(),
+            None => Vec::new(),
+        }
     }
 
     /// Solve residual ‖K w − b‖₂ (diagnostic).
