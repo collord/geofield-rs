@@ -1,5 +1,27 @@
 # Fault domains — design
 
+> **Status (shipped, field level).** Steps 1–4 below are implemented in
+> [`src/fault.rs`](../src/fault.rs) and [`src/lib.rs`](../src/lib.rs):
+> `BlockIndex` + `SingleBlock` + `PlanarFault`/`OneFault`/`FaultStack`, and
+> `Model::fit_faulted` (per-block assemble/solve, per-block eval dispatch, per-block
+> lithology). `Model::fit` is unchanged (the `SingleBlock` case). Tests in
+> `fault.rs` (membership) and `lib.rs::fault_tests` (a planar fault offsetting a flat
+> contact: discontinuous across the plane, continuous within blocks, each block
+> reproduces its own contact, lithology routes per block; plus a contrapositive that
+> the same data fit *without* a fault is smooth). The mesh-seam split (step 5) and
+> hand-authored on-fault block ids are NOT done — see notes below.
+>
+> **Reconciliation with the multi-series stack** (built after this doc): a fault is
+> kept INTERNAL to one `Model` — any `StackedSeries` can be faulted independently.
+> The stack reads a `Model` only through `scalar_field` / `lithology` (both per-block
+> after `fit_faulted`), so faulting composes with erode/onlap masking for free; no
+> change to `stack.rs`. A faulted contact's mesh already shows the lateral offset
+> because `scalar_field` is discontinuous (the octree contours whatever the field
+> gives). `Model::lithology()` returns block 0's interfaces as the representative set
+> for stack masking; per-point sign tests route per-block via `scalar_field`. We did
+> NOT add a stack-level `Relation::Fault` (a fault series offsetting every older
+> series) — that couples faults into the masking engine and is deferred.
+
 Goal: a fault surface partitions the model volume into **blocks**; the geological
 contact field solves **independently** inside each block, so the scalar field is
 *discontinuous across the fault* (gempy's "finite fault" behaviour — a fault
@@ -146,13 +168,25 @@ once step 4 lands.
 
 ## Suggested staging
 
-1. `BlockIndex` trait + `OneFault` (planar) + single-block default.
-2. `Model::fit_faulted` partition→per-block assemble/solve; `fit` delegates.
+1. ✅ `BlockIndex` trait + `OneFault` (planar) + single-block default.
+2. ✅ `Model::fit_faulted` partition→per-block assemble/solve; `fit` delegates.
    Per-block `Field` dispatch in `scalar_field`/`gradient`. Per-block lithology.
-3. Test: a planar fault offsetting a flat contact — assert the field is
-   discontinuous across the plane and continuous within each block; assert each
-   block reproduces its own contact.
-4. Multi-fault `FaultStack` (sign-tuple → block) once two-block works.
-5. (Later, optional) wire a fault mesh as an `octree::Boundary` to split the
-   rendered mesh too — depends on step 4.
-```
+3. ✅ Test: a planar fault offsetting a flat contact — discontinuous across the
+   plane, continuous within each block, each block reproduces its own contact.
+4. ✅ Multi-fault `FaultStack` (sign-tuple → block).
+5. ⬜ (Later, optional) wire a fault mesh as an `octree::Boundary` to split the
+   rendered mesh too. NOTE: for a faulted **field**, the contact mesh ALREADY shows
+   the lateral offset (the octree contours the discontinuous `scalar_field`). Step 5
+   is only needed if we want a fault *surface* meshed/closed as its own face.
+
+## Deviations from this design, as built
+
+* **Empty blocks.** A block with no surface points (a fault region with no data) is
+  stored as `None`; `scalar_field` there returns `+∞` and `lithology_unit` returns 0
+  (no contact / above everything). The doc's "open question" about on-fault points is
+  thus side-stepped for now: membership is `block_at(pt.xyz)` with `>= 0` → positive
+  side, and a data-less block simply contributes no field. Hand-authored block ids
+  are still not added (deferred until a real faulted dataset needs them).
+* **`Model` keeps a representative `lithology()`** (first non-empty block's
+  interfaces) so the stack and existing callers are unchanged; `block_lithology(b)`
+  exposes a specific block's isovalues.
