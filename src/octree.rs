@@ -1028,16 +1028,36 @@ enum VertKind {
     Seam,
 }
 
+/// How far past a cell face the projection's dominant-axis coordinate may travel,
+/// in cell sizes. The contour TOPOLOGY (4-leaves-per-edge, edge ownership, winding)
+/// is fixed by `corner_sign` on the cell's unmoved corners, so a vertex leaving its
+/// cell along the surface-normal direction creates no crack — proven by the
+/// watertight/flush/winding tests staying green with the dominant axis unclamped.
+/// This bound is only a runaway rail for an ill-conditioned Newton step on a coarse
+/// cell; a contact this resolution genuinely rises <2 cells per cell, so `2.0` never
+/// binds in practice.
+const PROJECT_OOB_CELLS: f64 = 2.0;
+
 /// Project a contact vertex onto the contact (`field == iso`) with a few Newton
-/// steps along the field gradient, clamped to the cell `[min, min+size]` (a vertex
-/// must stay in its own cell to keep the minimal-edge contour crack-free). The QEF
-/// can place a vertex off the contact on a coarse cell spanning a steep ramp, which
-/// terraces; this pins it back on the smooth surface.
+/// steps along the field gradient.
 ///
-/// For a `Seam` vertex the field gradient is projected into the boundary's tangent
-/// plane (the component along `boundary.surface_normal` is removed), so the vertex
-/// slides ALONG the boundary onto the contact without leaving it — preserving the
-/// flush domain closure.
+/// The QEF places a vertex at the joint minimizer, which on a COARSE cell straddling
+/// a ramp lands off the contact — and the naive fix of clamping the projected vertex
+/// to its own cell `[min, min+size]³` *re-quantizes* it: the true contact point can
+/// require a coordinate OUTSIDE the cell (a ramp rising >1 cell of height across the
+/// cell), so the clamp pins the vertex to the cell face — one terraced step per cell.
+///
+/// Instead we let the vertex leave its cell ALONG the gradient's dominant axis (the
+/// direction Newton actually steps — the contact's facing direction), while clamping
+/// the two OFF-axis coordinates to the cell. The contact is single-valued along its
+/// normal locally, so the dominant-axis coordinate is the one that must be free to
+/// reach the surface; the off-axis clamp keeps the lateral vertex lattice intact.
+/// Travel past a face is capped at [`PROJECT_OOB_CELLS`] cells as a runaway rail.
+///
+/// For a `Seam` vertex the field gradient is first projected into the boundary's
+/// tangent plane (the `boundary.surface_normal` component removed), so the dominant
+/// axis is necessarily IN the wall's tangent plane — the vertex slides ALONG the
+/// boundary onto the contact without leaving it, preserving the flush domain closure.
 fn project_to_contact(
     scene: &Scene,
     v: [f64; 3],
@@ -1045,6 +1065,10 @@ fn project_to_contact(
     size: f64,
     kind: VertKind,
 ) -> [f64; 3] {
+    let lo = min;
+    let hi = [min[0] + size, min[1] + size, min[2] + size];
+    // Out-of-bounds slack the dominant axis may use past either cell face.
+    let slack = size * PROJECT_OOB_CELLS;
     let mut p = v;
     for _ in 0..6 {
         let f = scene.primary(p);
@@ -1060,13 +1084,21 @@ fn project_to_contact(
         if g2 < 1e-12 {
             break;
         }
+        // Dominant axis of the (seam-adjusted) gradient — the surface-normal
+        // direction along which the contact is locally single-valued, and the only
+        // axis allowed to leave the cell.
+        let ax = (0..3)
+            .max_by(|&a, &b| g[a].abs().partial_cmp(&g[b].abs()).unwrap())
+            .unwrap();
         let s = f / g2;
         let np = [p[0] - s * g[0], p[1] - s * g[1], p[2] - s * g[2]];
         p = [
-            np[0].clamp(min[0], min[0] + size),
-            np[1].clamp(min[1], min[1] + size),
-            np[2].clamp(min[2], min[2] + size),
+            np[0].clamp(lo[0], hi[0]),
+            np[1].clamp(lo[1], hi[1]),
+            np[2].clamp(lo[2], hi[2]),
         ];
+        // Re-allow the dominant axis to leave the cell, up to the runaway rail.
+        p[ax] = np[ax].clamp(lo[ax] - slack, hi[ax] + slack);
     }
     p
 }
@@ -2424,5 +2456,98 @@ mod tests {
             .filter(|((a, b), _)| !(on_box(p(*a)) && on_box(p(*b))))
             .count();
         assert_eq!(torn, 0, "seam projection un-flushed the boundary: {torn} torn");
+    }
+
+    /// Terracing regression at COARSE depth. The raised-corner contact is a smooth
+    /// single-valued height field whose steepest ramp rises <1 cell of HEIGHT across
+    /// one depth-3 cell (size 125) — fully resolved in (x,y), NOT a sub-cell feature.
+    /// Yet before the dominant-axis projection fix, the cell-clamped Newton step
+    /// pinned ramp/seam vertices to cell z-faces (the contact point needed a z OUTSIDE
+    /// the cell), landing them ~19–24 units off the contact — the visible stair-steps.
+    ///
+    /// This asserts the smoothness bound the artifact violates: every referenced sheet
+    /// vertex sits within a small fraction of a cell of the true contact, at depth 3
+    /// AND depth 4. It FAILS on the pre-fix cell-clamped projection (off-contact ≈ 23,
+    /// i.e. ~0.18 cells at depth 3) — the artifact is caught here, not hidden by depth.
+    /// Raising `max_depth` is explicitly NOT the fix; this test is coarse on purpose.
+    ///
+    /// The flush-boundary assertion is kept so the steps can't be "smoothed" by simply
+    /// detaching seam vertices from the wall (which would tear the open-sheet rim).
+    #[test]
+    fn contact_is_not_terraced_at_coarse_depth() {
+        use std::collections::{HashMap, HashSet};
+        let pts = [
+            (100.0, 200.0, 600.0),
+            (500.0, 200.0, 600.0),
+            (900.0, 200.0, 800.0), // raised corner
+            (100.0, 800.0, 600.0),
+            (500.0, 800.0, 600.0),
+            (900.0, 800.0, 600.0),
+        ];
+        let sps: Vec<_> = pts
+            .iter()
+            .map(|&(x, y, z)| SurfacePoint::new([x, y, z], 0))
+            .collect();
+        let model = Model::fit(
+            &Series::new(sps, vec![Orientation::new([500.0, 500.0, 600.0], [0.0, 0.0, 1.0])]),
+            KernelOptions::default(),
+        );
+        let iso = model.lithology().interfaces[0].isovalue;
+
+        let on_box = |q: [f64; 3]| (0..3).any(|d| q[d].abs() < 1.0 || (q[d] - 1000.0).abs() < 1.0);
+
+        for depth in [3u32, 4] {
+            let cfg = OctreeConfig {
+                max_depth: depth,
+                min_depth: 2,
+                qef_threshold: 1e-6,
+                cap: false,
+            };
+            let mesh = octree_dual_contour(&model, [0.0, 0.0, 0.0], 1000.0, iso, cfg);
+            assert!(mesh.triangle_count() > 0, "depth {depth}: empty mesh");
+
+            let p = |i: u32| {
+                let b = (i as usize) * 3;
+                [
+                    mesh.positions[b] as f64,
+                    mesh.positions[b + 1] as f64,
+                    mesh.positions[b + 2] as f64,
+                ]
+            };
+            // Off-contact distance |field-iso|/|grad| of every referenced sheet vertex.
+            let referenced: HashSet<u32> = mesh.indices.iter().copied().collect();
+            let mut off_max = 0.0_f64;
+            for &i in &referenced {
+                let pv = p(i);
+                let f = model.scalar_field(pv) - iso;
+                let g = model.scalar_field_gradient(pv);
+                let gm = (g[0] * g[0] + g[1] * g[1] + g[2] * g[2]).sqrt().max(1e-9);
+                off_max = off_max.max((f / gm).abs());
+            }
+            let cell = 1000.0 / 2f64.powi(depth as i32);
+            // Bound: < 1/12 of a cell. At depth 3 (cell 125) that is ≈10.4 — far below
+            // the pre-fix strays (≈23) and far above the post-fix residual (≈0).
+            let bound = cell / 12.0;
+            assert!(
+                off_max < bound,
+                "depth {depth}: contact terraced — max off-contact {off_max:.1} ≥ {bound:.1} (cell {cell:.0})"
+            );
+
+            // Flush boundary preserved (the smoothing did not detach seam vertices from
+            // the wall): the only boundary edges are on the box rim.
+            let mut undirected: HashMap<(u32, u32), u32> = HashMap::new();
+            for t in mesh.indices.chunks_exact(3) {
+                for &(a, b) in &[(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+                    let e = if a < b { (a, b) } else { (b, a) };
+                    *undirected.entry(e).or_insert(0) += 1;
+                }
+            }
+            let torn = undirected
+                .iter()
+                .filter(|(_, &c)| c == 1)
+                .filter(|((a, b), _)| !(on_box(p(*a)) && on_box(p(*b))))
+                .count();
+            assert_eq!(torn, 0, "depth {depth}: seam projection un-flushed the boundary: {torn} torn");
+        }
     }
 }
