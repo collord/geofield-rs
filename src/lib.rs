@@ -298,6 +298,81 @@ impl Model {
         Some(octree_dual_contour_scene(&scene, min, size, cfg))
     }
 
+    /// All of block `b`'s lithology-unit solids (index = unit) for the closed-domain
+    /// view, with their SHARED contacts WELDED so consecutive units coincide on their
+    /// common boundary (no "green dips below blue").
+    ///
+    /// Each unit solid is meshed by the per-unit CSG path (watertight), then the
+    /// vertices lying on a shared contact are snapped onto a CANONICAL height field for
+    /// that contact — meshed ONCE via the surface contour (the projected/de-terraced
+    /// position). Because both adjacent units snap their cap to the SAME canonical
+    /// surface, the shared boundary matches exactly. (The per-unit re-contouring of a
+    /// shared contact otherwise leaves a depth-independent ~½-cell gap; the robust fix
+    /// is a single multi-label contour, tracked as a follow-up — this weld removes the
+    /// visible gap without rewriting the contour.)
+    pub fn mesh_block_unit_solids(
+        &self,
+        b: usize,
+        min: [f64; 3],
+        size: f64,
+        cfg: OctreeConfig,
+    ) -> Vec<Mesh> {
+        let Some(block) = self.blocks.get(b).and_then(|x| x.as_ref()) else {
+            return Vec::new();
+        };
+        let interfaces = &block.lithology.interfaces;
+        // Canonical height field z(x,y) per contact, meshed ONCE (surface contour of
+        // the block's smooth field, clipped to the block). Only valid for single-valued
+        // (height-field) contacts — the geological norm; a near-vertical contact would
+        // fall back to no weld (the column lookup just misses).
+        let canon: Vec<ContactHeightField> = interfaces
+            .iter()
+            .enumerate()
+            .map(|(k, _)| ContactHeightField::build(self, b, k, min, size, cfg))
+            .collect();
+
+        let mut out = Vec::with_capacity(self.block_unit_count(b));
+        for u in 0..self.block_unit_count(b) {
+            let mut mesh = self
+                .mesh_block_unit_solid(b, u, min, size, cfg)
+                .unwrap_or_default();
+            for &k in Self::bounding_contacts(u, interfaces.len()).iter().flatten() {
+                canon[k].weld(&mut mesh);
+            }
+            out.push(mesh);
+        }
+        out
+    }
+
+    /// The interfaces bounding lithology unit `u` (of `n` interfaces): the lower
+    /// (`u-1`) and upper (`u`) contacts, each `None` at the bottom/top of the stack.
+    fn bounding_contacts(u: usize, n: usize) -> [Option<usize>; 2] {
+        [u.checked_sub(1), (u < n).then_some(u)]
+    }
+
+    /// One welded unit solid (the closed-domain view for a single lithology unit), with
+    /// its shared contacts welded onto the canonical contact surfaces. Self-contained:
+    /// builds only the 1–2 canonical contacts bounding this unit. `None` if the block is
+    /// field-less or `unit_idx` is out of range. Used by the WASM per-unit binding.
+    pub fn mesh_block_unit_solid_welded(
+        &self,
+        b: usize,
+        unit_idx: usize,
+        min: [f64; 3],
+        size: f64,
+        cfg: OctreeConfig,
+    ) -> Option<Mesh> {
+        let n = self.block_interface_count(b);
+        if n == 0 || unit_idx > n {
+            return None;
+        }
+        let mut mesh = self.mesh_block_unit_solid(b, unit_idx, min, size, cfg)?;
+        for &k in Self::bounding_contacts(unit_idx, n).iter().flatten() {
+            ContactHeightField::build(self, b, k, min, size, cfg).weld(&mut mesh);
+        }
+        Some(mesh)
+    }
+
     /// The block containing `p`, if it has a field.
     fn block_at(&self, p: [f64; 3]) -> Option<&Block> {
         self.blocks.get(self.index.block_at(p)).and_then(|b| b.as_ref())
@@ -464,6 +539,98 @@ fn clip_mesh_to_plane(mesh: &mut Mesh, hs: &fault::HalfSpace) {
         }
     }
     mesh.indices = out;
+}
+
+/// A canonical mesh for ONE contact, meshed once via the surface contour (the
+/// projected/de-terraced contact position). Used to WELD the per-unit closed solids'
+/// caps onto a single shared surface so consecutive units coincide on their common
+/// contact: a unit cap vertex near the canonical contact is snapped to its NEAREST
+/// canonical vertex (full 3-D, so steep/raised-corner contacts weld correctly, not
+/// just height fields). Both adjacent units snap to the same canonical vertices, so the
+/// shared cap is identical.
+struct ContactHeightField {
+    /// Canonical contact vertices (the surface-contoured contact), in a coarse spatial
+    /// hash for nearest-vertex lookup.
+    verts: Vec<[f64; 3]>,
+    /// `bucket(p) → indices into verts`, bucketed at `cell`.
+    hash: std::collections::HashMap<(i64, i64, i64), Vec<u32>>,
+    cell: f64,
+    min: [f64; 3],
+}
+
+impl ContactHeightField {
+    fn build(model: &Model, b: usize, k: usize, min: [f64; 3], size: f64, cfg: OctreeConfig) -> Self {
+        // Bucket at ~one finest octree cell: a cap vertex's nearest canonical vertex is
+        // within a cell, so a 3×3×3 bucket neighbourhood always contains it.
+        let cell = (size / 2f64.powi(cfg.max_depth as i32)).max(1.0);
+        let mut verts: Vec<[f64; 3]> = Vec::new();
+        let mut hash: std::collections::HashMap<(i64, i64, i64), Vec<u32>> =
+            std::collections::HashMap::new();
+        if let Some(mesh) = model.mesh_block_interface(b, k, min, size, cfg) {
+            for i in mesh.indices.iter().copied().collect::<std::collections::HashSet<_>>() {
+                let o = (i as usize) * 3;
+                let p = [
+                    mesh.positions[o] as f64,
+                    mesh.positions[o + 1] as f64,
+                    mesh.positions[o + 2] as f64,
+                ];
+                let idx = verts.len() as u32;
+                verts.push(p);
+                hash.entry(Self::bucket(p, min, cell)).or_default().push(idx);
+            }
+        }
+        Self { verts, hash, cell, min }
+    }
+
+    fn bucket(p: [f64; 3], min: [f64; 3], cell: f64) -> (i64, i64, i64) {
+        (
+            ((p[0] - min[0]) / cell).floor() as i64,
+            ((p[1] - min[1]) / cell).floor() as i64,
+            ((p[2] - min[2]) / cell).floor() as i64,
+        )
+    }
+
+    /// Snap each vertex of `mesh` within ~one cell of a canonical contact vertex onto
+    /// that nearest canonical vertex (so both adjacent units land on the same surface).
+    fn weld(&self, mesh: &mut Mesh) {
+        if self.verts.is_empty() {
+            return;
+        }
+        let nverts = mesh.positions.len() / 3;
+        for i in 0..nverts {
+            let o = i * 3;
+            let p = [
+                mesh.positions[o] as f64,
+                mesh.positions[o + 1] as f64,
+                mesh.positions[o + 2] as f64,
+            ];
+            let (bx, by, bz) = Self::bucket(p, self.min, self.cell);
+            let mut best = (self.cell * self.cell, usize::MAX); // weld only within a cell
+            for dx in -1..=1 {
+                for dy in -1..=1 {
+                    for dz in -1..=1 {
+                        if let Some(ids) = self.hash.get(&(bx + dx, by + dy, bz + dz)) {
+                            for &vi in ids {
+                                let c = self.verts[vi as usize];
+                                let d2 = (c[0] - p[0]).powi(2)
+                                    + (c[1] - p[1]).powi(2)
+                                    + (c[2] - p[2]).powi(2);
+                                if d2 < best.0 {
+                                    best = (d2, vi as usize);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if best.1 != usize::MAX {
+                let c = self.verts[best.1];
+                mesh.positions[o] = c[0] as f32;
+                mesh.positions[o + 1] = c[1] as f32;
+                mesh.positions[o + 2] = c[2] as f32;
+            }
+        }
+    }
 }
 
 /// `Model` as a [`ScalarField`] for the contourer — per-block dispatch (the field is
@@ -1070,6 +1237,100 @@ mod fault_tests {
             let (nm, open) = edge_incidence(&mesh);
             assert_eq!(nm, 0, "unit {u}: non-manifold");
             assert_eq!(open, 0, "unit {u}: open");
+        }
+    }
+
+    /// THE zero-gap regression: consecutive lithology-unit solids must SHARE their
+    /// common contact exactly (unit k's top cap == unit k+1's bottom cap), so there is
+    /// no "green dips below blue". This holds only if the shared contact is contoured
+    /// ONCE (the multi-label `mesh_block_unit_solids`), not twice (the per-unit CSG
+    /// path, whose worst-case gap stays ~10 units at every depth). Assert the gap is
+    /// near zero at a COARSE depth 3 AND a fine depth 6 — depth-independence is the
+    /// whole point (a re-contoured boundary's gap does not shrink with depth).
+    #[test]
+    fn unit_solids_share_their_contact_exactly() {
+        // Raised-corner seed: rock2 at z=600 (z=800 at one corner), rock1 at z=400.
+        let pts = [
+            (100.0, 200.0, 600.0, 0u32), (500.0, 200.0, 600.0, 0), (900.0, 200.0, 800.0, 0),
+            (100.0, 800.0, 600.0, 0), (500.0, 800.0, 600.0, 0), (900.0, 800.0, 600.0, 0),
+            (100.0, 200.0, 400.0, 1), (500.0, 200.0, 400.0, 1), (900.0, 200.0, 400.0, 1),
+            (100.0, 800.0, 400.0, 1), (500.0, 800.0, 400.0, 1), (900.0, 800.0, 400.0, 1),
+        ];
+        let sps: Vec<_> = pts.iter().map(|&(x, y, z, id)| SurfacePoint::new([x, y, z], id)).collect();
+        let oris = vec![
+            Orientation::new([500.0, 500.0, 600.0], [0.0, 0.0, 1.0]),
+            Orientation::new([500.0, 500.0, 400.0], [0.0, 0.0, 1.0]),
+        ];
+        let model = Model::fit(&Series::new(sps, oris), KernelOptions::default());
+
+        for depth in [3u32, 6] {
+            let cfg = octree::OctreeConfig { cap: true, ..mesh_cfg(depth) };
+            let solids = model.mesh_block_unit_solids(0, [0.0, 0.0, 0.0], 1000.0, cfg);
+            assert_eq!(solids.len(), model.block_unit_count(0), "one solid per unit");
+
+            // Shared contact between unit 1 (blue) and unit 2 (green) is rock2 (iso[1]).
+            // For every vertex of unit 2 ON that contact, the NEAREST vertex of unit 1
+            // ON that contact must be ~coincident (3-D nearest, so steep/raised-corner
+            // regions are handled). With welding both caps land on the same canonical
+            // surface, so the nearest-vertex distance is ~0.
+            let iso1 = model.lithology().interfaces[1].isovalue;
+            let on_contact_pts = |m: &crate::mesh::Mesh| -> Vec<[f64; 3]> {
+                m.indices
+                    .iter()
+                    .copied()
+                    .collect::<std::collections::HashSet<_>>()
+                    .into_iter()
+                    .filter_map(|i| {
+                        let b = (i as usize) * 3;
+                        let p = [m.positions[b] as f64, m.positions[b + 1] as f64, m.positions[b + 2] as f64];
+                        let f = model.scalar_field(p) - iso1;
+                        let g = model.scalar_field_gradient(p);
+                        let gm = (g[0] * g[0] + g[1] * g[1] + g[2] * g[2]).sqrt().max(1e-9);
+                        ((f / gm).abs() < 12.0).then_some(p)
+                    })
+                    .collect()
+            };
+            let blue = on_contact_pts(&solids[1]);
+            let green = on_contact_pts(&solids[2]);
+            assert!(blue.len() > 10 && green.len() > 10, "depth {depth}: too few contact verts");
+            let mut worst = 0.0_f64;
+            for g in &green {
+                let nearest = blue
+                    .iter()
+                    .map(|b| (b[0] - g[0]).powi(2) + (b[1] - g[1]).powi(2) + (b[2] - g[2]).powi(2))
+                    .fold(f64::MAX, f64::min)
+                    .sqrt();
+                worst = worst.max(nearest);
+            }
+            assert!(
+                worst < 2.0,
+                "depth {depth}: shared contact gap {worst:.1} (units don't share the boundary)"
+            );
+        }
+    }
+
+    /// Welding the shared contact (snapping cap vertices onto the canonical contact)
+    /// must NOT break watertightness — `mesh_block_unit_solids` solids stay manifold
+    /// (every edge incidence 2, modulo the snap producing a degenerate triangle that is
+    /// dropped). Asserts each welded unit solid has zero open edges. (A snap can merge
+    /// two vertices into a degenerate tri; those are filtered, not left as a hole.)
+    #[test]
+    fn welded_unit_solids_stay_watertight() {
+        let model =
+            Model::fit_faulted(&faulted_offset_series(), fault_x500(), KernelOptions::default());
+        for depth in [4u32, 5] {
+            let cfg = octree::OctreeConfig { cap: true, ..mesh_cfg(depth) };
+            for b in 0..model.nblocks() {
+                let solids = model.mesh_block_unit_solids(b, [0.0, 0.0, 0.0], 1000.0, cfg);
+                for (u, mesh) in solids.iter().enumerate() {
+                    if mesh.triangle_count() == 0 {
+                        continue;
+                    }
+                    let (nm, open) = edge_incidence(mesh);
+                    assert_eq!(nm, 0, "d{depth} b{b} unit {u}: welded non-manifold {nm}");
+                    assert_eq!(open, 0, "d{depth} b{b} unit {u}: welded open {open}");
+                }
+            }
         }
     }
 

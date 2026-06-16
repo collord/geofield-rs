@@ -420,7 +420,7 @@ impl WasmModel {
         };
         match self
             .inner
-            .mesh_block_unit_solid(block, unit_idx, [min_x, min_y, min_z], size, cfg)
+            .mesh_block_unit_solid_welded(block, unit_idx, [min_x, min_y, min_z], size, cfg)
         {
             Some(m) => WasmMesh {
                 positions: m.positions,
