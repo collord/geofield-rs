@@ -156,14 +156,20 @@ export function Viewer({ mesh, surfacePoints, orientations }: Props) {
       }
 
       const color = pickColor(surf);
+      // Closed-volume unit solids render OPAQUE and front-face-only: they are
+      // watertight, so you should not see through one solid into the layers behind it
+      // (transparent solids made the stacked slabs unreadable — far walls bled through
+      // near ones). Open contact sheets stay translucent + double-sided so overlapping
+      // sheets remain visible.
+      const isSolid = surf.unit !== undefined;
       const mat = new THREE.MeshStandardMaterial({
         color,
         metalness: 0.1,
         roughness: 0.7,
-        side: THREE.DoubleSide,
+        side: isSolid ? THREE.FrontSide : THREE.DoubleSide,
         flatShading: false,
-        transparent: true,
-        opacity: 0.85,
+        transparent: !isSolid,
+        opacity: isSolid ? 1.0 : 0.85,
         // Push the filled faces slightly back so the edge overlay sits on top
         // without z-fighting.
         polygonOffset: true,
