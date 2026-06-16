@@ -1,5 +1,7 @@
 /target
 Cargo.lock
+# macOS Finder metadata
+.DS_Store
 # wasm-pack build outputs
 /pkg
 /pkg-node
