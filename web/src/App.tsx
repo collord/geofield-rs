@@ -60,6 +60,7 @@ export default function App() {
   const [faultOffset, setFaultOffset] = useState(0); // along normal from center
   const [mesh, setMesh] = useState<MeshData | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [warning, setWarning] = useState<string | null>(null);
   const [busyMs, setBusyMs] = useState<number | null>(null);
 
   useEffect(() => {
@@ -74,7 +75,7 @@ export default function App() {
     timer.current = window.setTimeout(() => {
       const t0 = performance.now();
       const fault = faultFromControls(faultEnabled, faultAzimuth, faultOffset);
-      const { mesh, error } = solveAndMesh(
+      const { mesh, error, warning } = solveAndMesh(
         surfacePoints,
         orientations,
         maxDepth,
@@ -83,6 +84,7 @@ export default function App() {
       );
       setMesh(mesh);
       setError(error);
+      setWarning(warning);
       setBusyMs(performance.now() - t0);
     }, DEBOUNCE_MS);
     return () => {
@@ -112,7 +114,12 @@ export default function App() {
                 {mesh.surfaces.length === 1 ? "" : "s"}
               </span>
               <span>{mesh.triangleCount.toLocaleString()} tris</span>
-              {faultEnabled && <span className="faulted">faulted</span>}
+              {faultEnabled && (
+                <span className="faulted">
+                  faulted · {mesh.blockCount} block
+                  {mesh.blockCount === 1 ? "" : "s"}
+                </span>
+              )}
               <span>residual {fmt(mesh.residual)}</span>
               <span>iso-spread {fmt(mesh.isovalueSpread)}</span>
               {busyMs != null && <span>{busyMs.toFixed(0)} ms</span>}
@@ -178,6 +185,7 @@ export default function App() {
       </header>
 
       {error && <div className="error">solve error: {error}</div>}
+      {!error && warning && <div className="warning">note: {warning}</div>}
 
       <section className="tables">
         <SurfacePointTable rows={surfacePoints} onChange={setSurfacePoints} />

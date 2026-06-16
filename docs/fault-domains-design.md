@@ -187,6 +187,15 @@ once step 4 lands.
   thus side-stepped for now: membership is `block_at(pt.xyz)` with `>= 0` → positive
   side, and a data-less block simply contributes no field. Hand-authored block ids
   are still not added (deferred until a real faulted dataset needs them).
+* **Orientation-starved blocks fall back to flat.** A block with surface points but
+  NO orientation (cokriging is singular without a gradient anchor) does NOT vanish —
+  it synthesizes one default FLAT-LYING orientation (pole +Z) at the block's
+  centroid (`default_flat_orientation`). This is the common case for a fault plane
+  that strands all orientations on one side (e.g. the harness's default fault through
+  the domain center). Flat-lying is the standard geological prior, invisible when
+  real orientations exist, and keeps both fault blocks meshable instead of leaving a
+  silent empty half. (Originally this block was dropped to `None`, which both looked
+  broken in the harness and — before the guard — panicked the solver.)
 * **`Model` keeps a representative `lithology()`** (first non-empty block's
   interfaces) so the stack and existing callers are unchanged; `block_lithology(b)`
   exposes a specific block's isovalues.

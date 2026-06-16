@@ -51,11 +51,16 @@ export interface MeshData {
   triangleCount: number; // total across surfaces
   residual: number;
   isovalueSpread: number;
+  /** Number of fault-bounded blocks the field was solved over (1 if not faulted). */
+  blockCount: number;
 }
 
 export interface SolveResult {
   mesh: MeshData;
+  /** A hard failure (the solve threw / bad input) — nothing was produced. */
   error: string | null;
+  /** A non-fatal note (e.g. a fault stranded a block) — a mesh may still exist. */
+  warning: string | null;
 }
 
 /** A single planar fault: a point on the plane + an outward normal. When
@@ -143,7 +148,7 @@ export function solveAndMesh(
       );
     }
   } catch (e) {
-    return { mesh: emptyMesh(), error: String(e) };
+    return { mesh: emptyMesh(), error: String(e), warning: null };
   }
 
   const [minX, maxX, minY, maxY, minZ, maxZ] = EXTENT;
@@ -187,14 +192,25 @@ export function solveAndMesh(
     wm.free();
   }
 
+  const blockCount = model.block_count;
   const mesh: MeshData = {
     surfaces,
     triangleCount: totalTris,
     residual: model.residual(),
     isovalueSpread: model.isovalue_spread(),
+    blockCount,
   };
   model.free();
-  return { mesh, error: null };
+
+  // A faulted fit where the plane stranded a block (no orientation on one side)
+  // meshes only part of the domain — flag it so an empty half doesn't look broken.
+  let warning: string | null = null;
+  if (fault && fault.enabled && totalTris === 0) {
+    warning =
+      "fault left no meshable surface — the plane may strand all data on one side " +
+      "(each side needs at least one orientation). Adjust strike/offset.";
+  }
+  return { mesh, error: null, warning };
 }
 
 function emptyMesh(): MeshData {
@@ -203,5 +219,6 @@ function emptyMesh(): MeshData {
     triangleCount: 0,
     residual: NaN,
     isovalueSpread: NaN,
+    blockCount: 0,
   };
 }

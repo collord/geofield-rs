@@ -9,6 +9,7 @@
 //!
 //! Build: `wasm-pack build --target web -- --features wasm`.
 
+use std::sync::Once;
 use wasm_bindgen::prelude::*;
 
 use crate::assemble::KernelOptions;
@@ -18,6 +19,26 @@ use crate::mesh::{dual_contour, MeshGrid};
 use crate::octree::{octree_dual_contour, OctreeConfig};
 use crate::stack::{Relation, Stack, StackedSeries};
 use crate::Model;
+
+#[wasm_bindgen]
+extern "C" {
+    #[wasm_bindgen(js_namespace = console)]
+    fn error(msg: &str);
+}
+
+/// Install a panic hook (once) that forwards Rust panic messages to JS
+/// `console.error`. Without this a Rust panic surfaces to JS only as the opaque
+/// `RuntimeError: unreachable` trap with no message; with it the actual panic
+/// location + message appears in the browser console. Called at the top of every
+/// fallible WASM entry point, so any panic is diagnosable.
+fn install_panic_hook() {
+    static HOOK: Once = Once::new();
+    HOOK.call_once(|| {
+        std::panic::set_hook(Box::new(|info| {
+            error(&format!("geofield-rs panic: {info}"));
+        }));
+    });
+}
 
 /// Build (validate + marshal + fit) a single-series [`Model`] from the flat typed
 /// arrays the JS side passes. Shared by [`WasmModel::new`]/[`WasmModel::new_faulted`]
@@ -39,6 +60,7 @@ fn fit_from_flat(
     nugget: f64,
     fault: Option<Box<dyn BlockIndex>>,
 ) -> Result<Model, JsError> {
+    install_panic_hook();
     if !sp_xyz.len().is_multiple_of(3)
         || !ori_xyz.len().is_multiple_of(3)
         || !ori_pole.len().is_multiple_of(3)
@@ -371,6 +393,7 @@ impl WasmStack {
     /// An empty stack. Add series youngest→oldest with [`WasmStack::add_series`].
     #[wasm_bindgen(constructor)]
     pub fn new() -> WasmStack {
+        install_panic_hook();
         WasmStack {
             inner: Stack::new(Vec::new()),
         }

@@ -79,6 +79,13 @@ header h1 {
   border-bottom: 1px solid #5a2a2e;
 }
 
+.warning {
+  padding: 6px 16px;
+  background: #38301a;
+  color: #ffe0a3;
+  border-bottom: 1px solid #5a4a23;
+}
+
 .tables {
   display: flex;
   gap: 16px;

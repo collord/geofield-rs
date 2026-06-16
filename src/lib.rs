@@ -105,14 +105,26 @@ impl Model {
         let mut isovalue_spread = 0.0_f64;
         let mut residual = 0.0_f64;
         for b in 0..nblocks {
-            // A block needs surface points to define a contact (and at least one
-            // orientation to anchor the gradient — the same requirement as a
-            // non-faulted fit). Empty blocks are field-less.
+            // A block with no surface points has no contact — field-less (`None`).
             if sp_buckets[b].is_empty() {
                 blocks.push(None);
                 continue;
             }
-            let sub = Series::new(std::mem::take(&mut sp_buckets[b]), std::mem::take(&mut ori_buckets[b]));
+            // A block with points but NO orientation is under-constrained (cokriging
+            // is singular without a gradient anchor). Rather than drop it — which
+            // makes one side of a fault silently vanish — fall back to a default
+            // FLAT-LYING orientation (pole +Z, horizontal contact) at the block's
+            // surface-point centroid. This is the most common geological prior, is
+            // invisible when real orientations exist, and keeps both fault blocks
+            // meshable. (A fault plane that strands all orientations on one side is
+            // exactly the harness's default-fault case.)
+            let oris = std::mem::take(&mut ori_buckets[b]);
+            let oris = if oris.is_empty() {
+                vec![default_flat_orientation(&sp_buckets[b])]
+            } else {
+                oris
+            };
+            let sub = Series::new(std::mem::take(&mut sp_buckets[b]), oris);
             let system = assemble(&sub, opts);
             let solution = solve(&system);
             residual = residual.max(solution.residual);
@@ -203,6 +215,21 @@ impl Model {
     }
 }
 
+/// A default FLAT-LYING orientation (pole +Z) at the centroid of `points` — the
+/// fallback gradient anchor for a fault block that has surface points but no
+/// orientation of its own. Flat-lying is the standard geological default; it keeps
+/// the block's field well-posed without inventing a dip direction.
+fn default_flat_orientation(points: &[SurfacePoint]) -> Orientation {
+    let n = points.len().max(1) as f64;
+    let mut c = [0.0; 3];
+    for p in points {
+        c[0] += p.xyz[0];
+        c[1] += p.xyz[1];
+        c[2] += p.xyz[2];
+    }
+    Orientation::new([c[0] / n, c[1] / n, c[2] / n], [0.0, 0.0, 1.0])
+}
+
 #[cfg(test)]
 mod fault_tests {
     use super::*;
@@ -253,6 +280,56 @@ mod fault_tests {
             jump < 5.0 * within_left.max(1e-9),
             "unfaulted fit should be smooth across x=500: jump={jump} within={within_left}"
         );
+    }
+
+    /// A fault that leaves one side with NO orientations (both orientations sit on
+    /// the plane / other side) must NOT panic. The orientation-starved block falls
+    /// back to a default flat-lying orientation, so BOTH blocks mesh — no silent
+    /// empty half. This is the harness's default fault (plane through the domain
+    /// center, the seed orientations at x=500 landing on it).
+    #[test]
+    fn fault_with_orientation_starved_block_falls_back_flat() {
+        // Seed-like data: contacts at z=600/z=400, both orientations at x=500.
+        let mut sps = Vec::new();
+        for &(x, y) in &[(100.0, 200.0), (500.0, 200.0), (900.0, 200.0), (500.0, 800.0)] {
+            sps.push(SurfacePoint::new([x, y, 600.0], 0));
+            sps.push(SurfacePoint::new([x, y, 400.0], 1));
+        }
+        let oris = vec![
+            Orientation::new([500.0, 500.0, 600.0], [0.0, 0.0, 1.0]),
+            Orientation::new([500.0, 500.0, 400.0], [0.0, 0.0, 1.0]),
+        ];
+        let series = Series::new(sps, oris);
+        // Vertical plane x=500, normal +x: orientations (x=500) go to the positive
+        // side (block 1); the negative side (block 0) gets points but no orientation.
+        let fault = Box::new(OneFault::new(PlanarFault::new([500.0, 0.0, 0.0], [1.0, 0.0, 0.0])));
+        let model = Model::fit_faulted(&series, fault, KernelOptions::default());
+
+        assert_eq!(model.nblocks(), 2);
+        // BOTH blocks fit: the starved block 0 used a default flat orientation.
+        assert!(model.block_lithology(0).is_some(), "starved block should fall back, not vanish");
+        assert!(model.block_lithology(1).is_some(), "populated block should fit");
+        // Both sides have a real (finite) field at the contact elevations.
+        assert!(model.scalar_field([100.0, 500.0, 500.0]).is_finite());
+        assert!(model.scalar_field([900.0, 500.0, 500.0]).is_finite());
+    }
+
+    /// A block with NO surface points at all (not just no orientation) is genuinely
+    /// field-less — there is no contact to mesh. Sentinel `+∞` / unit 0 there.
+    #[test]
+    fn fault_block_with_no_points_is_field_less() {
+        // All points on the positive side (x>500); the negative side is truly empty.
+        let mut sps = Vec::new();
+        for &(x, y) in &[(600.0, 200.0), (800.0, 200.0), (600.0, 800.0), (800.0, 800.0)] {
+            sps.push(SurfacePoint::new([x, y, 600.0], 0));
+        }
+        let oris = vec![Orientation::new([700.0, 500.0, 600.0], [0.0, 0.0, 1.0])];
+        let series = Series::new(sps, oris);
+        let fault = Box::new(OneFault::new(PlanarFault::new([500.0, 0.0, 0.0], [1.0, 0.0, 0.0])));
+        let model = Model::fit_faulted(&series, fault, KernelOptions::default());
+        assert!(model.block_lithology(0).is_none(), "empty side has no contact");
+        assert!(model.block_lithology(1).is_some());
+        assert!(model.scalar_field([100.0, 500.0, 500.0]).is_infinite());
     }
 
     /// `Model::fit` (no fault) is unchanged: one block, the whole field.
