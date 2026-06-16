@@ -187,15 +187,23 @@ once step 4 lands.
   thus side-stepped for now: membership is `block_at(pt.xyz)` with `>= 0` → positive
   side, and a data-less block simply contributes no field. Hand-authored block ids
   are still not added (deferred until a real faulted dataset needs them).
-* **Orientation-starved blocks fall back to flat.** A block with surface points but
-  NO orientation (cokriging is singular without a gradient anchor) does NOT vanish —
-  it synthesizes one default FLAT-LYING orientation (pole +Z) at the block's
-  centroid (`default_flat_orientation`). This is the common case for a fault plane
-  that strands all orientations on one side (e.g. the harness's default fault through
-  the domain center). Flat-lying is the standard geological prior, invisible when
-  real orientations exist, and keeps both fault blocks meshable instead of leaving a
-  silent empty half. (Originally this block was dropped to `None`, which both looked
-  broken in the harness and — before the guard — panicked the solver.)
+* **Orientation-starved blocks INFER an orientation from their points.** A block with
+  surface points but NO orientation (cokriging is singular without a gradient anchor)
+  does NOT vanish and does NOT blindly assume flat — `infer_orientation` derives the
+  pole from the points' own geometry, using the best-constrained interface (most
+  points):
+    * ≥3 non-collinear points → the best-fit plane normal (covariance smallest-
+      eigenvector via a local 3×3 symmetric Jacobi eigensolver, `sym3_eig`);
+    * 2 points or ≥3 collinear points → the *flattest* plane through that line
+      (`pole = P × H`, `flattest_plane_normal`) — the line fixes strike, flat is the
+      dip prior;
+    * 1 point (or fully degenerate) → flat `+Z`, the bare default.
+  This is the common case for a fault plane that strands all orientations on one side
+  (the harness's default fault through the domain center). It is invisible when real
+  orientations exist and keeps both fault blocks meshable — and, unlike a flat
+  assumption, a dipping contact stays dipping on the starved side. (Originally this
+  block was dropped to `None`, which looked broken and — before the guard — panicked
+  the solver; the first fix used a blind flat fallback.)
 * **`Model` keeps a representative `lithology()`** (first non-empty block's
   interfaces) so the stack and existing callers are unchanged; `block_lithology(b)`
   exposes a specific block's isovalues.
