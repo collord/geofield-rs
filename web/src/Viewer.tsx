@@ -1,7 +1,7 @@
 import { useEffect, useRef } from "react";
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
-import { MeshData, SurfaceMesh } from "./model";
+import { MeshData, surfaceKey, pickColor } from "./model";
 import {
   SurfacePointRow,
   OrientationRow,
@@ -12,6 +12,8 @@ import { azimuthDipToPole } from "./model";
 
 interface Props {
   mesh: MeshData;
+  /** Surface keys (see `surfaceKey`) currently hidden via the object tree. */
+  hidden: Set<string>;
   surfacePoints: SurfacePointRow[];
   orientations: OrientationRow[];
 }
@@ -21,39 +23,16 @@ const FORMATION_COLORS: Record<string, number> = {
   rock2: 0x3d9be9,
 };
 
-/** Color for one surface. Contacts use the formation palette (rock1/rock2). Closed
- *  lithology-unit solids use an evenly-spaced HSL hue per unit (so adjacent layers are
- *  maximally distinct, unlike a string hash where "unit 1"/"unit 2" collide), shifted
- *  in lightness per fault block so block A's and block B's layers also differ. */
-function pickColor(surf: SurfaceMesh): number {
-  if (surf.unit === undefined) {
-    return FORMATION_COLORS[surf.formation] ?? colorFor(surf.formation);
-  }
-  // Golden-angle hue spacing → well-separated colors for any unit count.
-  const hue = (surf.unit * 0.61803398875) % 1;
-  // Per-block lightness shift: block 0 darker, block 1 lighter (and so on).
-  const block = surf.block ?? 0;
-  const light = 0.45 + 0.12 * (block % 3);
-  return hslToHex(hue, 0.6, light);
-}
-
-function hslToHex(h: number, s: number, l: number): number {
-  const f = (n: number) => {
-    const k = (n + h * 12) % 12;
-    const a = s * Math.min(l, 1 - l);
-    const c = l - a * Math.max(-1, Math.min(k - 3, 9 - k, 1));
-    return Math.round(c * 255);
-  };
-  return (f(0) << 16) | (f(8) << 8) | f(4);
-}
-
-export function Viewer({ mesh, surfacePoints, orientations }: Props) {
+export function Viewer({ mesh, hidden, surfacePoints, orientations }: Props) {
   const mountRef = useRef<HTMLDivElement>(null);
   const sceneRef = useRef<THREE.Scene>();
   const rendererRef = useRef<THREE.WebGLRenderer>();
   const cameraRef = useRef<THREE.PerspectiveCamera>();
   const surfaceGroupRef = useRef<THREE.Group>();
   const dataGroupRef = useRef<THREE.Group>();
+  // Latest hidden set, read by the geometry-build effect (which keys off `mesh` only)
+  // so a re-solve re-applies the current visibility without depending on `hidden`.
+  const hiddenRef = useRef(hidden);
 
   // One-time scene setup.
   useEffect(() => {
@@ -177,6 +156,11 @@ export function Viewer({ mesh, surfacePoints, orientations }: Props) {
         polygonOffsetUnits: 1,
       });
       const fill = new THREE.Mesh(geom, mat);
+      // Tag with the surface key so the visibility effect can toggle it, and apply
+      // the current hidden state immediately (so a re-solve keeps hidden objects hidden).
+      const key = surfaceKey(surf);
+      fill.userData.surfaceKey = key;
+      fill.visible = !hiddenRef.current.has(key);
 
       // Edge overlay: show every mesh edge (threshold 0 keeps coplanar quad
       // edges too, so the dual-contour cell structure is visible). Darken the
@@ -192,6 +176,17 @@ export function Viewer({ mesh, surfacePoints, orientations }: Props) {
       group.add(fill);
     }
   }, [mesh]);
+
+  // Toggle object visibility from the object tree without rebuilding geometry.
+  useEffect(() => {
+    hiddenRef.current = hidden;
+    const group = surfaceGroupRef.current;
+    if (!group) return;
+    for (const child of group.children) {
+      const key = child.userData?.surfaceKey as string | undefined;
+      if (key !== undefined) child.visible = !hidden.has(key);
+    }
+  }, [hidden]);
 
   // Rebuild data markers (surface points as spheres, orientations as arrows).
   useEffect(() => {

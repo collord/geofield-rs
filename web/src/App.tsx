@@ -8,6 +8,7 @@ import {
 import { initWasm, solveAndMesh, MeshData, FaultConfig } from "./model";
 import { SurfacePointTable, OrientationTable } from "./Tables";
 import { Viewer } from "./Viewer";
+import { ObjectTree } from "./ObjectTree";
 import { EXTENT } from "./data";
 
 const DEBOUNCE_MS = 300;
@@ -62,6 +63,19 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [warning, setWarning] = useState<string | null>(null);
   const [busyMs, setBusyMs] = useState<number | null>(null);
+  // Surface keys hidden from the 3-D view (toggled in the object tree). Kept across
+  // re-solves so hiding "Block B" stays hidden as you drag sliders.
+  const [hidden, setHidden] = useState<Set<string>>(new Set());
+
+  const setHide = (keys: string[], hide: boolean) =>
+    setHidden((prev) => {
+      const next = new Set(prev);
+      for (const k of keys) {
+        if (hide) next.add(k);
+        else next.delete(k);
+      }
+      return next;
+    });
 
   useEffect(() => {
     initWasm().then(() => setWasmReady(true));
@@ -194,12 +208,23 @@ export default function App() {
 
       <section className="viewer">
         {mesh && (
-          <Viewer
-            mesh={mesh}
-            surfacePoints={surfacePoints}
-            orientations={orientations}
+          <ObjectTree
+            surfaces={mesh.surfaces}
+            hidden={hidden}
+            onToggle={(k, hide) => setHide([k], hide)}
+            onToggleMany={(keys, hide) => setHide(keys, hide)}
           />
         )}
+        <div className="viewer-canvas">
+          {mesh && (
+            <Viewer
+              mesh={mesh}
+              hidden={hidden}
+              surfacePoints={surfacePoints}
+              orientations={orientations}
+            />
+          )}
+        </div>
       </section>
     </div>
   );

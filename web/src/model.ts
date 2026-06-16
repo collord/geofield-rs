@@ -61,6 +61,62 @@ export interface MeshData {
   blockCount: number;
 }
 
+/** A stable id for one surface object, used to toggle its visibility from the object
+ *  tree. Encodes block + (unit | interface) so it survives re-solves. */
+export function surfaceKey(s: SurfaceMesh): string {
+  const blk = s.block === undefined ? "_" : `b${s.block}`;
+  const part = s.unit !== undefined ? `u${s.unit}` : `i${s.interfaceId}`;
+  return `${blk}:${part}`;
+}
+
+/** Human label for a surface in the object tree. */
+export function surfaceLabel(s: SurfaceMesh): string {
+  if (s.unit !== undefined) return `unit ${s.unit}`;
+  return s.formation; // a contact: the formation name
+}
+
+const FORMATION_COLORS: Record<string, number> = {
+  rock1: 0xe07b39,
+  rock2: 0x3d9be9,
+};
+
+/** Render color for one surface, shared by the 3-D view and the object-tree swatch.
+ *  Contacts use the formation palette (rock1/rock2). Closed lithology-unit solids use
+ *  an evenly-spaced HSL hue per unit (so adjacent layers are maximally distinct, unlike
+ *  a string hash where "unit 1"/"unit 2" collide), shifted in lightness per fault block
+ *  so block A's and block B's layers also differ. */
+export function pickColor(surf: SurfaceMesh): number {
+  if (surf.unit === undefined) {
+    return FORMATION_COLORS[surf.formation] ?? colorFor(surf.formation);
+  }
+  const hue = (surf.unit * 0.61803398875) % 1; // golden-angle hue spacing
+  const block = surf.block ?? 0;
+  const light = 0.45 + 0.12 * (block % 3); // per-block lightness shift
+  return hslToHex(hue, 0.6, light);
+}
+
+/** "#rrggbb" CSS string for a surface color (object-tree swatch). */
+export function pickColorCss(surf: SurfaceMesh): string {
+  return "#" + pickColor(surf).toString(16).padStart(6, "0");
+}
+
+function hslToHex(h: number, s: number, l: number): number {
+  const f = (n: number) => {
+    const k = (n + h * 12) % 12;
+    const a = s * Math.min(l, 1 - l);
+    const c = l - a * Math.max(-1, Math.min(k - 3, 9 - k, 1));
+    return Math.round(c * 255);
+  };
+  return (f(0) << 16) | (f(8) << 8) | f(4);
+}
+
+/** Stable fallback color for any formation not in the palette. */
+function colorFor(name: string): number {
+  let h = 0;
+  for (let i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) >>> 0;
+  return h & 0xffffff;
+}
+
 export interface SolveResult {
   mesh: MeshData;
   /** A hard failure (the solve threw / bad input) — nothing was produced. */
