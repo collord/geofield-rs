@@ -224,14 +224,17 @@ export function solveAndMesh(
   const surfaces: SurfaceMesh[] = [];
   let totalTris = 0;
 
-  // A faulted model renders per-block to avoid the cross-fault field discontinuity
-  // crumpling the contour. OPEN-SHEET (cap off): one clean clipped contact surface per
-  // (block, interface) (Leapfrog-style). CLOSED (cap on): one watertight solid per
-  // (block, lithology unit), capped by the box AND the fault plane — the layered
-  // solids stitch to the fault.
+  // CLOSED (cap on): one watertight solid per (block, lithology UNIT) — the disjoint
+  //   slabs between consecutive contacts. This is the geological closed model and the
+  //   slabs do NOT overlap. (The old per-INTERFACE closed path built nested
+  //   "everything below contact X" solids, so the upper one fully enclosed/occluded the
+  //   lower — the bug this replaces.) Works for 1 block (block 0 = whole model) or N.
+  // OPEN (cap off): a FAULTED model renders one clean clipped contact per (block,
+  //   interface) to avoid the cross-fault discontinuity crumpling the contour;
+  //   a non-faulted model renders one contact surface per interface over the whole box.
   const blockCount = model.block_count;
+  const closed = cap;
   const faultedOpen = blockCount > 1 && !cap;
-  const faultedClosed = blockCount > 1 && cap;
 
   const pushSurface = (
     wm: ReturnType<WasmModel["mesh_isosurface_octree"]>,
@@ -258,11 +261,40 @@ export function solveAndMesh(
     wm.free();
   };
 
-  if (faultedOpen) {
-    // One surface per (block, interface), each clipped to its block's region.
+  if (closed) {
+    // One watertight solid per (block, lithology UNIT) — disjoint slabs (capped by the
+    // box, and by the fault plane when faulted). Block 0 is the whole model when not
+    // faulted. Per-block keeps the field smooth on each side of any fault.
+    for (let b = 0; b < blockCount; b++) {
+      const units = model.block_unit_count(b);
+      const bIds = Array.from(model.block_interface_ids(b));
+      const blockLabel = blockCount > 1 ? b : undefined;
+      for (let u = 0; u < units; u++) {
+        const wm = model.mesh_block_unit_solid_octree(
+          b,
+          u,
+          minX,
+          minY,
+          minZ,
+          size,
+          maxDepth,
+          minDepth,
+          QEF_EPS,
+        );
+        if (wm.triangle_count > 0) {
+          // Unit u sits above interface u-1; tag with that interface id when present.
+          const lowerId = u > 0 ? bIds[u - 1] : -1;
+          pushSurface(wm, lowerId, 0, blockLabel, u);
+        } else {
+          wm.free();
+        }
+      }
+    }
+  } else if (faultedOpen) {
+    // One contact surface per (block, interface), each clipped to its block's region.
     for (let b = 0; b < blockCount; b++) {
       const bIds = Array.from(model.block_interface_ids(b));
-      const bIsos = Array.from(model.interface_isovalues()); // representative; per-block uses own iso internally
+      const bIsos = Array.from(model.interface_isovalues()); // per-block uses own iso internally
       for (let s = 0; s < bIds.length; s++) {
         const wm = model.mesh_block_interface_octree(
           b,
@@ -282,36 +314,8 @@ export function solveAndMesh(
         }
       }
     }
-  } else if (faultedClosed) {
-    // One watertight solid per (block, lithology unit), capped by box + fault plane.
-    for (let b = 0; b < blockCount; b++) {
-      const units = model.block_unit_count(b);
-      // Name a unit by the contact below it (its lower bounding interface), best-effort.
-      const bIds = Array.from(model.block_interface_ids(b));
-      for (let u = 0; u < units; u++) {
-        const wm = model.mesh_block_unit_solid_octree(
-          b,
-          u,
-          minX,
-          minY,
-          minZ,
-          size,
-          maxDepth,
-          minDepth,
-          QEF_EPS,
-        );
-        if (wm.triangle_count > 0) {
-          // Unit u sits above interface u-1; tag it with that interface id when present.
-          const lowerId = u > 0 ? bIds[u - 1] : -1;
-          pushSurface(wm, lowerId, 0, b, u);
-        } else {
-          wm.free();
-        }
-      }
-    }
   } else {
-    // Non-faulted (or closed-solid) path: one surface per interface over the whole
-    // domain at its recovered isovalue.
+    // Non-faulted OPEN sheet: one contact surface per interface over the whole domain.
     const isovalues = Array.from(model.interface_isovalues());
     const ids = Array.from(model.interface_ids());
     for (let s = 0; s < isovalues.length; s++) {
@@ -324,7 +328,7 @@ export function solveAndMesh(
         maxDepth,
         minDepth,
         QEF_EPS,
-        cap,
+        false, // open sheet (closed solids go through the per-unit path above)
       );
       pushSurface(wm, ids[s], isovalues[s], undefined);
     }
