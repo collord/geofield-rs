@@ -15,6 +15,12 @@ re-render live in a three.js viewport.
   Z is up.
 - Edits **auto re-solve** after a ~300 ms debounce. An octree-depth slider (2–7)
   caps adaptive refinement.
+- A **fault** toggle adds a single vertical planar fault: the field solves
+  independently on each side, so the contacts are **laterally offset** across the
+  plane (a finite fault, gempy's behaviour — `Model::fit_faulted` / `BlockIndex` in
+  the crate). The **strike** slider rotates the plane (deg from +Y) and **offset**
+  slides it along its normal from the domain center. A "faulted" badge shows when
+  active. Wired through `WasmModel.new_faulted` → `fit_faulted` (per-block solve).
 
 ## Architecture
 

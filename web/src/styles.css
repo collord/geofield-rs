@@ -61,6 +61,17 @@ header h1 {
   color: var(--text);
 }
 
+.status .faulted {
+  padding: 1px 8px;
+  border-radius: 10px;
+  background: #4a2f1a;
+  color: #ffcf9e;
+  border: 1px solid #6a4523;
+  font-size: 0.85em;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
 .error {
   padding: 6px 16px;
   background: #3a1f22;

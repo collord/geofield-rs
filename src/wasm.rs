@@ -13,13 +13,16 @@ use wasm_bindgen::prelude::*;
 
 use crate::assemble::KernelOptions;
 use crate::data::{Orientation, Series, SurfacePoint};
+use crate::fault::{BlockIndex, OneFault, PlanarFault};
 use crate::mesh::{dual_contour, MeshGrid};
 use crate::octree::{octree_dual_contour, OctreeConfig};
 use crate::stack::{Relation, Stack, StackedSeries};
 use crate::Model;
 
 /// Build (validate + marshal + fit) a single-series [`Model`] from the flat typed
-/// arrays the JS side passes. Shared by [`WasmModel::new`] and [`WasmStack::add_series`].
+/// arrays the JS side passes. Shared by [`WasmModel::new`]/[`WasmModel::new_faulted`]
+/// and [`WasmStack::add_series`]. If `fault` is `Some`, the model is fit per-block
+/// (a faulted, laterally-discontinuous field); otherwise it is one smooth field.
 /// Kernel options default (mirroring `OctreeConfig`/`KernelOptions::default`) where a
 /// value is NaN / `uni_degree == 0`.
 #[allow(clippy::too_many_arguments)]
@@ -34,6 +37,7 @@ fn fit_from_flat(
     gi_res: f64,
     uni_degree: u32,
     nugget: f64,
+    fault: Option<Box<dyn BlockIndex>>,
 ) -> Result<Model, JsError> {
     if !sp_xyz.len().is_multiple_of(3)
         || !ori_xyz.len().is_multiple_of(3)
@@ -72,7 +76,28 @@ fn fit_from_flat(
     };
 
     let series = Series::new(surface_points, orientations);
-    Ok(Model::fit(&series, opts))
+    Ok(match fault {
+        Some(index) => Model::fit_faulted(&series, index, opts),
+        None => Model::fit(&series, opts),
+    })
+}
+
+/// Build a single-planar-fault [`BlockIndex`] from a JS point+normal, or `None` if
+/// the normal is degenerate (all ~zero / non-finite) — the "no fault" signal the JS
+/// side uses to mean an un-faulted fit.
+fn planar_fault_from_flat(point: &[f64], normal: &[f64]) -> Option<Box<dyn BlockIndex>> {
+    if point.len() < 3 || normal.len() < 3 {
+        return None;
+    }
+    let n2 = normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2];
+    if !n2.is_finite() || n2 < 1e-12 {
+        return None;
+    }
+    let fault = PlanarFault::new(
+        [point[0], point[1], point[2]],
+        [normal[0], normal[1], normal[2]],
+    );
+    Some(Box::new(OneFault::new(fault)))
 }
 
 /// A dual-contoured triangle mesh handed to JS: flat position + index buffers.
@@ -145,8 +170,53 @@ impl WasmModel {
             gi_res,
             uni_degree,
             nugget,
+            None,
         )?;
         Ok(WasmModel { inner })
+    }
+
+    /// Fit a model with a single **planar fault** offsetting the contacts. Same
+    /// arrays/options as [`WasmModel::new`], plus the fault plane as
+    /// `fault_point` (a 3-element `Float64Array`, a point on the plane) and
+    /// `fault_normal` (a 3-element `Float64Array`). The field solves independently on
+    /// each side of the plane, so contacts are laterally offset across it. A
+    /// degenerate (≈zero) normal means "no fault" → identical to [`WasmModel::new`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_faulted(
+        sp_xyz: &[f64],
+        sp_interface: &[f64],
+        ori_xyz: &[f64],
+        ori_pole: &[f64],
+        range: f64,
+        c_o: f64,
+        i_res: f64,
+        gi_res: f64,
+        uni_degree: u32,
+        nugget: f64,
+        fault_point: &[f64],
+        fault_normal: &[f64],
+    ) -> Result<WasmModel, JsError> {
+        let fault = planar_fault_from_flat(fault_point, fault_normal);
+        let inner = fit_from_flat(
+            sp_xyz,
+            sp_interface,
+            ori_xyz,
+            ori_pole,
+            range,
+            c_o,
+            i_res,
+            gi_res,
+            uni_degree,
+            nugget,
+            fault,
+        )?;
+        Ok(WasmModel { inner })
+    }
+
+    /// Number of fault-bounded blocks (1 if the model is not faulted).
+    #[wasm_bindgen(getter)]
+    pub fn block_count(&self) -> usize {
+        self.inner.nblocks()
     }
 
     /// Scalar field at a single world point.
@@ -336,6 +406,7 @@ impl WasmStack {
             gi_res,
             uni_degree,
             nugget,
+            None,
         )?;
         self.inner
             .series

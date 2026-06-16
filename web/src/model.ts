@@ -58,6 +58,15 @@ export interface SolveResult {
   error: string | null;
 }
 
+/** A single planar fault: a point on the plane + an outward normal. When
+ *  `enabled`, the field solves independently on each side so contacts are offset
+ *  laterally across the plane (a finite fault). */
+export interface FaultConfig {
+  enabled: boolean;
+  point: [number, number, number];
+  normal: [number, number, number];
+}
+
 /** Fit the model from the current rows and adaptively (octree) dual-contour ONE
  *  surface per interface, each at its recovered isovalue (so the meshes pass
  *  through the input surface points, as gempy renders contacts — not an arbitrary
@@ -69,6 +78,7 @@ export function solveAndMesh(
   orientations: OrientationRow[],
   maxDepth: number,
   cap: boolean = false,
+  fault: FaultConfig | null = null,
 ): SolveResult {
   const idOf = (formation: string): number => {
     const i = SERIES_ORDER.indexOf(formation);
@@ -101,18 +111,37 @@ export function solveAndMesh(
   try {
     // NaN options → crate defaults (range 1.7, c_o 10, i_res 4, gi_res 2,
     // uni_degree 1, nugget 1e-5). uni_degree = 1.
-    model = new WasmModel(
-      sp_xyz,
-      sp_if,
-      ori_xyz,
-      ori_pole,
-      NAN,
-      NAN,
-      NAN,
-      NAN,
-      1,
-      NAN,
-    );
+    if (fault && fault.enabled) {
+      // Faulted fit: the field solves independently on each side of the plane, so
+      // contacts are offset across it. A degenerate normal means "no fault".
+      model = WasmModel.new_faulted(
+        sp_xyz,
+        sp_if,
+        ori_xyz,
+        ori_pole,
+        NAN,
+        NAN,
+        NAN,
+        NAN,
+        1,
+        NAN,
+        new Float64Array(fault.point),
+        new Float64Array(fault.normal),
+      );
+    } else {
+      model = new WasmModel(
+        sp_xyz,
+        sp_if,
+        ori_xyz,
+        ori_pole,
+        NAN,
+        NAN,
+        NAN,
+        NAN,
+        1,
+        NAN,
+      );
+    }
   } catch (e) {
     return { mesh: emptyMesh(), error: String(e) };
   }
