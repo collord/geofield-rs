@@ -53,7 +53,16 @@
 //! `(c&1, (c>>1)&1, (c>>2)&1)` = (x, y, z) ∈ {0,1}³ (same as `mesh::corner_offset`).
 
 use crate::mesh::{corner_offset, normalize, qef_vertex, Mesh, CELL_EDGES};
-use crate::Model;
+
+/// A scalar field the contourer can sample: the value and analytic gradient at a
+/// world point. Implemented by [`crate::Model`] (which dispatches per fault block) and
+/// by a single-block view, so the contourer can mesh either the whole faulted model or
+/// ONE block's smooth field in isolation (the latter avoids the cross-fault
+/// discontinuity that crumples the contact at the fault).
+pub trait ScalarField {
+    fn scalar_field(&self, p: [f64; 3]) -> f64;
+    fn scalar_field_gradient(&self, p: [f64; 3]) -> [f64; 3];
+}
 
 // ---------------------------------------------------------------------------
 // Boundary: the domain wall as just-another-implicit-surface.
@@ -103,12 +112,12 @@ pub trait Boundary {
 /// the field gradient. This is how a second contact (e.g. an erosion surface that
 /// truncates a stack) enters the combined field as just-another-`Boundary`.
 pub struct ContactSurface<'a> {
-    model: &'a Model,
+    model: &'a dyn ScalarField,
     isovalue: f64,
 }
 
 impl<'a> ContactSurface<'a> {
-    pub fn new(model: &'a Model, isovalue: f64) -> Self {
+    pub fn new(model: &'a dyn ScalarField, isovalue: f64) -> Self {
         Self { model, isovalue }
     }
 }
@@ -147,7 +156,7 @@ impl Boundary for ContactSurface<'_> {
 /// surface to the half OUTSIDE a younger eroding body (`below = false`, the
 /// `field >= iso` side), and to build slabs (`below(hi) ∩ above(lo)`) from one field.
 pub struct ContactHalfSpace<'a> {
-    model: &'a Model,
+    model: &'a dyn ScalarField,
     isovalue: f64,
     /// `true` keeps the below side (`field < iso`) inside; `false` the above side.
     below: bool,
@@ -156,7 +165,7 @@ pub struct ContactHalfSpace<'a> {
 impl<'a> ContactHalfSpace<'a> {
     /// A half-space of `model`'s contact at `isovalue`. `below = true` → the
     /// `field < iso` side is inside; `below = false` → the `field > iso` side.
-    pub fn new(model: &'a Model, isovalue: f64, below: bool) -> Self {
+    pub fn new(model: &'a dyn ScalarField, isovalue: f64, below: bool) -> Self {
         Self {
             model,
             isovalue,
@@ -276,7 +285,7 @@ impl Boundary for PlaneHalfSpace {
 /// The primary contact is distinguished only because its gradient orients the open
 /// sheet (`cap = false`); for the closed solid all contributors are symmetric.
 pub struct Scene<'a> {
-    model: &'a Model,
+    model: &'a dyn ScalarField,
     isovalue: f64,
     /// Additional surfaces intersected with the primary contact. The first is
     /// conventionally the domain boundary; further entries are truncating contacts.
@@ -284,7 +293,7 @@ pub struct Scene<'a> {
 }
 
 impl<'a> Scene<'a> {
-    pub fn new(model: &'a Model, isovalue: f64, contributors: Vec<&'a dyn Boundary>) -> Self {
+    pub fn new(model: &'a dyn ScalarField, isovalue: f64, contributors: Vec<&'a dyn Boundary>) -> Self {
         Self {
             model,
             isovalue,
@@ -717,7 +726,7 @@ impl Default for OctreeConfig {
 /// closed against the axis-aligned-box domain (the original behavior). Adaptive:
 /// fine near detail, coarse in flat regions.
 pub fn octree_dual_contour(
-    model: &Model,
+    model: &dyn ScalarField,
     min: [f64; 3],
     size: f64,
     isovalue: f64,
@@ -745,7 +754,7 @@ pub fn octree_dual_contour(
 ///
 /// `[min, min+size]³` is the octree's sampling cube.
 pub fn octree_dual_contour_bounded(
-    model: &Model,
+    model: &dyn ScalarField,
     boundary: &dyn Boundary,
     min: [f64; 3],
     size: f64,
@@ -1755,6 +1764,7 @@ mod tests {
     use super::*;
     use crate::assemble::KernelOptions;
     use crate::data::{Orientation, Series, SurfacePoint};
+    use crate::Model;
 
     fn flat_model() -> Model {
         let sps = vec![

@@ -26,9 +26,7 @@ use assemble::{assemble, KernelOptions, System};
 use data::{Orientation, Series, SurfacePoint};
 use evaluate::Field;
 use mesh::{normalize, Mesh};
-use octree::{
-    octree_dual_contour_scene, AxisBox, Boundary, OctreeConfig, PlaneHalfSpace, Scene,
-};
+use octree::{octree_dual_contour, OctreeConfig, ScalarField};
 use fault::{BlockIndex, SingleBlock};
 use litho::Lithology;
 use solve::{solve, Solution};
@@ -187,10 +185,11 @@ impl Model {
     /// at the fault plane (Leapfrog-style), instead of one mesh stitched across the
     /// discontinuity.
     ///
-    /// The clip region is the block's fault half-spaces ([`BlockIndex::block_half_spaces`])
-    /// intersected with the domain box. The primary field is the whole model's
-    /// `scalar_field`, which dispatches per block — but the clip guarantees every
-    /// in-region point is in block `b`, so it evaluates block `b`'s field there.
+    /// Contour the block's OWN smooth field over the whole box (so the contact is
+    /// continuous — no cross-fault discontinuity to crumple it), then drop the
+    /// triangles whose centroid falls OUTSIDE the block's half-spaces. The contact ends
+    /// flush at the fault as a clean cut, with no welded vertical seam wall (the clip
+    /// is a pure post-hoc triangle drop, not a CSG boundary the contact bends toward).
     ///
     /// Returns `None` if `b` is field-less or `interface_idx` is out of range.
     /// `[min, min+size]³` is the octree cube.
@@ -202,28 +201,23 @@ impl Model {
         size: f64,
         cfg: OctreeConfig,
     ) -> Option<Mesh> {
-        let iv = *self.block_lithology(b)?.interfaces.get(interface_idx)?;
+        let block = self.blocks.get(b)?.as_ref()?;
+        let iv = *block.lithology.interfaces.get(interface_idx)?;
 
-        let box_b = AxisBox::new(min, size);
-        // One PlaneHalfSpace per fault bounding this block.
-        let planes: Vec<PlaneHalfSpace> = self
-            .index
-            .block_half_spaces(b)
-            .into_iter()
-            .map(|hs| PlaneHalfSpace::new(hs.point, hs.normal, hs.keep_positive))
-            .collect();
-
-        let mut contributors: Vec<&dyn Boundary> = Vec::with_capacity(planes.len() + 1);
-        contributors.push(&box_b);
-        for p in &planes {
-            contributors.push(p);
-        }
-
-        // The per-block view is always the OPEN sheet (cap=false), so the contact
-        // stops flush at the clip planes / box without a closing cap.
+        // Contour ONLY this block's field (smooth everywhere) as an open sheet.
+        let field = BlockField { block };
         let cfg = OctreeConfig { cap: false, ..cfg };
-        let scene = Scene::new(self, iv.isovalue, contributors);
-        Some(octree_dual_contour_scene(&scene, min, size, cfg))
+        let mut mesh = octree_dual_contour(&field, min, size, iv.isovalue, cfg);
+
+        // Drop triangles outside the block: a triangle is kept iff its centroid is on
+        // the kept side of every fault half-space bounding this block. (Centroid test
+        // is robust — a triangle straddling the fault is dropped, leaving a clean cut
+        // edge within a cell of the plane.)
+        let half_spaces = self.index.block_half_spaces(b);
+        if !half_spaces.is_empty() {
+            clip_mesh_to_half_spaces(&mut mesh, &half_spaces);
+        }
+        Some(mesh)
     }
 
     /// The block containing `p`, if it has a field.
@@ -268,6 +262,134 @@ impl Model {
     /// [`Model::block_lithology`] for a specific block.
     pub fn lithology(&self) -> &Lithology {
         &self.representative_lithology
+    }
+}
+
+/// Clip a triangle mesh to a fault block's region by SPLITTING triangles at each
+/// bounding half-space plane (Sutherland–Hodgman per triangle), so the contact ends
+/// FLUSH on the fault — a clean cut exactly at the plane, not a ragged per-triangle
+/// keep/drop. New vertices created on a plane get interpolated positions AND normals
+/// (so shading stays smooth up to the cut). Vertices that become unreferenced are left
+/// in the buffers (harmless).
+fn clip_mesh_to_half_spaces(mesh: &mut Mesh, half_spaces: &[fault::HalfSpace]) {
+    for hs in half_spaces {
+        clip_mesh_to_plane(mesh, hs);
+    }
+}
+
+/// One Sutherland–Hodgman pass: clip every triangle to the kept side of `hs`.
+fn clip_mesh_to_plane(mesh: &mut Mesh, hs: &fault::HalfSpace) {
+    let has_normals = mesh.normals.len() == mesh.positions.len();
+    let vpos = |m: &Mesh, i: u32| {
+        let b = (i as usize) * 3;
+        [m.positions[b] as f64, m.positions[b + 1] as f64, m.positions[b + 2] as f64]
+    };
+    let vnorm = |m: &Mesh, i: u32| {
+        let b = (i as usize) * 3;
+        [m.normals[b] as f64, m.normals[b + 1] as f64, m.normals[b + 2] as f64]
+    };
+    // Kept-signed distance: >= 0 on the kept side, < 0 outside.
+    let kept_dist = |p: [f64; 3]| -> f64 {
+        let d = (p[0] - hs.point[0]) * hs.normal[0]
+            + (p[1] - hs.point[1]) * hs.normal[1]
+            + (p[2] - hs.point[2]) * hs.normal[2];
+        if hs.keep_positive {
+            d
+        } else {
+            -d
+        }
+    };
+
+    let old = std::mem::take(&mut mesh.indices);
+    let mut out: Vec<u32> = Vec::with_capacity(old.len());
+    for tri in old.chunks_exact(3) {
+        let p = [vpos(mesh, tri[0]), vpos(mesh, tri[1]), vpos(mesh, tri[2])];
+        let dk = [kept_dist(p[0]), kept_dist(p[1]), kept_dist(p[2])];
+        // All inside → emit unchanged; all outside → drop. (Fast path, no new verts.)
+        if dk.iter().all(|&d| d >= 0.0) {
+            out.extend_from_slice(tri);
+            continue;
+        }
+        if dk.iter().all(|&d| d < 0.0) {
+            continue;
+        }
+        // Mixed: build the clipped polygon (kept corners + edge crossings), appending
+        // a new vertex for each crossing. Collected as plain `mesh` reads first so the
+        // borrow of `mesh.positions` ends before we push.
+        let mut poly: Vec<u32> = Vec::with_capacity(4);
+        for e in 0..3 {
+            let (a, b) = (tri[e], tri[(e + 1) % 3]);
+            let (da, db) = (dk[e], dk[(e + 1) % 3]);
+            if da >= 0.0 {
+                poly.push(a);
+            }
+            if (da >= 0.0) != (db >= 0.0) {
+                let t = da / (da - db);
+                let (pa, pb) = (vpos(mesh, a), vpos(mesh, b));
+                let np = [
+                    pa[0] + (pb[0] - pa[0]) * t,
+                    pa[1] + (pb[1] - pa[1]) * t,
+                    pa[2] + (pb[2] - pa[2]) * t,
+                ];
+                let nn = if has_normals {
+                    let (na, nb) = (vnorm(mesh, a), vnorm(mesh, b));
+                    Some(normalize([
+                        na[0] + (nb[0] - na[0]) * t,
+                        na[1] + (nb[1] - na[1]) * t,
+                        na[2] + (nb[2] - na[2]) * t,
+                    ]))
+                } else {
+                    None
+                };
+                let idx = (mesh.positions.len() / 3) as u32;
+                mesh.positions.push(np[0] as f32);
+                mesh.positions.push(np[1] as f32);
+                mesh.positions.push(np[2] as f32);
+                if let Some(n) = nn {
+                    mesh.normals.push(n[0] as f32);
+                    mesh.normals.push(n[1] as f32);
+                    mesh.normals.push(n[2] as f32);
+                }
+                poly.push(idx);
+            }
+        }
+        // Fan-triangulate the convex clipped polygon.
+        for i in 1..poly.len().saturating_sub(1) {
+            out.push(poly[0]);
+            out.push(poly[i]);
+            out.push(poly[i + 1]);
+        }
+    }
+    mesh.indices = out;
+}
+
+/// `Model` as a [`ScalarField`] for the contourer — per-block dispatch (the field is
+/// discontinuous across faults). Delegates to the inherent methods.
+impl ScalarField for Model {
+    fn scalar_field(&self, p: [f64; 3]) -> f64 {
+        Model::scalar_field(self, p)
+    }
+    fn scalar_field_gradient(&self, p: [f64; 3]) -> [f64; 3] {
+        Model::scalar_field_gradient(self, p)
+    }
+}
+
+/// A view of ONE fault block's field as a [`ScalarField`] — a single smooth cokriging
+/// field with NO per-block dispatch, so contouring it produces a continuous contact
+/// everywhere (the block's contact extrapolated across the whole domain). The per-block
+/// mesh then drops the extrapolated part outside the block. This is what lets a faulted
+/// contact mesh as clean separate sheets without the cross-fault discontinuity crumpling
+/// the contour.
+struct BlockField<'a> {
+    block: &'a Block,
+}
+
+impl ScalarField for BlockField<'_> {
+    fn scalar_field(&self, p: [f64; 3]) -> f64 {
+        self.block.field().scalar_field(p)
+    }
+    fn scalar_field_gradient(&self, p: [f64; 3]) -> [f64; 3] {
+        self.block.field().scalar_field_gradient(p)
     }
 }
 
@@ -763,16 +885,67 @@ mod fault_tests {
             .expect("block 1 interface 0");
         assert!(m0.triangle_count() > 0 && m1.triangle_count() > 0, "both blocks mesh");
 
-        // Block 0 = negative side (x <= 500), block 1 = positive (x >= 500). Allow a
-        // small epsilon for vertices that land exactly on the clip plane.
+        // Block 0 = negative side (x <= 500), block 1 = positive (x >= 500). With the
+        // triangle-splitting clip the cut is FLUSH at x=500 (only f32 rounding slack).
         let referenced = |m: &crate::mesh::Mesh| -> std::collections::HashSet<u32> {
             m.indices.iter().copied().collect()
         };
         for &i in &referenced(&m0) {
-            assert!(pos(&m0, i)[0] <= 500.0 + 1.0, "block 0 vertex crossed the fault: {:?}", pos(&m0, i));
+            assert!(pos(&m0, i)[0] <= 500.0 + 0.1, "block 0 vertex crossed the fault: {:?}", pos(&m0, i));
         }
         for &i in &referenced(&m1) {
-            assert!(pos(&m1, i)[0] >= 500.0 - 1.0, "block 1 vertex crossed the fault: {:?}", pos(&m1, i));
+            assert!(pos(&m1, i)[0] >= 500.0 - 0.1, "block 1 vertex crossed the fault: {:?}", pos(&m1, i));
+        }
+    }
+
+    /// No seam WALL at the fault: a per-block contact mesh must not contain near-
+    /// vertical faces lying in the fault plane (the welded/snapped sawtooth the old
+    /// CSG-clip produced). With the per-block smooth contour + triangle-split clip the
+    /// contact ends flush as a clean cut, so there are zero faces parallel to the
+    /// (vertical) fault plane. Uses the raised-corner screenshot data.
+    #[test]
+    fn no_seam_wall_at_the_fault() {
+        let pts = [
+            (100.0, 200.0, 500.0, 0u32), (500.0, 200.0, 600.0, 0), (900.0, 200.0, 800.0, 0),
+            (100.0, 800.0, 600.0, 0), (500.0, 800.0, 600.0, 0), (900.0, 800.0, 600.0, 0),
+            (100.0, 200.0, 400.0, 1), (500.0, 200.0, 400.0, 1), (900.0, 200.0, 400.0, 1),
+            (100.0, 800.0, 400.0, 1), (500.0, 800.0, 400.0, 1), (900.0, 800.0, 400.0, 1),
+        ];
+        let sps: Vec<_> = pts.iter().map(|&(x, y, z, id)| SurfacePoint::new([x, y, z], id)).collect();
+        let oris = vec![
+            Orientation::new([500.0, 500.0, 600.0], [0.0, 0.0, 1.0]),
+            Orientation::new([500.0, 500.0, 400.0], [0.0, 0.0, 1.0]),
+        ];
+        let series = Series::new(sps, oris);
+        // Vertical fault at x=275 (the screenshot's offset=-225), normal +x.
+        let fault = Box::new(OneFault::new(PlanarFault::new([275.0, 0.0, 0.0], [1.0, 0.0, 0.0])));
+        let model = Model::fit_faulted(&series, fault, KernelOptions::default());
+
+        let face_nz = |m: &crate::mesh::Mesh, t: usize| -> f64 {
+            let i = [m.indices[3 * t], m.indices[3 * t + 1], m.indices[3 * t + 2]];
+            let p = |k: u32| {
+                let b = (k as usize) * 3;
+                [m.positions[b] as f64, m.positions[b + 1] as f64, m.positions[b + 2] as f64]
+            };
+            let (a, b, c) = (p(i[0]), p(i[1]), p(i[2]));
+            let e1 = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+            let e2 = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+            let n = [
+                e1[1] * e2[2] - e1[2] * e2[1],
+                e1[2] * e2[0] - e1[0] * e2[2],
+                e1[0] * e2[1] - e1[1] * e2[0],
+            ];
+            let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt().max(1e-12);
+            n[2].abs() / len // |cos| with +Z; ~0 ⇒ vertical wall face
+        };
+        for b in 0..model.nblocks() {
+            for s in 0..model.block_interface_count(b) {
+                let m = model
+                    .mesh_block_interface(b, s, [0.0, 0.0, 0.0], 1000.0, mesh_cfg(5))
+                    .unwrap();
+                let walls = (0..m.triangle_count()).filter(|&t| face_nz(&m, t) < 0.05).count();
+                assert_eq!(walls, 0, "block {b} iface {s}: {walls} vertical wall faces at the fault");
+            }
         }
     }
 
