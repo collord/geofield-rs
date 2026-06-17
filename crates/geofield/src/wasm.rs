@@ -23,6 +23,7 @@ use wasm_bindgen::prelude::*;
 
 use crate::octree::{octree_dual_contour, OctreeConfig};
 use crate::remote::{self, RemoteModel};
+use crate::stack::{Relation, Stack, StackedSeries};
 use crate::{BlockModel, MeshModel};
 
 #[wasm_bindgen]
@@ -373,5 +374,137 @@ impl WasmModel {
     /// Largest within-interface isovalue spread at fit time (diagnostic).
     pub fn isovalue_spread(&self) -> f64 {
         self.inner.isovalue_spread()
+    }
+}
+
+/// Map a JS relation code to a [`Relation`]. `0=Erode 1=Onlap 2=Conformable
+/// 3=Basement`; anything else falls back to `Erode` (GemPy's default).
+fn relation_from_code(code: u32) -> Relation {
+    match code {
+        1 => Relation::Onlap,
+        2 => Relation::Conformable,
+        3 => Relation::Basement,
+        _ => Relation::Erode,
+    }
+}
+
+/// A multi-series stack exposed to JS (GemPy-style unconformities), over the two-wasm
+/// split: each series is fitted in the kernel module and held here as a [`RemoteModel`]
+/// handle, so the stack's erode/onlap meshing runs in the BSD engine while the cokriging
+/// lives in the EUPL kernel.
+///
+/// Build it by calling [`WasmStack::add_series`] **youngest series first**, each with its
+/// own surface points/orientations, a relation code, and an optional planar fault, then
+/// query per-point lithology ([`WasmStack::lithology_label`]) or mesh one interface
+/// clipped to its series' visible region ([`WasmStack::mesh_interface_octree`]).
+#[wasm_bindgen]
+pub struct WasmStack {
+    inner: Stack<RemoteModel>,
+}
+
+#[wasm_bindgen]
+impl WasmStack {
+    /// An empty stack. Add series youngest→oldest with [`WasmStack::add_series`].
+    #[wasm_bindgen(constructor)]
+    pub fn new() -> WasmStack {
+        install_panic_hook();
+        WasmStack { inner: Stack::new(Vec::new()) }
+    }
+
+    /// Fit and append one series (the next-oldest). Arrays and kernel options match
+    /// [`WasmModel::new`]; `relation` is the code in [`relation_from_code`]
+    /// (`0=Erode 1=Onlap 2=Conformable 3=Basement`). `fault_point`/`fault_normal` apply a
+    /// single planar fault to THIS series' fit (a degenerate normal = no fault). Appends
+    /// in call order, so the FIRST `add_series` is the youngest.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_series(
+        &mut self,
+        sp_xyz: &[f64],
+        sp_interface: &[f64],
+        ori_xyz: &[f64],
+        ori_pole: &[f64],
+        range: f64,
+        c_o: f64,
+        i_res: f64,
+        gi_res: f64,
+        uni_degree: u32,
+        nugget: f64,
+        relation: u32,
+        fault_point: &[f64],
+        fault_normal: &[f64],
+    ) -> Result<(), JsError> {
+        install_panic_hook();
+        let fault = fault_from_flat(fault_point, fault_normal);
+        let buf = build_fit_buffer(
+            sp_xyz, sp_interface, ori_xyz, ori_pole, range, c_o, i_res, gi_res, uni_degree,
+            nugget, fault,
+        )?;
+        let model = if fault.is_some() {
+            remote::fit_faulted(&buf)
+        } else {
+            remote::fit(&buf)
+        };
+        self.inner
+            .series
+            .push(StackedSeries::new(model, relation_from_code(relation)));
+        Ok(())
+    }
+
+    /// Number of series in the stack.
+    #[wasm_bindgen(getter)]
+    pub fn series_count(&self) -> usize {
+        self.inner.len()
+    }
+
+    /// Number of interfaces (meshable contacts) in series `series`. `0` if out of range.
+    pub fn interface_count(&self, series: usize) -> usize {
+        self.inner
+            .series
+            .get(series)
+            .map(|s| s.model.interface_isovalues().len())
+            .unwrap_or(0)
+    }
+
+    /// The flattened global lithology label at a point, encoding `(series, unit)` as
+    /// `series * 1000 + unit`. JS decodes with `Math.floor(v/1000)` and `v % 1000`.
+    pub fn lithology_label(&self, x: f64, y: f64, z: f64) -> u32 {
+        let (s, u) = self.inner.global_unit([x, y, z]);
+        (s as u32) * 1000 + (u as u32)
+    }
+
+    /// Just the winning series index at a point (which series is visible there).
+    pub fn series_at(&self, x: f64, y: f64, z: f64) -> usize {
+        self.inner.global_unit([x, y, z]).0
+    }
+
+    /// Adaptive octree mesh of interface `interface_idx` of series `series`, clipped to
+    /// that series' visible region (the domain box ∩ outside every younger erosion).
+    /// EMPTY mesh if indices are out of range. Octree params mirror
+    /// [`WasmModel::mesh_isosurface_octree`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn mesh_interface_octree(
+        &self,
+        series: usize,
+        interface_idx: usize,
+        min_x: f64,
+        min_y: f64,
+        min_z: f64,
+        size: f64,
+        max_depth: u32,
+        min_depth: u32,
+        qef_threshold: f64,
+        cap: bool,
+    ) -> WasmMesh {
+        let cfg = octree_cfg(max_depth, min_depth, qef_threshold, cap);
+        self.inner
+            .mesh_one(series, interface_idx, [min_x, min_y, min_z], size, cfg)
+            .map(Into::into)
+            .unwrap_or_else(EMPTY_MESH)
+    }
+}
+
+impl Default for WasmStack {
+    fn default() -> Self {
+        Self::new()
     }
 }

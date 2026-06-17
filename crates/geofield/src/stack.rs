@@ -46,7 +46,7 @@ use crate::mesh::Mesh;
 use crate::octree::{
     octree_dual_contour_scene, AxisBox, Boundary, ContactHalfSpace, OctreeConfig, Scene,
 };
-use crate::Model;
+use crate::SeriesModel;
 
 /// How a series relates to the (older) series beneath it (GemPy `StackRelationType`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,15 +66,16 @@ pub enum Relation {
 }
 
 /// One series in a [`Stack`]: its own fitted field plus its relationship to the
-/// series beneath it. The series' interfaces (and their isovalues) live in
-/// `model.lithology()`.
-pub struct StackedSeries {
-    pub model: Model,
+/// series beneath it. Generic over the fitted model `M` so the SAME stack logic drives
+/// the native kernel [`Model`] and the wasm [`RemoteModel`] (see [`SeriesModel`]). The
+/// series' interfaces (and their isovalues) come from `model.interface_isovalues()`.
+pub struct StackedSeries<M> {
+    pub model: M,
     pub relation: Relation,
 }
 
-impl StackedSeries {
-    pub fn new(model: Model, relation: Relation) -> Self {
+impl<M: SeriesModel> StackedSeries<M> {
+    pub fn new(model: M, relation: Relation) -> Self {
         Self { model, relation }
     }
 
@@ -82,7 +83,7 @@ impl StackedSeries {
     /// isovalue). The series is "present" where `field < iso_top`. `None` if the
     /// series has no interfaces (an empty/degenerate fit).
     pub fn iso_top(&self) -> Option<f64> {
-        self.model.lithology().interfaces.last().map(|iv| iv.isovalue)
+        self.model.interface_isovalues().last().copied()
     }
 
     /// Is this series' rock present at `p` (below its bounding contact)? A series
@@ -105,13 +106,14 @@ pub struct SeriesMeshes {
 }
 
 /// An ordered stack of series, **youngest (index 0) → oldest (last)**. The oldest
-/// series is conventionally a [`Relation::Basement`].
-pub struct Stack {
-    pub series: Vec<StackedSeries>,
+/// series is conventionally a [`Relation::Basement`]. Generic over the fitted model `M`
+/// ([`SeriesModel`]) so the native and wasm paths share one implementation.
+pub struct Stack<M> {
+    pub series: Vec<StackedSeries<M>>,
 }
 
-impl Stack {
-    pub fn new(series: Vec<StackedSeries>) -> Self {
+impl<M: SeriesModel> Stack<M> {
+    pub fn new(series: Vec<StackedSeries<M>>) -> Self {
         Self { series }
     }
 
@@ -139,21 +141,20 @@ impl Stack {
         (self.series.len(), 0)
     }
 
-    /// The younger series (indices `< i`) that CLIP series `i`'s surfaces: every
-    /// younger `Erode` series. Onlap/Conformable/Basement younger series do not clip.
-    fn erode_maskers_for(&self, i: usize) -> Vec<ContactHalfSpace<'_>> {
-        let mut maskers = Vec::new();
-        for j in 0..i {
-            let sj = &self.series[j];
+    /// The younger-`Erode` series (indices `< i`) that CLIP series `i`'s surfaces, as
+    /// `(field, iso_top)` pairs. Onlap/Conformable/Basement younger series do not clip.
+    /// Returned as owned fields (not yet `ContactHalfSpace`s) so the caller can keep them
+    /// alive while the half-spaces borrow them — a `ContactHalfSpace` borrows its field.
+    fn erode_masker_fields(&self, i: usize) -> Vec<(M::Field<'_>, f64)> {
+        let mut out = Vec::new();
+        for sj in &self.series[..i] {
             if sj.relation == Relation::Erode {
                 if let Some(iso_top) = sj.iso_top() {
-                    // Series `i` survives where it is OUTSIDE younger `j`'s body, i.e.
-                    // `field_j >= iso_top(j)` — the ABOVE side (`below = false`).
-                    maskers.push(ContactHalfSpace::new(&sj.model, iso_top, false));
+                    out.push((sj.model.field(), iso_top));
                 }
             }
         }
-        maskers
+        out
     }
 
     /// Mesh ONE interface of series `i`, clipped to that series' visible region (the
@@ -171,15 +172,24 @@ impl Stack {
         cfg: OctreeConfig,
     ) -> Option<Mesh> {
         let s = self.series.get(i)?;
-        let iv = *s.model.lithology().interfaces.get(interface_idx)?;
+        let isovalue = *s.model.interface_isovalues().get(interface_idx)?;
         let box_b = AxisBox::new(min, size);
-        let maskers = self.erode_maskers_for(i);
+        // Hold the masker fields in a local so the half-spaces (which borrow them) and the
+        // field reference below all outlive the `Scene`.
+        let masker_fields = self.erode_masker_fields(i);
+        let maskers: Vec<ContactHalfSpace<'_>> = masker_fields
+            .iter()
+            // Series `i` survives where it is OUTSIDE younger `j`'s body, i.e.
+            // `field_j >= iso_top(j)` — the ABOVE side (`below = false`).
+            .map(|(field, iso_top)| ContactHalfSpace::new(field, *iso_top, false))
+            .collect();
         let mut contributors: Vec<&dyn Boundary> = Vec::with_capacity(maskers.len() + 1);
         contributors.push(&box_b);
         for m in &maskers {
             contributors.push(m);
         }
-        let scene = Scene::new(&s.model, iv.isovalue, contributors);
+        let field = s.model.field();
+        let scene = Scene::new(&field, isovalue, contributors);
         Some(octree_dual_contour_scene(&scene, min, size, cfg))
     }
 
@@ -193,17 +203,15 @@ impl Stack {
     pub fn mesh_surfaces(&self, min: [f64; 3], size: f64, cfg: OctreeConfig) -> Vec<SeriesMeshes> {
         let mut out = Vec::with_capacity(self.series.len());
         for (i, s) in self.series.iter().enumerate() {
-            let interfaces = s
-                .model
-                .lithology()
-                .interfaces
+            let ids = s.model.interface_ids();
+            let interfaces = ids
                 .iter()
                 .enumerate()
-                .map(|(k, iv)| {
+                .map(|(k, &iid)| {
                     let mesh = self
                         .mesh_one(i, k, min, size, cfg)
                         .expect("i,k in range by construction");
-                    (iv.interface_id, mesh)
+                    (iid, mesh)
                 })
                 .collect();
             out.push(SeriesMeshes {
@@ -215,12 +223,14 @@ impl Stack {
     }
 }
 
-#[cfg(test)]
+// Builds in-process kernel `Model`s, so native-only.
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
     use crate::assemble::KernelOptions;
     use crate::data::{Orientation, Series, SurfacePoint};
     use crate::mesh::normalize;
+    use crate::Model;
     use std::collections::HashMap;
 
     /// Fit a planar contact `z = z0 + sx*(x-500) + sy*(y-500)` over a [0,1000]² grid
@@ -266,7 +276,7 @@ mod tests {
     /// Assert every interface mesh of every series is strictly watertight
     /// (incidence == 2), at several depths. The combined per-series Scene is a single
     /// sign field, so the watertight guarantee carries over from the octree CSG tests.
-    fn assert_stack_watertight(build: impl Fn() -> Stack, label: &str) {
+    fn assert_stack_watertight(build: impl Fn() -> Stack<Model>, label: &str) {
         for depth in [4u32, 5, 6] {
             let stack = build();
             let meshes = stack.mesh_surfaces([0.0, 0.0, 0.0], 1000.0, cfg(depth));
@@ -295,7 +305,7 @@ mod tests {
     /// is present over the LEFT of the domain and absent over the RIGHT, over an older
     /// flat bed at z=500 (`Basement`). Same geometry for both relations — only the
     /// younger relation changes.
-    fn two_series_stack(younger: Relation) -> Stack {
+    fn two_series_stack(younger: Relation) -> Stack<Model> {
         // Younger contact ~ z = 600 + 0.4*(x-500): below z≈400 at x=0, z≈800 at x=1000.
         let young = dipping_plane(600.0, 0.4, 0.0);
         // Older flat bed at z=500.
@@ -399,7 +409,7 @@ mod tests {
     }
 
     /// Helper: is series `i` of `stack` present at `p`?
-    fn stack_present(stack: &Stack, i: usize, p: [f64; 3]) -> bool {
+    fn stack_present(stack: &Stack<Model>, i: usize, p: [f64; 3]) -> bool {
         stack.series[i].present_at(p)
     }
 

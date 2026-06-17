@@ -19,7 +19,7 @@
 //! memory at the `out_ptr` we pass (an offset into engine memory). From Rust's side they
 //! look like ordinary imports writing to our own pointer.
 
-use crate::{BlockModel, HalfSpace, ScalarField};
+use crate::{BlockModel, HalfSpace, ScalarField, SeriesModel};
 
 const WHOLE_MODEL: u32 = u32::MAX;
 
@@ -185,6 +185,25 @@ impl RemoteModel {
         let mut out = [0.0f64; 2];
         unsafe { gf_diagnostics(self.handle, out.as_mut_ptr() as *mut u8) };
         out
+    }
+}
+
+impl SeriesModel for RemoteModel {
+    type Field<'a> = RemoteField;
+    fn field(&self) -> Self::Field<'_> {
+        self.whole_field()
+    }
+    fn scalar_field(&self, p: [f64; 3]) -> f64 {
+        RemoteModel::scalar_field(self, p)
+    }
+    fn lithology_unit(&self, p: [f64; 3]) -> usize {
+        RemoteModel::lithology_unit(self, p) as usize
+    }
+    fn interface_isovalues(&self) -> Vec<f64> {
+        RemoteModel::interface_isovalues(self)
+    }
+    fn interface_ids(&self) -> Vec<u32> {
+        RemoteModel::interface_ids(self).into_iter().map(|x| x as u32).collect()
     }
 }
 

@@ -15,10 +15,9 @@
 pub mod mesh;
 pub mod octree;
 
-// The multi-series stack (erode/onlap masking) is built on the in-process kernel `Model`
-// and is native-only for now — the web harness drives single `WasmModel`s, not stacks. A
-// wasm stack would need `StackedSeries` ported onto `RemoteModel` (a follow-up).
-#[cfg(not(target_arch = "wasm32"))]
+// The multi-series stack (erode/onlap masking) is generic over `SeriesModel`, so it runs
+// on BOTH targets: over the in-process kernel `Model` natively, and over `RemoteModel`
+// (the wasm import bridge) in the browser.
 pub mod stack;
 
 #[cfg(feature = "wasm")]
@@ -28,7 +27,6 @@ pub mod wasm;
 // are available on BOTH targets (native in-process kernel, and the wasm remote module).
 pub use geofield_types::{HalfSpace, ScalarField};
 
-#[cfg(not(target_arch = "wasm32"))]
 pub use stack::{Relation, Stack, StackedSeries};
 
 // NATIVE ONLY: the in-process kernel. Re-exported so `geofield::Model` / `geofield::data`
@@ -81,6 +79,50 @@ pub trait BlockModel {
     }
     /// The fault half-spaces bounding block `b` (for clipping its mesh to the block).
     fn block_half_spaces(&self, b: usize) -> Vec<HalfSpace>;
+}
+
+/// What the multi-series [`stack::Stack`] needs from a fitted model — the WHOLE-model
+/// oracle (per-block dispatch across any fault) plus its representative interface set.
+/// Abstracted so a `Stack` works over the native kernel [`Model`] and the wasm
+/// [`RemoteModel`] alike. Like [`BlockModel`], returns OWNED interface data so it is safe
+/// across separate wasm instances.
+pub trait SeriesModel {
+    /// The whole-model field oracle as a [`ScalarField`] (per-block dispatch).
+    type Field<'a>: ScalarField
+    where
+        Self: 'a;
+
+    /// Borrow the whole-model field oracle.
+    fn field(&self) -> Self::Field<'_>;
+    /// Scalar field at a world point (whole model, per-block dispatch).
+    fn scalar_field(&self, p: [f64; 3]) -> f64;
+    /// Lithology unit index at a world point (per-block classification).
+    fn lithology_unit(&self, p: [f64; 3]) -> usize;
+    /// Representative interface isovalues (ascending) — the whole-model set.
+    fn interface_isovalues(&self) -> Vec<f64>;
+    /// Representative interface ids, parallel to [`SeriesModel::interface_isovalues`].
+    fn interface_ids(&self) -> Vec<u32>;
+}
+
+/// `geofield_kernel::Model` as a [`SeriesModel`] for the native (in-process) stack path.
+#[cfg(not(target_arch = "wasm32"))]
+impl SeriesModel for Model {
+    type Field<'a> = &'a Model;
+    fn field(&self) -> Self::Field<'_> {
+        self
+    }
+    fn scalar_field(&self, p: [f64; 3]) -> f64 {
+        Model::scalar_field(self, p)
+    }
+    fn lithology_unit(&self, p: [f64; 3]) -> usize {
+        Model::lithology_unit(self, p)
+    }
+    fn interface_isovalues(&self) -> Vec<f64> {
+        self.lithology().interfaces.iter().map(|iv| iv.isovalue).collect()
+    }
+    fn interface_ids(&self) -> Vec<u32> {
+        self.lithology().interfaces.iter().map(|iv| iv.interface_id).collect()
+    }
 }
 
 /// `geofield_kernel::Model` as a [`BlockModel`] for the native (in-process) meshing path.
