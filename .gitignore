@@ -18,3 +18,12 @@ Cargo.lock
 /web/src/wasm
 /web/src/wasm-kernel
 /web/*.tsbuildinfo
+
+# web2 scale benchmark — generated artifacts (wasm, dataset, build output)
+/web2/node_modules
+/web2/dist
+/web2/src/wasm
+/web2/public/geofield_kernel.wasm
+/web2/public/scenario.json
+/web2/package-lock.json
+/web2/*.tsbuildinfo

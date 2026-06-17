@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>geofield — two-wasm scale bench</title>
+    <style>
+      body { font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; margin: 1.5rem; color: #ddd; background: #1a1a1a; }
+      h1 { font-size: 1.1rem; } h2 { font-size: 0.95rem; margin-top: 1.5rem; color: #9cf; }
+      table { border-collapse: collapse; margin: 0.5rem 0; }
+      th, td { border: 1px solid #444; padding: 2px 10px; text-align: right; }
+      th { background: #2a2a2a; } td:first-child, th:first-child { text-align: left; }
+      #status { color: #fc6; } .num { color: #9f9; }
+      button { font: inherit; padding: 4px 12px; background: #2a4; color: #fff; border: 0; border-radius: 3px; cursor: pointer; }
+      pre { white-space: pre-wrap; }
+    </style>
+  </head>
+  <body>
+    <h1>geofield — two-wasm scale bench</h1>
+    <p>Loads the EUPL kernel + BSD engine as two wasm modules, fits the scenario stack
+       across the boundary, and times fit + mesh at increasing octree depth.</p>
+    <button id="run">Run benchmark</button>
+    <div id="status"></div>
+    <div id="out"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

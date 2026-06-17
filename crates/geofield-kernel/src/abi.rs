@@ -26,6 +26,39 @@ thread_local! {
 
 const WHOLE_MODEL: u32 = u32::MAX;
 
+// Optional boundary-crossing instrumentation (feature = "wasm-abi-stats"). Counts every
+// gf_eval / gf_eval_grad — the per-sample wasm-module-boundary calls the octree makes —
+// so the web2 harness can report how many crossings a mesh costs.
+#[cfg(feature = "wasm-abi-stats")]
+thread_local! {
+    static EVAL_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[inline(always)]
+fn bump_eval_count() {
+    #[cfg(feature = "wasm-abi-stats")]
+    EVAL_COUNT.with(|c| c.set(c.get() + 1));
+}
+
+/// Total field evals (gf_eval + gf_eval_grad) since the last reset. Always present so the
+/// host can call it unconditionally; returns 0 when stats are disabled.
+#[no_mangle]
+pub extern "C" fn gf_eval_count() -> u64 {
+    #[cfg(feature = "wasm-abi-stats")]
+    {
+        return EVAL_COUNT.with(|c| c.get());
+    }
+    #[cfg(not(feature = "wasm-abi-stats"))]
+    0
+}
+
+/// Reset the field-eval counter to 0 (no-op when stats are disabled).
+#[no_mangle]
+pub extern "C" fn gf_eval_count_reset() {
+    #[cfg(feature = "wasm-abi-stats")]
+    EVAL_COUNT.with(|c| c.set(0));
+}
+
 fn put_model(m: Model) -> u32 {
     MODELS.with(|s| {
         let mut s = s.borrow_mut();
@@ -199,6 +232,7 @@ pub unsafe extern "C" fn gf_fit_faulted(ptr: *const u8, len_f64: usize) -> u32 {
 /// field. Returns `+∞` for a stale handle / field-less block.
 #[no_mangle]
 pub extern "C" fn gf_eval(handle: u32, block: u32, x: f64, y: f64, z: f64) -> f64 {
+    bump_eval_count();
     with_model(handle, f64::INFINITY, |m| {
         if block == WHOLE_MODEL {
             m.scalar_field([x, y, z])
@@ -217,6 +251,7 @@ pub extern "C" fn gf_eval(handle: u32, block: u32, x: f64, y: f64, z: f64) -> f6
 /// `out_ptr` must point to 24 valid writable bytes in kernel memory.
 #[no_mangle]
 pub unsafe extern "C" fn gf_eval_grad(handle: u32, block: u32, x: f64, y: f64, z: f64, out_ptr: *mut u8) {
+    bump_eval_count();
     let g = with_model(handle, [0.0; 3], |m| {
         if block == WHOLE_MODEL {
             m.scalar_field_gradient([x, y, z])

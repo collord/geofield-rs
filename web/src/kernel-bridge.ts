@@ -40,6 +40,10 @@ interface KernelExports {
   gf_interface_ids(handle: number, outPtr: number, cap: number): number;
   gf_diagnostics(handle: number, outPtr: number): void;
   gf_release(handle: number): void;
+  // Optional instrumentation (feature = "wasm-abi-stats"). Present unconditionally in the
+  // kernel ABI; gf_eval_count returns 0 when the feature is off.
+  gf_eval_count(): bigint;
+  gf_eval_count_reset(): void;
 }
 
 let kernel: KernelExports | null = null;
@@ -69,6 +73,16 @@ export async function initKernel(wasmUrl: string | URL): Promise<void> {
 function k(): KernelExports {
   if (!kernel) throw new Error("kernel wasm not initialized — call initKernel() first");
   return kernel;
+}
+
+/** Total field evals (gf_eval + gf_eval_grad) since the last reset — the per-sample
+ *  wasm-module-boundary crossings. Returns 0 if the kernel was built without
+ *  `wasm-abi-stats`. For the web2 scale harness. */
+export function evalCount(): number {
+  return Number(k().gf_eval_count());
+}
+export function evalCountReset(): void {
+  k().gf_eval_count_reset();
 }
 
 // Scratch buffer in KERNEL memory for bridged reads (grown on demand).
