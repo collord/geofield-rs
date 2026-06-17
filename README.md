@@ -251,4 +251,19 @@ geometric effect.
 
 ## License
 
-MIT OR Apache-2.0
+This workspace is split-licensed by crate, to keep the GemPy-derived interpolation
+math separable from the independent meshing engine:
+
+| Crate | Licence | What it is |
+|-------|---------|------------|
+| `geofield-kernel` | **EUPL-1.2** | The universal-cokriging scalar-field kernel (re-derived from GemPy). |
+| `geofield` | **BSD-3-Clause** | The meshing/contouring engine + WASM bindings. Independent work. |
+| `geofield-types` | **BSD-3-Clause** | The interface-only crate (`ScalarField`, `HalfSpace`) both depend on. |
+
+In the browser the two ship as **separate WebAssembly artifacts** —
+`geofield_kernel.wasm` (EUPL) and `geofield.wasm` (BSD) — wired at load time by the
+host. The engine does not link or embed the kernel in its wasm build; it reaches the
+kernel's field oracle across a WebAssembly module boundary (runtime imports), so
+`geofield.wasm` contains no EUPL-covered code and the EUPL obligations travel only with
+`geofield_kernel.wasm`. See `web/public/NOTICE.txt` (shipped to the web bundle) and each
+crate's `LICENSE`.

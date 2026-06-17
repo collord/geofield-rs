@@ -3,7 +3,7 @@ name = "geofield-kernel"
 version = "0.1.0"
 edition = "2021"
 description = "Universal-cokriging scalar field — the gempy-validated interpolation kernel (assemble, solve, evaluate, lithology), plus the fitted Model and field-level faults. WASM-safe; no meshing."
-license = "EUPL"
+license = "EUPL-1.2"
 
 [dependencies]
 # The permissive interface crate (ScalarField, HalfSpace). Both the kernel and the

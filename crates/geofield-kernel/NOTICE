@@ -1,0 +1,18 @@
+geofield-kernel — universal-cokriging scalar field (the gempy-validated kernel)
+
+Copyright (c) 2026 <YOUR NAME>
+
+Licensed under the EUPL-1.2 only.
+
+This crate's interpolation kernel (assemble / solve / evaluate / lithology) is
+re-derived from GemPy's universal-cokriging math; per the project's licensing
+posture it is distributed under the European Union Public Licence v. 1.2 (the
+full text is in the LICENSE file beside this notice).
+
+Distribution note (the two-wasm split):
+This crate compiles into its OWN artifact — `geofield_kernel.wasm` — which is the
+ONLY place its compiled code appears. The sibling `geofield` crate (BSD-3-Clause)
+does NOT link or embed this crate in its WebAssembly build; it reaches this
+kernel's field oracle across a WebAssembly module boundary (runtime imports), so
+`geofield.wasm` contains none of this EUPL-covered code. The two are separate
+works combined only at load time by the host, each governed by its own licence.
