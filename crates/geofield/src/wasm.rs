@@ -63,6 +63,7 @@ fn build_fit_buffer(
     gi_res: f64,
     uni_degree: u32,
     nugget: f64,
+    decimate_frac: f64,
     fault: Option<([f64; 3], [f64; 3])>,
 ) -> Result<Vec<f64>, JsError> {
     if !sp_xyz.len().is_multiple_of(3)
@@ -80,7 +81,11 @@ fn build_fit_buffer(
         return Err(JsError::new("ori_xyz and ori_pole must have equal length"));
     }
 
-    let mut buf = Vec::with_capacity(9 + 4 * n_sp + 6 * n_ori + 6);
+    // Decimation: `decimate_frac` > 0 enables the coreset with that re-add threshold
+    // (fraction of the field's isovalue range); NaN / ≤ 0 disables it (keep all points).
+    let dec_on = decimate_frac.is_finite() && decimate_frac > 0.0;
+
+    let mut buf = Vec::with_capacity(13 + 4 * n_sp + 6 * n_ori + 6);
     buf.push(n_sp as f64);
     buf.push(n_ori as f64);
     buf.push(range);
@@ -90,6 +95,10 @@ fn build_fit_buffer(
     buf.push(uni_degree as f64);
     buf.push(nugget); // grad_nugget
     buf.push(nugget); // sp_nugget
+    buf.push(if dec_on { 1.0 } else { 0.0 }); // decimate_on
+    buf.push(f64::NAN); // seed_cell → kernel default
+    buf.push(if dec_on { decimate_frac } else { f64::NAN }); // threshold_frac
+    buf.push(f64::NAN); // point_budget → default (none)
     buf.extend_from_slice(sp_xyz);
     buf.extend_from_slice(sp_interface);
     buf.extend_from_slice(ori_xyz);
@@ -205,11 +214,12 @@ impl WasmModel {
         gi_res: f64,
         uni_degree: u32,
         nugget: f64,
+        decimate_frac: f64,
     ) -> Result<WasmModel, JsError> {
         install_panic_hook();
         let buf = build_fit_buffer(
             sp_xyz, sp_interface, ori_xyz, ori_pole, range, c_o, i_res, gi_res, uni_degree,
-            nugget, None,
+            nugget, decimate_frac, None,
         )?;
         Ok(WasmModel { inner: remote::fit(&buf) })
     }
@@ -230,6 +240,7 @@ impl WasmModel {
         gi_res: f64,
         uni_degree: u32,
         nugget: f64,
+        decimate_frac: f64,
         fault_point: &[f64],
         fault_normal: &[f64],
     ) -> Result<WasmModel, JsError> {
@@ -237,7 +248,7 @@ impl WasmModel {
         let fault = fault_from_flat(fault_point, fault_normal);
         let buf = build_fit_buffer(
             sp_xyz, sp_interface, ori_xyz, ori_pole, range, c_o, i_res, gi_res, uni_degree,
-            nugget, fault,
+            nugget, decimate_frac, fault,
         )?;
         // A degenerate fault → no trailing plane → kernel falls back to a plain fit, so
         // `gf_fit_faulted` is still safe to call (it tolerates a missing/zero plane).
@@ -430,6 +441,7 @@ impl WasmStack {
         uni_degree: u32,
         nugget: f64,
         relation: u32,
+        decimate_frac: f64,
         fault_point: &[f64],
         fault_normal: &[f64],
     ) -> Result<(), JsError> {
@@ -437,7 +449,7 @@ impl WasmStack {
         let fault = fault_from_flat(fault_point, fault_normal);
         let buf = build_fit_buffer(
             sp_xyz, sp_interface, ori_xyz, ori_pole, range, c_o, i_res, gi_res, uni_degree,
-            nugget, fault,
+            nugget, decimate_frac, fault,
         )?;
         let model = if fault.is_some() {
             remote::fit_faulted(&buf)

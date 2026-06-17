@@ -204,6 +204,7 @@ export function solveAndMesh(
         NAN,
         1,
         NAN,
+        NAN, // decimate_frac: off (this harness fits modest point counts)
         new Float64Array(fault.point),
         new Float64Array(fault.normal),
       );
@@ -219,6 +220,7 @@ export function solveAndMesh(
         NAN,
         1,
         NAN,
+        NAN, // decimate_frac: off
       );
     }
   } catch (e) {

@@ -45,9 +45,11 @@ function f64(a: number[]): Float64Array {
   return new Float64Array(a);
 }
 
-/** Build the WasmStack from the scenario, youngest series first. Returns the stack and
- *  the wall-ms spent in each series' fit (the cross-boundary kernel solve). */
-function buildStack(scn: Scenario): { stack: WasmStack; fitMs: number[] } {
+/** Build the WasmStack from the scenario, youngest series first. `decimateFrac` > 0
+ *  enables the kernel's residual-guided point decimation (re-add threshold = that
+ *  fraction of the field's isovalue range); NaN = keep all points (full solve). Returns
+ *  the stack and the wall-ms spent in each series' fit (the cross-boundary kernel solve). */
+function buildStack(scn: Scenario, decimateFrac: number): { stack: WasmStack; fitMs: number[] } {
   const stack = new WasmStack();
   const fitMs: number[] = [];
   for (const s of scn.series) {
@@ -58,6 +60,7 @@ function buildStack(scn: Scenario): { stack: WasmStack; fitMs: number[] } {
       f64(s.sp_xyz), f64(s.sp_if), f64(s.ori_xyz), f64(s.ori_pole),
       NAN, NAN, NAN, NAN, 1, NAN,
       s.relation,
+      decimateFrac,
       f64(fp), f64(fn),
     );
     fitMs.push(now() - t0);
@@ -115,10 +118,21 @@ async function run() {
   const scn: Scenario = await (await fetch("/scenario.json")).json();
 
   const totalSp = scn.series.reduce((a, s) => a + s.sp_if.length, 0);
-  status(`fitting ${scn.series.length} series (${totalSp} surface points)…`);
-  const t0 = now();
-  const { stack, fitMs } = buildStack(scn);
-  const totalFit = now() - t0;
+
+  // Fit FULL (no decimation) for the baseline, then DECIMATED for the speedup. The
+  // decimated stack is the one we mesh (it's what an app would ship).
+  status(`fitting FULL (${scn.series.length} series, ${totalSp} surface points)…`);
+  const tF = now();
+  const full = buildStack(scn, NAN);
+  const fullFit = now() - tF;
+  await new Promise((r) => setTimeout(r, 0));
+
+  const DECIMATE_FRAC = 0.2; // re-add threshold = 20% of the field's isovalue range
+  status(`fitting DECIMATED (frac ${DECIMATE_FRAC})…`);
+  const tD = now();
+  const { stack, fitMs } = buildStack(scn, DECIMATE_FRAC);
+  const decFit = now() - tD;
+  const totalFit = decFit;
 
   // Depth sweep.
   const depths = [4, 5, 6, 7];
@@ -141,10 +155,17 @@ ${JSON.stringify(scn.stats)}</pre>`;
 
   html += `<h2>Fit (cross-boundary cokriging solve, per series)</h2>`;
   html += table(
-    ["series", "points", "fit ms"],
-    scn.series.map((s, i) => [s.name, s.sp_if.length, fitMs[i].toFixed(1)]),
+    ["series", "points", "full fit ms", "decimated fit ms"],
+    scn.series.map((s, i) => [
+      s.name, s.sp_if.length, full.fitMs[i].toFixed(1), fitMs[i].toFixed(1),
+    ]),
   );
-  html += `<p>total fit: <span class="num">${totalFit.toFixed(1)} ms</span></p>`;
+  const speedup = decFit > 0 ? (fullFit / decFit) : 0;
+  html += `<p>total fit: full <span class="num">${fullFit.toFixed(1)} ms</span>
+    → decimated (frac ${DECIMATE_FRAC}) <span class="num">${decFit.toFixed(1)} ms</span>
+    = <span class="num">${speedup.toFixed(1)}× faster</span>.
+    Decimation re-adds only points the coarse field mis-predicts by &gt; ${DECIMATE_FRAC}·(isovalue range),
+    so the geology is honored to that tolerance.</p>`;
 
   html += `<h2>Mesh — octree depth sweep (all series × interfaces)</h2>`;
   html += table(

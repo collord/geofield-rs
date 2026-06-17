@@ -127,9 +127,12 @@ unsafe fn read_f64s(ptr: *const u8, n: usize) -> Vec<f64> {
 // ---------------------------------------------------------------------------
 // Input decoding. The host stages one f64 buffer laid out as:
 //   [n_sp, n_ori,  range, c_o, i_res, gi_res, uni_degree, grad_nugget, sp_nugget,
+//    decimate_on, seed_cell, threshold_frac, point_budget,
 //    sp_xyz (3*n_sp), sp_if (n_sp), ori_xyz (3*n_ori), ori_pole (3*n_ori)]
-// (everything as f64 — ids/degree are small integers carried losslessly). A trailing
-// optional fault plane (6 f64: point xyz + normal xyz) is read by `gf_fit_faulted`.
+// (everything as f64 — ids/degree/budget are small integers carried losslessly). A
+// trailing optional fault plane (6 f64: point xyz + normal xyz) is read by
+// `gf_fit_faulted`. `decimate_on` ≠ 0 enables the coreset; NaN seed_cell/threshold use
+// the DecimateConfig defaults.
 // ---------------------------------------------------------------------------
 
 struct FitInput {
@@ -146,6 +149,17 @@ unsafe fn decode_fit(ptr: *const u8, len_f64: usize) -> FitInput {
     let n_ori = v[1] as usize;
     let d = KernelOptions::default();
     let or = |x: f64, dflt: f64| if x.is_nan() { dflt } else { x };
+    let dd = crate::assemble::DecimateConfig::default();
+    let decimate = if v[9] != 0.0 && !v[9].is_nan() {
+        Some(crate::assemble::DecimateConfig {
+            seed_cell: or(v[10], dd.seed_cell),
+            threshold_frac: or(v[11], dd.threshold_frac),
+            point_budget: if v[12].is_nan() || v[12] < 0.0 { dd.point_budget } else { v[12] as usize },
+            max_iters: dd.max_iters,
+        })
+    } else {
+        None
+    };
     let opts = KernelOptions {
         range: or(v[2], d.range),
         c_o: or(v[3], d.c_o),
@@ -154,8 +168,9 @@ unsafe fn decode_fit(ptr: *const u8, len_f64: usize) -> FitInput {
         uni_degree: if v[6] as u32 == 0 { d.uni_degree } else { v[6] as u32 },
         grad_nugget: or(v[7], d.grad_nugget),
         sp_nugget: or(v[8], d.sp_nugget),
+        decimate,
     };
-    let mut off = 9;
+    let mut off = 13;
     let sps: Vec<SurfacePoint> = (0..n_sp)
         .map(|i| {
             let p = [v[off + 3 * i], v[off + 3 * i + 1], v[off + 3 * i + 2]];
