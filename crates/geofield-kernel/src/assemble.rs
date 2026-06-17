@@ -19,6 +19,48 @@ use crate::geometry::{
 use crate::kernel::{cubic_a, cubic_c, cubic_p_div_r};
 
 /// Live kernel options (read from the validation fixture, never hardcoded in
+/// Iterative, residual-guided surface-point decimation (a kriging "coreset").
+///
+/// Borehole datasets oversample smooth contacts: thousands of nearly-redundant points
+/// blow up the dense cokriging matrix (~N³ solve) AND wreck its conditioning (the
+/// near-redundant rows form a large near-null-space). This thins the points WITHOUT
+/// discarding information: fit a coarse seed subset, then **re-add only the points the
+/// coarse field mis-predicts** by more than `threshold_frac · isovalue_spread` (the
+/// fold hinges / anomalies the seed missed), and iterate. A point in a flat redundant
+/// cluster has ~zero residual against the coarse field and stays out; a genuinely
+/// informative point always generates residual and is kept. The data is honored to a
+/// tolerance, not uniformly subsampled.
+///
+/// `None` decimation (the default) keeps ALL points — the gempy-bit-exact path the
+/// validation suite pins.
+#[derive(Debug, Clone, Copy)]
+pub struct DecimateConfig {
+    /// Seed grid cell size in NORMALIZED coordinates (the rescaled box has side ~0.5).
+    /// One seed point per occupied cell per interface; the interface reference point is
+    /// always kept. ~`range/20` (e.g. 0.08) is a reasonable coarse seed.
+    pub seed_cell: f64,
+    /// Re-add threshold as a fraction of the interface's recovered isovalue spread: a
+    /// point omitted from the current fit is re-added if the field mis-predicts it by
+    /// more than `threshold_frac · spread`. Smaller → keep more points (closer to exact).
+    pub threshold_frac: f64,
+    /// Hard cap on kept points per block (stops the loop even if residuals remain). The
+    /// solve cost bound. `0` = no budget.
+    pub point_budget: usize,
+    /// Max re-add iterations (each one refits). Small (3–6) is plenty in practice.
+    pub max_iters: usize,
+}
+
+impl Default for DecimateConfig {
+    fn default() -> Self {
+        Self {
+            seed_cell: 0.08,
+            threshold_frac: 0.1,
+            point_budget: 0,
+            max_iters: 5,
+        }
+    }
+}
+
 /// tests — KERNEL_MATH.md §7). Defaults mirror gempy's octree defaults.
 #[derive(Debug, Clone, Copy)]
 pub struct KernelOptions {
@@ -36,6 +78,9 @@ pub struct KernelOptions {
     pub grad_nugget: f64,
     /// Nugget added on the surface-point sub-block diagonal.
     pub sp_nugget: f64,
+    /// Optional iterative surface-point decimation. `None` keeps all points (gempy
+    /// bit-exact); `Some` thins them via the residual-guided coreset.
+    pub decimate: Option<DecimateConfig>,
 }
 
 impl Default for KernelOptions {
@@ -48,6 +93,7 @@ impl Default for KernelOptions {
             uni_degree: 1,
             grad_nugget: 1e-5,
             sp_nugget: 1e-5,
+            decimate: None,
         }
     }
 }

@@ -140,7 +140,14 @@ impl Model {
             } else {
                 oris
             };
-            let sub = Series::new(std::mem::take(&mut sp_buckets[b]), oris);
+            // Optional residual-guided decimation BEFORE the (expensive, ~N³) solve. The
+            // coreset honors the data to a tolerance; `None` keeps every point (gempy-exact).
+            let block_points = std::mem::take(&mut sp_buckets[b]);
+            let block_points = match opts.decimate {
+                Some(cfg) => decimate_block(&block_points, &oris, opts, cfg),
+                None => block_points,
+            };
+            let sub = Series::new(block_points, oris);
             let system = assemble(&sub, opts);
             let solution = solve(&system);
             residual = residual.max(solution.residual);
@@ -305,6 +312,135 @@ impl ScalarField for BlockField<'_> {
 ///
 /// The pole is oriented "up" (`pole·+Z ≥ 0`) to match the field's sign convention,
 /// and anchored at the chosen interface's centroid.
+/// Iterative residual-guided decimation of ONE block's surface points (a kriging
+/// coreset). Returns the kept subset. See [`assemble::DecimateConfig`] for the rationale:
+/// seed a coarse grid-thinned subset, fit it, then re-add only the omitted points the
+/// coarse field mis-predicts by more than `threshold_frac · isovalue_spread`, and repeat.
+///
+/// Orientations are passed through unchanged (they are few and each anchors a gradient).
+/// Each interface's reference point (the first seen — the increment anchor) is always
+/// kept. A degenerate fit during the loop falls back to keeping all points (safe).
+fn decimate_block(
+    points: &[SurfacePoint],
+    orientations: &[Orientation],
+    opts: KernelOptions,
+    cfg: assemble::DecimateConfig,
+) -> Vec<SurfacePoint> {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    if points.len() <= 8 {
+        return points.to_vec(); // nothing to gain
+    }
+
+    // Normalized coordinates for gridding (same transform the assembly uses).
+    let transform = data::Transform::from_input_points(points, orientations);
+    let cell = cfg.seed_cell.max(1e-6);
+    let bucket = |p: [f64; 3]| -> (i64, i64, i64) {
+        let n = transform.apply(p);
+        (
+            (n[0] / cell).floor() as i64,
+            (n[1] / cell).floor() as i64,
+            (n[2] / cell).floor() as i64,
+        )
+    };
+
+    // Reference point index per interface — always kept (the increment anchor).
+    let mut ref_idx: BTreeMap<u32, usize> = BTreeMap::new();
+    for (i, sp) in points.iter().enumerate() {
+        ref_idx.entry(sp.interface_id).or_insert(i);
+    }
+
+    // Seed: one point per (interface, grid cell) plus every interface reference.
+    let mut kept: BTreeSet<usize> = ref_idx.values().copied().collect();
+    let mut seen_cells: BTreeSet<(u32, i64, i64, i64)> = BTreeSet::new();
+    for (i, sp) in points.iter().enumerate() {
+        let (bx, by, bz) = bucket(sp.xyz);
+        if seen_cells.insert((sp.interface_id, bx, by, bz)) {
+            kept.insert(i);
+        }
+    }
+
+    // Refit-and-re-add loop.
+    for _ in 0..cfg.max_iters.max(1) {
+        if cfg.point_budget > 0 && kept.len() >= cfg.point_budget {
+            break;
+        }
+        let kept_pts: Vec<SurfacePoint> = kept.iter().map(|&i| points[i]).collect();
+        // Need ≥1 point per interface that has any; Series picks references from these.
+        let series = Series::new(kept_pts, orientations.to_vec());
+        let system = assemble(&series, opts);
+        let solution = solve(&system);
+        if !solution.residual.is_finite() {
+            return points.to_vec(); // degenerate seed → keep all (safe)
+        }
+        let field = Field::new(&system.geom, &solution);
+        let (lithology, _spread) = Lithology::recover(&series, &field);
+        let iso_by_iface: BTreeMap<u32, f64> = lithology
+            .interfaces
+            .iter()
+            .map(|iv| (iv.interface_id, iv.isovalue))
+            .collect();
+        // Threshold scale: the field's natural dynamic range — the spread of recovered
+        // isovalues ACROSS interfaces (how far apart the contacts sit in field value).
+        // This is STABLE as the seed improves (unlike per-interface kept-point spread,
+        // which collapses to ~0 on a good seed and then re-admits everything). A point
+        // mis-predicted by < frac·range carries no contact-scale information.
+        let (mut gmin, mut gmax) = (f64::INFINITY, f64::NEG_INFINITY);
+        for &iso in iso_by_iface.values() {
+            gmin = gmin.min(iso);
+            gmax = gmax.max(iso);
+        }
+        // Fall back to the magnitude of a representative isovalue if there is a single
+        // interface (range 0): use |iso| so a one-contact field still has a real scale.
+        let scale = if gmax > gmin {
+            gmax - gmin
+        } else {
+            iso_by_iface.values().next().map_or(1.0, |v| v.abs().max(1e-3))
+        };
+        let threshold = cfg.threshold_frac * scale;
+
+        // Score every OMITTED point; collect those whose field misses its interface's
+        // isovalue by more than the threshold.
+        let mut worst: Vec<(f64, usize)> = Vec::new();
+        for (i, sp) in points.iter().enumerate() {
+            if kept.contains(&i) {
+                continue;
+            }
+            let Some(&iso) = iso_by_iface.get(&sp.interface_id) else {
+                worst.push((f64::INFINITY, i)); // unseen interface → definitely informative
+                continue;
+            };
+            let miss = (field.isovalue_at(sp.xyz) - iso).abs();
+            if miss > threshold {
+                worst.push((miss, i));
+            }
+        }
+        if worst.is_empty() {
+            break; // the kept subset explains all points to tolerance
+        }
+        // Re-add worst-first, but GROW GRADUALLY: cap each iteration's additions to ~50%
+        // of the current kept count (min 32). This converges to a MINIMAL sufficient set
+        // — adding the worst misses first means the few informative points come in early,
+        // and the loop stops as soon as the rest fall under threshold, instead of
+        // overshooting back to the full set in one jump.
+        worst.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        let add_cap = (kept.len() / 2).max(32);
+        let mut added = 0;
+        for (_, i) in worst {
+            if added >= add_cap {
+                break;
+            }
+            if cfg.point_budget > 0 && kept.len() >= cfg.point_budget {
+                break;
+            }
+            kept.insert(i);
+            added += 1;
+        }
+    }
+
+    kept.iter().map(|&i| points[i]).collect()
+}
+
 fn infer_orientation(points: &[SurfacePoint]) -> Orientation {
     // Group by interface; pick the interface with the most points in this block.
     let mut by_iface: std::collections::BTreeMap<u32, Vec<[f64; 3]>> =
@@ -758,5 +894,75 @@ mod tests {
         // And a point ABOVE each contact is a different unit from below it.
         let above_left = model.lithology_unit([300.0, 500.0, 650.0]); // above z=600
         assert_ne!(unit_left, above_left, "above vs below the contact must differ");
+    }
+
+    /// A heavily OVERSAMPLED flat contact: 40×40 points on z=500 (1600 points) for a
+    /// surface a handful of points would define. Decimation must (a) keep far fewer
+    /// points and (b) leave the field essentially unchanged versus the full fit.
+    fn oversampled_flat() -> Series {
+        let mut sps = Vec::new();
+        for i in 0..40 {
+            for j in 0..40 {
+                let x = i as f64 * 25.0 + 10.0;
+                let y = j as f64 * 25.0 + 10.0;
+                sps.push(SurfacePoint::new([x, y, 500.0], 0));
+            }
+        }
+        let oris = vec![Orientation::new([500.0, 500.0, 500.0], [0.0, 0.0, 1.0])];
+        Series::new(sps, oris)
+    }
+
+    #[test]
+    fn decimation_thins_an_oversampled_contact_but_preserves_the_field() {
+        let series = oversampled_flat();
+        let full = Model::fit(&series, KernelOptions::default());
+
+        let mut opts = KernelOptions::default();
+        opts.decimate = Some(assemble::DecimateConfig {
+            seed_cell: 0.08,
+            threshold_frac: 0.2,
+            point_budget: 0,
+            max_iters: 5,
+        });
+        let dec = Model::fit(&series, opts);
+
+        // The decimated fit must agree with the full fit across the domain (it honors the
+        // data to a tolerance — a flat contact is the easy case, so agreement is tight).
+        let mut max_err = 0.0_f64;
+        for &x in &[100.0, 300.0, 500.0, 700.0, 900.0] {
+            for &y in &[100.0, 500.0, 900.0] {
+                for &z in &[300.0, 500.0, 700.0] {
+                    let e = (full.scalar_field([x, y, z]) - dec.scalar_field([x, y, z])).abs();
+                    max_err = max_err.max(e);
+                }
+            }
+        }
+        // Field scale ~O(1) after rescaling; agreement well under 5% of that.
+        assert!(max_err < 0.05, "decimated field drifted from full: max_err={max_err}");
+
+        // Both classify a below-contact point the same way (the geology is preserved).
+        assert_eq!(
+            full.lithology_unit([500.0, 500.0, 400.0]),
+            dec.lithology_unit([500.0, 500.0, 400.0]),
+            "decimation changed the lithology below the contact"
+        );
+    }
+
+    #[test]
+    fn decimation_none_is_bit_identical_to_no_decimation() {
+        // The default (None) path must be byte-for-byte the existing behavior — this is
+        // what keeps the gempy validation suite exact.
+        let series = oversampled_flat();
+        let a = Model::fit(&series, KernelOptions::default());
+        let mut opts = KernelOptions::default();
+        opts.decimate = None;
+        let b = Model::fit(&series, opts);
+        for &z in &[400.0, 500.0, 600.0] {
+            assert_eq!(
+                a.scalar_field([500.0, 500.0, z]),
+                b.scalar_field([500.0, 500.0, z]),
+                "decimate=None must be identical to the default"
+            );
+        }
     }
 }

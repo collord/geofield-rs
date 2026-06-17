@@ -130,6 +130,7 @@ fn load_inputs(dir: &Path) -> Option<(Series, KernelOptions)> {
         uni_degree: ko["uni_degree"].as_u64().unwrap_or(1) as u32,
         grad_nugget: f("grad_nugget", ko["nugget"].as_f64().unwrap_or(1e-5)),
         sp_nugget: f("sp_nugget", ko["nugget"].as_f64().unwrap_or(1e-5)),
+        decimate: None,
     };
     Some((Series::new(sps, oris), opts))
 }
