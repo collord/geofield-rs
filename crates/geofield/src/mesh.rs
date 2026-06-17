@@ -14,7 +14,7 @@
 //! Output is a triangle mesh: a flat `Vec<f32>` of vertex positions (`3*V`) and a
 //! flat `Vec<u32>` of triangle indices (`3*T`), ready for a GPU buffer.
 
-use geofield_kernel::ScalarField;
+use geofield_types::ScalarField;
 
 /// An axis-aligned sampling box and resolution for dual contouring.
 #[derive(Debug, Clone, Copy)]

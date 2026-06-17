@@ -54,11 +54,12 @@
 
 use crate::mesh::{corner_offset, normalize, qef_vertex, Mesh, CELL_EDGES};
 
-/// The contourer samples a scalar field through the kernel's [`ScalarField`] contract
-/// (value + analytic gradient at a world point). Implemented by the kernel's `Model`
-/// (per-block dispatch) and its `BlockField` (one block's smooth field), so the octree
-/// can mesh the whole faulted model or one block in isolation.
-pub use geofield_kernel::ScalarField;
+/// The contourer samples a scalar field through the [`ScalarField`] oracle contract
+/// (value + analytic gradient at a world point) — defined in the permissive
+/// `geofield-types` interface crate. In-process it is the kernel's `Model`/`BlockField`;
+/// in the browser it is a `RemoteField` forwarding to the kernel wasm module. Either way
+/// the octree is generic over `&dyn ScalarField` and unchanged.
+pub use geofield_types::ScalarField;
 
 // ---------------------------------------------------------------------------
 // Boundary: the domain wall as just-another-implicit-surface.

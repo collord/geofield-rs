@@ -35,15 +35,11 @@ use solve::{solve, Solution};
 
 pub use fault::{FaultStack, OneFault, PlanarFault};
 
-/// A scalar field the contourer can sample: the value and analytic gradient at a
-/// world point. Implemented by [`Model`] (which dispatches per fault block) and
-/// by a single-block view, so the contourer can mesh either the whole faulted model or
-/// ONE block's smooth field in isolation (the latter avoids the cross-fault
-/// discontinuity that crumples the contact at the fault).
-pub trait ScalarField {
-    fn scalar_field(&self, p: [f64; 3]) -> f64;
-    fn scalar_field_gradient(&self, p: [f64; 3]) -> [f64; 3];
-}
+/// The field-oracle contract — defined in the permissive `geofield-types` interface
+/// crate (the boundary between this EUPL kernel and the BSD meshing engine), re-exported
+/// here so kernel callers keep using `geofield_kernel::ScalarField`. Implemented below by
+/// [`Model`] (per-block dispatch) and [`BlockField`] (one block's smooth field).
+pub use geofield_types::ScalarField;
 
 /// A potential field solved independently over one fault-bounded **block** —
 /// its assembled system, solved weights, and the lithology isovalues recovered from

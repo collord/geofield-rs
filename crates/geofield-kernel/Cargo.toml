@@ -6,6 +6,9 @@ description = "Universal-cokriging scalar field — the gempy-validated interpol
 license = "EUPL"
 
 [dependencies]
+# The permissive interface crate (ScalarField, HalfSpace). Both the kernel and the
+# engine depend on this; neither depends on the other.
+geofield-types = { path = "../geofield-types" }
 # Trimmed faer: std + dense linalg + npy (no rand/getrandom → wasm-safe). See the
 # root README/Cargo history for why each feature is set. The Bunch-Kaufman solver
 # lives under `linalg`.

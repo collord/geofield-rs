@@ -2,22 +2,33 @@
 name = "geofield"
 version = "0.1.0"
 edition = "2021"
-description = "Geological meshing on top of geofield-kernel: adaptive octree dual contouring, multi-series stacking, per-block fault meshing, and WASM bindings."
-license = "MIT OR Apache-2.0"
+description = "Geological meshing engine: adaptive octree dual contouring, multi-series stacking, per-block fault meshing, WASM bindings. Queries the cokriging field through the geofield-types ScalarField oracle — across a wasm module boundary in the browser, in-process for native tests/CLI."
+# BSD: this crate is independent work. It does NOT embed the EUPL kernel in its wasm
+# artifact — the field oracle is reached across a wasm-module boundary (imports), so
+# geofield.wasm contains no gempy-derived code. (See the cfg-gated native dep below.)
+license = "BSD-3-Clause"
 
 [dependencies]
-geofield-kernel = { path = "../geofield-kernel" }
+# Interface-only types shared with the kernel (ScalarField, HalfSpace). Permissive.
+geofield-types = { path = "../geofield-types" }
 wasm-bindgen = { version = "0.2", optional = true }
 # Fixture I/O for the geofield-cli validation binary (feature = "cli").
 npyz = { version = "0.8", optional = true }
 serde_json = { version = "1", optional = true }
 
+# NATIVE ONLY. The kernel is linked in-process for native tests + the CLI so they can
+# build a real Model and mesh it. This dependency is `cfg(not(wasm32))`, so it is NOT
+# part of the wasm32 build graph — `geofield.wasm` never links the EUPL kernel; the
+# browser reaches the field oracle through wasm IMPORTS instead (see src/remote.rs).
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+geofield-kernel = { path = "../geofield-kernel" }
+
 [features]
 default = []
-# Native builds opt into rayon for parallel BLAS (via the kernel).
-native-parallel = ["geofield-kernel/native-parallel"]
+# Native parallel BLAS (via the kernel, native only).
+native-parallel = []
 wasm = ["dep:wasm-bindgen"]
-# The validation CLI (geofield-cli) reads/writes .npy + .json fixtures.
+# The validation CLI (geofield-cli) reads/writes .npy + .json fixtures (native).
 cli = ["dep:npyz", "dep:serde_json"]
 
 [lib]

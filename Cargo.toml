@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/geofield-kernel", "crates/geofield"]
+members = ["crates/geofield-types", "crates/geofield-kernel", "crates/geofield"]
 resolver = "2"
 
 # Two crates:

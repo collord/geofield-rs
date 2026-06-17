@@ -1,0 +1,11 @@
+[package]
+name = "geofield-types"
+version = "0.1.0"
+edition = "2021"
+description = "Interface types shared across the geofield kernel↔engine wasm-module boundary: the ScalarField oracle trait and plain boundary-data structs. No computation, no gempy-derived content — permissively licensed."
+license = "BSD-3-Clause"
+
+[dependencies]
+
+[lib]
+crate-type = ["rlib"]
