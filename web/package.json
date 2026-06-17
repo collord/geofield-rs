@@ -4,7 +4,9 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "wasm": "wasm-pack build ../crates/geofield --target web --out-dir ../../web/src/wasm -- --features wasm",
+    "wasm:kernel": "cargo build -p geofield-kernel --release --target wasm32-unknown-unknown --features wasm-abi && mkdir -p src/wasm-kernel && cp ../target/wasm32-unknown-unknown/release/geofield_kernel.wasm src/wasm-kernel/geofield_kernel.wasm",
+    "wasm:engine": "wasm-pack build ../crates/geofield --release --target web --out-dir ../../web/src/wasm -- --features wasm",
+    "wasm": "npm run wasm:kernel && npm run wasm:engine",
     "dev": "vite",
     "build": "tsc -b && vite build",
     "preview": "vite preview"

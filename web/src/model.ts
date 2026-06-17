@@ -2,6 +2,8 @@
 // isosurface mesh. Mirrors the conversions in src/bin/geofield_cli.rs.
 
 import init, { WasmModel } from "./wasm/geofield.js";
+import { initKernel, setEngineMemory } from "./kernel-bridge";
+import kernelWasmUrl from "./wasm-kernel/geofield_kernel.wasm?url";
 import {
   SurfacePointRow,
   OrientationRow,
@@ -11,9 +13,19 @@ import {
 
 let ready: Promise<void> | null = null;
 
-/** Initialize the WASM module exactly once. */
+/** Initialize BOTH WASM modules exactly once, in order:
+ *   1. the EUPL kernel (geofield_kernel.wasm) — it imports nothing;
+ *   2. the BSD engine (geofield.wasm) — its `"kernel"` imports resolve to the kernel
+ *      bridge, so they must be live before the engine runs any model op.
+ *  Then register the engine's memory so the bridge can copy bytes into it. */
 export function initWasm(): Promise<void> {
-  if (!ready) ready = init().then(() => undefined);
+  if (!ready) {
+    ready = (async () => {
+      await initKernel(kernelWasmUrl);
+      const wasm = await init();
+      setEngineMemory(wasm.memory as WebAssembly.Memory);
+    })();
+  }
   return ready;
 }
 
