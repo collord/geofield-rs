@@ -23,6 +23,11 @@ not on the UI thread — so the page never freezes and a real status stream is p
   The cost is a ~1 s cold wasm re-init on the next run, which is accepted.
 - Surfaces are meshed and streamed **before** the timing sweep, so the geology appears as
   soon as the (fast, decimated) fit completes rather than after the whole benchmark.
+- A faulted contact is meshed **per fault block** (`series → block → interface`), matching
+  the `web/` harness: each block's sheet is contoured from that block's own smooth field and
+  cut flush at the fault plane, so the offset reads as two clean sheets instead of one
+  surface stretched across the discontinuity. `WasmStack.mesh_series_block_interface` /
+  `series_block_count` back this; a non-faulted series is a single block (the whole domain).
 
 ## The scenario
 

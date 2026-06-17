@@ -46,7 +46,7 @@ use crate::mesh::Mesh;
 use crate::octree::{
     octree_dual_contour_scene, AxisBox, Boundary, ContactHalfSpace, OctreeConfig, Scene,
 };
-use crate::SeriesModel;
+use crate::{clip_mesh_to_half_spaces, BlockModel, SeriesModel};
 
 /// How a series relates to the (older) series beneath it (GemPy `StackRelationType`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -220,6 +220,62 @@ impl<M: SeriesModel> Stack<M> {
             });
         }
         out
+    }
+}
+
+impl<M: SeriesModel + BlockModel> Stack<M> {
+    /// Number of fault blocks in series `i` (1 if that series is not faulted). `0` if `i`
+    /// is out of range.
+    pub fn series_block_count(&self, i: usize) -> usize {
+        self.series.get(i).map(|s| s.model.nblocks()).unwrap_or(0)
+    }
+
+    /// Mesh ONE interface of series `i` **within a single fault block `b`** — the
+    /// per-block open-sheet view that matches the `web/` harness: each fault block's
+    /// contact is contoured from that block's OWN smooth field and clipped flush to the
+    /// block's fault half-spaces, so the offset reads as two clean separate sheets rather
+    /// than one surface stretched across the discontinuity.
+    ///
+    /// The block's contact is still clipped to the series' visible region (the domain box
+    /// ∩ outside every younger erosion), exactly as [`Stack::mesh_one`] — only the field
+    /// being contoured is the block field instead of the whole-model field, plus the
+    /// post-hoc fault-plane clip. Returns `None` if `i`/`b`/`interface_idx` is out of
+    /// range or block `b` is field-less.
+    pub fn mesh_one_block(
+        &self,
+        i: usize,
+        b: usize,
+        interface_idx: usize,
+        min: [f64; 3],
+        size: f64,
+        cfg: OctreeConfig,
+    ) -> Option<Mesh> {
+        let s = self.series.get(i)?;
+        // The block carries the same interfaces as the series, at this block's (offset)
+        // isovalue — use the block's own isovalue so the contour lands on the block field.
+        let isovalue = *s.model.block_interface_isovalues(b).get(interface_idx)?;
+        let block_field = s.model.block_field(b)?;
+        let box_b = AxisBox::new(min, size);
+        // Younger-erosion clip half-spaces, exactly as `mesh_one` (whole-model fields —
+        // erosion is geological and dispatches per-block correctly).
+        let masker_fields = self.erode_masker_fields(i);
+        let maskers: Vec<ContactHalfSpace<'_>> = masker_fields
+            .iter()
+            .map(|(field, iso_top)| ContactHalfSpace::new(field, *iso_top, false))
+            .collect();
+        let mut contributors: Vec<&dyn Boundary> = Vec::with_capacity(maskers.len() + 1);
+        contributors.push(&box_b);
+        for m in &maskers {
+            contributors.push(m);
+        }
+        let scene = Scene::new(&block_field, isovalue, contributors);
+        let mut mesh = octree_dual_contour_scene(&scene, min, size, cfg);
+        // Cut the sheet flush at the fault plane(s) bounding this block.
+        let half_spaces = s.model.block_half_spaces(b);
+        if !half_spaces.is_empty() {
+            clip_mesh_to_half_spaces(&mut mesh, &half_spaces);
+        }
+        Some(mesh)
     }
 }
 
@@ -446,5 +502,70 @@ mod tests {
             ])
         };
         assert_stack_watertight(build, "four-series");
+    }
+
+    /// A single-series stack whose one series is FAULTED: a flat contact offset across the
+    /// plane x=500 (z=600 on the left, z=700 on the right — a 100-unit throw), the same
+    /// geometry the kernel's per-block tests use. `nblocks()` is 2.
+    fn faulted_single_series_stack() -> Stack<Model> {
+        use crate::{OneFault, PlanarFault};
+        use crate::data::{Orientation, Series, SurfacePoint};
+        let mut sps = Vec::new();
+        for i in 0..5 {
+            for j in 0..3 {
+                let x = i as f64 * 200.0 + 100.0; // 100,300,500,700,900
+                let y = j as f64 * 300.0 + 200.0;
+                let z = if x < 500.0 { 600.0 } else { 700.0 };
+                sps.push(SurfacePoint::new([x, y, z], 0));
+            }
+        }
+        let oris = vec![
+            Orientation::new([300.0, 500.0, 600.0], [0.0, 0.0, 1.0]),
+            Orientation::new([700.0, 500.0, 700.0], [0.0, 0.0, 1.0]),
+        ];
+        let fault = Box::new(OneFault::new(PlanarFault::new([500.0, 0.0, 0.0], [1.0, 0.0, 0.0])));
+        let model = Model::fit_faulted(&Series::new(sps, oris), fault, KernelOptions::default());
+        Stack::new(vec![StackedSeries::new(model, Relation::Basement)])
+    }
+
+    /// Per-block meshing honors the fault: a faulted series has 2 blocks, and each block's
+    /// contact sheet stays on its OWN side of the fault plane at its OWN offset elevation —
+    /// the offset is rendered as two separate sheets, not one surface stretched across the
+    /// discontinuity. (This is the `web/`-parity property `mesh_one_block` exists to give;
+    /// the whole-domain `mesh_one` would instead bridge the step.)
+    #[test]
+    fn faulted_series_meshes_per_block() {
+        let stack = faulted_single_series_stack();
+        let cfg = OctreeConfig { max_depth: 6, min_depth: 2, qef_threshold: 1e-6, cap: false };
+        assert_eq!(stack.series_block_count(0), 2, "a one-fault series has 2 blocks");
+
+        // Block 0 = left (x<500), contact at z=600; block 1 = right (x>=500), contact z=700.
+        for (b, side_lo, side_hi, expect_z) in [(0usize, 0.0, 500.0, 600.0), (1, 500.0, 1000.0, 700.0)] {
+            let mesh = stack
+                .mesh_one_block(0, b, 0, [0.0, 0.0, 0.0], 1000.0, cfg)
+                .expect("block in range");
+            assert!(mesh.triangle_count() > 0, "block {b} produced an empty mesh");
+            // Contact vertices (near the bed, not box-cap walls) must sit on this block's
+            // side of the fault AND at this block's offset elevation — proving the sheet is
+            // cut at the plane and carries the right block's field. Only check vertices
+            // actually REFERENCED by a triangle: the Sutherland–Hodgman clip leaves the
+            // pre-clip vertices in the buffer unreferenced (harmless), but the live surface
+            // is the referenced set. Allow a one-cell slop at the plane for the cut edge.
+            let cell = 1000.0 / 2f64.powi(6) + 1.0; // depth-6 leaf size + epsilon
+            let referenced: std::collections::HashSet<u32> = mesh.indices.iter().copied().collect();
+            let mut contact_vs = 0;
+            for &vi in &referenced {
+                let base = vi as usize * 3;
+                let (x, z) = (mesh.positions[base] as f64, mesh.positions[base + 2] as f64);
+                if (z - expect_z).abs() < 50.0 {
+                    contact_vs += 1;
+                    assert!(
+                        x >= side_lo - cell && x <= side_hi + cell,
+                        "block {b} contact vertex x={x:.1} crossed the fault (expected x∈[{side_lo},{side_hi}] ±{cell:.1})"
+                    );
+                }
+            }
+            assert!(contact_vs > 0, "block {b} has no contact vertices near z={expect_z}");
+        }
     }
 }

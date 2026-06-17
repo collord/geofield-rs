@@ -7,13 +7,19 @@
 
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+import { interfaceColor, relationInfo } from "./relations";
 
 export interface RenderMesh {
   interfaceId: number;
+  /** Owning series' relation (0=Erode 1=Onlap 2=Conformable 3=Basement). */
+  relation: number;
   positions: Float32Array; // 3 * V
   normals: Float32Array; // 3 * V (may be empty)
   indices: Uint32Array; // 3 * T
 }
+
+/** How surfaces are colored: per-contact hue, or one color per stack relation. */
+export type ColorMode = "interface" | "relation";
 
 export interface DataPoint {
   x: number;
@@ -22,16 +28,11 @@ export interface DataPoint {
   interfaceId: number;
 }
 
-// Stable per-interface colors. Kept readable against the dark background — the basalt
-// is a saturated blue-grey (not near-black) so the unconformity surface is visible.
-const PALETTE: Record<number, number> = {
-  0: 0xe07b4a, // sed_lower  — orange
-  1: 0xefb34a, // sed_mid    — amber
-  2: 0xf2e08a, // sed_upper  — pale yellow
-  10: 0x5a9bd4, // erosion / basalt — blue (stands out from the warm sediments)
-};
-function colorFor(id: number): number {
-  return PALETTE[id] ?? 0x8899aa;
+// Surface/point colors come from the shared relations module so the scene and the legend
+// panel agree. A surface is drawn either by its individual contact hue ("interface" mode)
+// or by its stack relation ("relation" mode) — see setColorMode.
+function colorFor(mesh: RenderMesh, mode: ColorMode): number {
+  return mode === "relation" ? relationInfo(mesh.relation).color : interfaceColor(mesh.interfaceId);
 }
 
 export interface Viewer {
@@ -43,6 +44,8 @@ export interface Viewer {
   setPoints(points: DataPoint[]): void;
   /** Toggle the data-point cloud; returns the new visibility. */
   togglePoints(): boolean;
+  /** Recolor all current surfaces by contact hue or by stack relation. */
+  setColorMode(mode: ColorMode): void;
 }
 
 /** Build the scene into `mount`. `extent` is [minX,maxX,minY,maxY,minZ,maxZ]. */
@@ -95,6 +98,8 @@ export function createViewer(mount: HTMLElement, extent: number[]): Viewer {
   const dataGroup = new THREE.Group();
   scene.add(surfaceGroup, dataGroup);
 
+  let colorMode: ColorMode = "interface";
+
   const clear = (g: THREE.Group) => {
     for (const c of [...g.children]) {
       g.remove(c);
@@ -136,14 +141,16 @@ export function createViewer(mount: HTMLElement, extent: number[]): Viewer {
       geom.computeVertexNormals();
     }
     const mat = new THREE.MeshStandardMaterial({
-      color: colorFor(m.interfaceId),
+      color: colorFor(m, colorMode),
       metalness: 0.1,
       roughness: 0.7,
       side: THREE.DoubleSide,
       transparent: true,
       opacity: 0.85,
     });
-    surfaceGroup.add(new THREE.Mesh(geom, mat));
+    const mesh = new THREE.Mesh(geom, mat);
+    mesh.userData.render = m; // keep the source mesh so setColorMode can recolor
+    surfaceGroup.add(mesh);
   };
 
   return {
@@ -169,7 +176,7 @@ export function createViewer(mount: HTMLElement, extent: number[]): Viewer {
         pos[3 * i] = p.x;
         pos[3 * i + 1] = p.y;
         pos[3 * i + 2] = p.z;
-        c.setHex(colorFor(p.interfaceId));
+        c.setHex(interfaceColor(p.interfaceId));
         col[3 * i] = c.r;
         col[3 * i + 1] = c.g;
         col[3 * i + 2] = c.b;
@@ -190,6 +197,15 @@ export function createViewer(mount: HTMLElement, extent: number[]): Viewer {
     togglePoints() {
       dataGroup.visible = !dataGroup.visible;
       return dataGroup.visible;
+    },
+
+    setColorMode(mode: ColorMode) {
+      colorMode = mode;
+      for (const c of surfaceGroup.children) {
+        const m = (c as THREE.Mesh).userData.render as RenderMesh | undefined;
+        const mat = (c as THREE.Mesh).material as THREE.MeshStandardMaterial;
+        if (m && mat) mat.color.setHex(colorFor(m, colorMode));
+      }
     },
   };
 }

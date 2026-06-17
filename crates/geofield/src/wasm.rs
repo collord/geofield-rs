@@ -513,6 +513,41 @@ impl WasmStack {
             .map(Into::into)
             .unwrap_or_else(EMPTY_MESH)
     }
+
+    /// Number of fault blocks in `series` (1 if that series is not faulted; 0 if out of
+    /// range). Loop `block` over this for [`WasmStack::mesh_series_block_interface`].
+    pub fn series_block_count(&self, series: usize) -> usize {
+        self.inner.series_block_count(series)
+    }
+
+    /// Adaptive octree mesh of interface `interface_idx` of series `series`, **within a
+    /// single fault block `block`** — the per-block open-sheet view (matches `web/`): the
+    /// contact is contoured from that block's own smooth field and cut flush at the fault
+    /// plane, so a faulted contact renders as separate sheets per block rather than one
+    /// surface stretched across the offset. Still clipped to the series' visible region
+    /// (younger erosions). EMPTY mesh if any index is out of range or the block is
+    /// field-less.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mesh_series_block_interface(
+        &self,
+        series: usize,
+        block: usize,
+        interface_idx: usize,
+        min_x: f64,
+        min_y: f64,
+        min_z: f64,
+        size: f64,
+        max_depth: u32,
+        min_depth: u32,
+        qef_threshold: f64,
+        cap: bool,
+    ) -> WasmMesh {
+        let cfg = octree_cfg(max_depth, min_depth, qef_threshold, cap);
+        self.inner
+            .mesh_one_block(series, block, interface_idx, [min_x, min_y, min_z], size, cfg)
+            .map(Into::into)
+            .unwrap_or_else(EMPTY_MESH)
+    }
 }
 
 impl Default for WasmStack {

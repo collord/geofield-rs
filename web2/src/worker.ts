@@ -71,7 +71,8 @@ function buildStack(scn: Scenario, decimateFrac: number, pass: "full" | "decimat
   return { stack, totalMs: now() - t0 };
 }
 
-/** Mesh every interface at one depth for timing (geometry discarded). */
+/** Mesh every interface at one depth for timing (geometry discarded). Meshes per fault
+ *  block — the SAME workload streamSurfaces renders — so the timings reflect what's drawn. */
 function meshAtDepth(stack: WasmStack, scn: Scenario, depth: number) {
   const [x0, x1, y0, y1, z0, z1] = scn.extent;
   const size = Math.max(x1 - x0, y1 - y0, z1 - z0);
@@ -81,17 +82,23 @@ function meshAtDepth(stack: WasmStack, scn: Scenario, depth: number) {
   const t0 = now();
   for (let si = 0; si < stack.series_count; si++) {
     const n = stack.interface_count(si);
-    for (let k = 0; k < n; k++) {
-      const m = stack.mesh_interface_octree(si, k, x0, y0, z0, size, depth, minDepth, 1e-6, false);
-      tris += m.triangle_count;
-      verts += m.vertex_count;
-      m.free();
+    const blocks = Math.max(1, stack.series_block_count(si));
+    for (let b = 0; b < blocks; b++) {
+      for (let k = 0; k < n; k++) {
+        const m = stack.mesh_series_block_interface(si, b, k, x0, y0, z0, size, depth, minDepth, 1e-6, false);
+        tris += m.triangle_count;
+        verts += m.vertex_count;
+        m.free();
+      }
     }
   }
   return { meshMs: now() - t0, tris, verts, evals: evalCount() };
 }
 
-/** Mesh every interface at `depth` and STREAM each surface back (transferred). */
+/** Mesh every interface at `depth` and STREAM each surface back (transferred). A faulted
+ *  series is meshed PER FAULT BLOCK — each block's contact is a separate sheet cut flush at
+ *  the fault plane (matching the web/ harness), rather than one surface stretched across the
+ *  offset. A non-faulted series has a single block (block 0 = whole domain). */
 function streamSurfaces(stack: WasmStack, scn: Scenario, depth: number): number {
   const [x0, x1, y0, y1, z0, z1] = scn.extent;
   const size = Math.max(x1 - x0, y1 - y0, z1 - z0);
@@ -100,21 +107,25 @@ function streamSurfaces(stack: WasmStack, scn: Scenario, depth: number): number 
   for (let si = 0; si < stack.series_count; si++) {
     const ids = seriesInterfaceIds(scn.series[si]);
     const n = stack.interface_count(si);
-    for (let k = 0; k < n; k++) {
-      const m = stack.mesh_interface_octree(si, k, x0, y0, z0, size, depth, minDepth, 1e-6, false);
-      if (m.triangle_count > 0) {
-        const positions = m.positions();
-        const normals = m.normals();
-        const indices = m.indices();
-        const ev: SurfaceEvent = {
-          type: "surface", seriesIndex: si, interfaceIndex: k,
-          interfaceId: ids[k] ?? ids[0] ?? 0,
-          positions, normals, indices,
-        };
-        emit(ev, [positions.buffer, normals.buffer, indices.buffer]);
-        count++;
+    const blocks = Math.max(1, stack.series_block_count(si));
+    for (let b = 0; b < blocks; b++) {
+      for (let k = 0; k < n; k++) {
+        const m = stack.mesh_series_block_interface(si, b, k, x0, y0, z0, size, depth, minDepth, 1e-6, false);
+        if (m.triangle_count > 0) {
+          const positions = m.positions();
+          const normals = m.normals();
+          const indices = m.indices();
+          const ev: SurfaceEvent = {
+            type: "surface", seriesIndex: si, block: b, interfaceIndex: k,
+            interfaceId: ids[k] ?? ids[0] ?? 0,
+            relation: scn.series[si].relation,
+            positions, normals, indices,
+          };
+          emit(ev, [positions.buffer, normals.buffer, indices.buffer]);
+          count++;
+        }
+        m.free();
       }
-      m.free();
     }
   }
   return count;

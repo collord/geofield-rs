@@ -4,8 +4,9 @@
 // and a running gf_eval ticker. The heavy wasm work runs in the worker, so this thread
 // stays responsive (progress animates, Cancel works instantly).
 
-import { createViewer, type RenderMesh, type DataPoint, type Viewer } from "./viewer";
-import type { Command, Scenario, WorkerEvent } from "./protocol";
+import { createViewer, type RenderMesh, type DataPoint, type Viewer, type ColorMode } from "./viewer";
+import type { Command, Scenario, SeriesJson, WorkerEvent } from "./protocol";
+import { interfaceColor, relationInfo, cssHex } from "./relations";
 
 const $ = (id: string) => document.getElementById(id)!;
 const setStatus = (s: string) => { $("status").textContent = s; };
@@ -13,6 +14,7 @@ const setBar = (p: number) => { ($("bar") as HTMLProgressElement).value = Math.m
 
 let viewer: Viewer | null = null;
 let worker: Worker | null = null;
+let colorMode: ColorMode = "interface";
 
 const DECIMATE_FRAC = 0.2;
 const DEPTHS = [4, 5, 6]; // depth 7 is the long pole; 4–6 already shows the scaling
@@ -72,6 +74,48 @@ function table(headers: string[], rows: (string | number)[][]): string {
   return `<table><thead><tr>${th}</tr></thead><tbody>${trs}</tbody></table>`;
 }
 
+const swatch = (color: number) =>
+  `<span class="swatch" style="background:${cssHex(color)}"></span>`;
+
+/** Distinct interface ids of a series, ascending (matches the meshing/streaming order). */
+function seriesIds(s: SeriesJson): number[] {
+  return [...new Set(s.sp_if)].sort((x, y) => x - y);
+}
+
+/** The stack-relations schematic: series oldest -> youngest, each with its relation gloss
+ *  and color-keyed contacts. This is what makes "erosional surface cutting a conformable
+ *  stack" READABLE — the bare 3D meshes can't convey the relations. Read from the scenario,
+ *  so it is always correct regardless of the fit. */
+function renderStackPanel(scn: Scenario) {
+  // The scenario lists series youngest-first (stack order); show oldest at the BOTTOM as in
+  // a stratigraphic column.
+  const ordered = scn.series.map((s, i) => ({ s, i }));
+  let html = `<div class="stack">`;
+  for (const { s } of ordered) {
+    const info = relationInfo(s.relation);
+    const ids = seriesIds(s);
+    const contacts = ids
+      .map((id) => {
+        const nm = scn.interface_names[String(id)] ?? `id ${id}`;
+        return `<span class="contact">${swatch(interfaceColor(id))}${nm}</span>`;
+      })
+      .join("");
+    html += `<div class="series">
+      <div class="series-head">
+        ${swatch(info.color)}<strong>${s.name}</strong>
+        <span class="rel">${info.name}</span>${s.faulted ? `<span class="faulted">faulted</span>` : ""}
+      </div>
+      <div class="gloss">${info.gloss}</div>
+      <div class="contacts">${contacts}</div>
+    </div>`;
+  }
+  const f = scn.fault;
+  html += `<div class="fault">⟂ fault — strike ${f.strike_deg}° dip ${f.dip_deg}°, ${f.offset_ft} ft down-to-east (cuts both series)</div>`;
+  html += `<div class="reading">↑ youngest · oldest ↓ &nbsp; — &nbsp; an <em>Erode</em> series truncates everything older; the sediments are one <em>conformable</em> stack on a <em>basement</em>.</div>`;
+  html += `</div>`;
+  $("stack").innerHTML = `<h3>Stack relations</h3>` + html;
+}
+
 function startRun(scn: Scenario) {
   // Fresh worker each run (hard-cancel terminates the previous one).
   worker?.terminate();
@@ -79,9 +123,13 @@ function startRun(scn: Scenario) {
 
   if (!viewer) viewer = createViewer($("scene"), scn.extent);
   viewer.clearSurfaces();
+  viewer.setColorMode(colorMode);
   // Show the data points immediately (we have them without the worker).
   viewer.setPoints(collectPoints(scn));
+  // The stack-relations schematic is known from the scenario alone — show it up front.
+  renderStackPanel(scn);
   $("togglePts").removeAttribute("disabled");
+  $("colorMode").removeAttribute("disabled");
 
   const a: Accum = {
     scn, fullFit: [], decFit: [], depthRows: [], surfaces: 0, evalLive: 0,
@@ -103,6 +151,7 @@ function startRun(scn: Scenario) {
       case "surface":
         viewer!.addSurface({
           interfaceId: ev.interfaceId,
+          relation: ev.relation,
           positions: ev.positions,
           normals: ev.normals,
           indices: ev.indices,
@@ -178,3 +227,9 @@ async function onRun() {
 $("run").addEventListener("click", () => { onRun().catch((e) => setStatus("ERROR: " + e)); });
 $("cancel").addEventListener("click", cancelRun);
 $("togglePts").addEventListener("click", () => { viewer?.togglePoints(); });
+$("colorMode").addEventListener("click", () => {
+  colorMode = colorMode === "interface" ? "relation" : "interface";
+  viewer?.setColorMode(colorMode);
+  $("colorMode").textContent =
+    colorMode === "relation" ? "Color: by relation" : "Color: by contact";
+});

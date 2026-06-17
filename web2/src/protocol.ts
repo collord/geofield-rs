@@ -78,8 +78,13 @@ export interface FitDoneEvent {
 export interface SurfaceEvent {
   type: "surface";
   seriesIndex: number;
+  /** Which fault block this sheet belongs to (0-based). A faulted contact is streamed as
+   *  one SurfaceEvent per block, each cut flush at the fault — matching the web/ harness. */
+  block: number;
   interfaceIndex: number;
   interfaceId: number;
+  /** The owning series' relation (0=Erode 1=Onlap 2=Conformable 3=Basement). */
+  relation: number;
   positions: Float32Array;
   normals: Float32Array;
   indices: Uint32Array;

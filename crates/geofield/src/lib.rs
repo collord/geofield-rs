@@ -403,7 +403,7 @@ fn max_abs_field_in_box(field: &dyn ScalarField, min: [f64; 3], size: f64) -> f6
 /// keep/drop. New vertices created on a plane get interpolated positions AND normals
 /// (so shading stays smooth up to the cut). Vertices that become unreferenced are left
 /// in the buffers (harmless).
-fn clip_mesh_to_half_spaces(mesh: &mut Mesh, half_spaces: &[HalfSpace]) {
+pub(crate) fn clip_mesh_to_half_spaces(mesh: &mut Mesh, half_spaces: &[HalfSpace]) {
     for hs in half_spaces {
         clip_mesh_to_plane(mesh, hs);
     }

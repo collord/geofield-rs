@@ -15,9 +15,24 @@
       button:disabled { background: #444; color: #999; cursor: default; }
       button#cancel { background: #a33; }
       pre { white-space: pre-wrap; }
-      #scene { width: 100%; height: 70vh; margin-top: 1rem; border: 1px solid #444; border-radius: 4px; background: #1a1d23; }
       #bar { width: 100%; height: 6px; margin: 0.5rem 0; accent-color: #2a4; }
-      .controls { display: flex; gap: 0.5rem; align-items: center; }
+      .controls { display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; }
+
+      /* scene + stack-relations panel side by side */
+      .view { display: flex; gap: 0.75rem; margin-top: 1rem; align-items: stretch; }
+      #scene { flex: 1 1 auto; height: 70vh; border: 1px solid #444; border-radius: 4px; background: #1a1d23; }
+      #stack { flex: 0 0 290px; border: 1px solid #444; border-radius: 4px; background: #20242c; padding: 0.6rem 0.7rem; overflow-y: auto; height: 70vh; }
+      #stack h3 { margin: 0 0 0.5rem; font-size: 0.85rem; color: #9cf; }
+      .swatch { display: inline-block; width: 11px; height: 11px; border-radius: 2px; margin-right: 5px; vertical-align: -1px; border: 1px solid #0006; }
+      .stack .series { border: 1px solid #3a4150; border-radius: 4px; padding: 6px 8px; margin-bottom: 6px; background: #262b34; }
+      .series-head { display: flex; align-items: center; gap: 6px; }
+      .series-head .rel { margin-left: auto; font-size: 0.78rem; color: #fc6; text-transform: uppercase; letter-spacing: 0.03em; }
+      .series-head .faulted { font-size: 0.68rem; color: #c97; border: 1px solid #644; border-radius: 3px; padding: 0 4px; }
+      .gloss { font-size: 0.78rem; color: #aab; margin: 3px 0 5px; }
+      .contacts { display: flex; flex-direction: column; gap: 2px; }
+      .contact { font-size: 0.76rem; color: #cdd; }
+      .fault { font-size: 0.78rem; color: #d99; border-top: 1px dashed #555; padding-top: 6px; margin-top: 4px; }
+      .reading { font-size: 0.72rem; color: #889; margin-top: 8px; line-height: 1.45; }
     </style>
   </head>
   <body>
@@ -29,10 +44,14 @@
       <button id="run">Run</button>
       <button id="cancel" disabled>Cancel</button>
       <button id="togglePts" disabled>Toggle data points</button>
+      <button id="colorMode" disabled>Color: by contact</button>
     </div>
     <progress id="bar" max="1" value="0"></progress>
     <div id="status"></div>
-    <div id="scene"></div>
+    <div class="view">
+      <div id="scene"></div>
+      <div id="stack"><h3>Stack relations</h3></div>
+    </div>
     <div id="out"></div>
     <script type="module" src="/src/main.ts"></script>
   </body>
