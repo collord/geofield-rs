@@ -6,6 +6,7 @@
 import init, { WasmStack } from "./wasm/geofield.js";
 import { initKernel, setEngineMemory, evalCount, evalCountReset } from "../../web/src/kernel-bridge";
 import kernelWasmUrl from "../public/geofield_kernel.wasm?url";
+import { createViewer, type RenderMesh, type DataPoint, type Viewer } from "./viewer";
 
 interface SeriesJson {
   name: string;
@@ -30,6 +31,7 @@ const status = (s: string) => { $("status").textContent = s; };
 const now = () => performance.now();
 
 let ready: Promise<void> | null = null;
+let viewer: Viewer | null = null;
 function initWasm(): Promise<void> {
   if (!ready) {
     ready = (async () => {
@@ -99,6 +101,55 @@ function meshAtDepth(stack: WasmStack, scn: Scenario, depth: number): DepthRow {
   const meshMs = now() - t0;
   const evals = evalCount();
   return { depth, meshMs, tris, verts, evals };
+}
+
+/** The distinct interface ids of a series, ASCENDING — matching the order
+ *  `mesh_interface_octree(si, k)` meshes them (ascending isovalue ≈ ascending id here,
+ *  since deeper sediments have lower ids). Derived from the scenario's surface points. */
+function seriesInterfaceIds(s: SeriesJson): number[] {
+  return [...new Set(s.sp_if)].sort((a, b) => a - b);
+}
+
+/** Mesh every interface of every series at one depth and KEEP the geometry (for the 3D
+ *  viewer). Each surface is tagged with its interface id so it gets the right color. */
+function collectSurfaces(stack: WasmStack, scn: Scenario, depth: number): RenderMesh[] {
+  const [x0, x1, y0, y1, z0, z1] = scn.extent;
+  const size = Math.max(x1 - x0, y1 - y0, z1 - z0);
+  const minDepth = Math.min(2, depth);
+  const out: RenderMesh[] = [];
+  for (let si = 0; si < stack.series_count; si++) {
+    const ids = seriesInterfaceIds(scn.series[si]);
+    const nIface = stack.interface_count(si);
+    for (let k = 0; k < nIface; k++) {
+      const m = stack.mesh_interface_octree(si, k, x0, y0, z0, size, depth, minDepth, 1e-6, false);
+      if (m.triangle_count > 0) {
+        out.push({
+          interfaceId: ids[k] ?? ids[0] ?? 0,
+          positions: m.positions(),
+          normals: m.normals(),
+          indices: m.indices(),
+        });
+      }
+      m.free();
+    }
+  }
+  return out;
+}
+
+/** All borehole surface points across series, for the data-point cloud. */
+function collectPoints(scn: Scenario): DataPoint[] {
+  const pts: DataPoint[] = [];
+  for (const s of scn.series) {
+    for (let i = 0; i < s.sp_if.length; i++) {
+      pts.push({
+        x: s.sp_xyz[3 * i],
+        y: s.sp_xyz[3 * i + 1],
+        z: s.sp_xyz[3 * i + 2],
+        interfaceId: s.sp_if[i],
+      });
+    }
+  }
+  return pts;
 }
 
 function table(headers: string[], rows: (string | number)[][]): string {
@@ -183,7 +234,20 @@ ${JSON.stringify(scn.stats)}</pre>`;
     "ns / eval" is the amortized boundary-crossing + field-evaluation cost.</p>`;
 
   $("out").innerHTML = html;
-  status("done.");
+
+  // Render the DECIMATED model: data points + contact surfaces (meshed once at a
+  // readable depth). This is the same stack the table reports timings for.
+  status("rendering scene…");
+  await new Promise((r) => setTimeout(r, 0));
+  const VIEW_DEPTH = 5;
+  const surfaces: RenderMesh[] = collectSurfaces(stack, scn, VIEW_DEPTH);
+  const points: DataPoint[] = collectPoints(scn);
+  if (!viewer) viewer = createViewer($("scene"), scn.extent);
+  viewer.setSurfaces(surfaces);
+  viewer.setPoints(points);
+  $("togglePts").removeAttribute("disabled");
+
+  status(`done. ${points.length} data points, ${surfaces.length} surfaces (octree depth ${VIEW_DEPTH}). Drag to orbit; "Toggle data points" to see surfaces alone.`);
   $("run").removeAttribute("disabled");
 
   // Also dump to console for copy/paste.
@@ -192,3 +256,4 @@ ${JSON.stringify(scn.stats)}</pre>`;
 }
 
 $("run").addEventListener("click", () => { run().catch((e) => { status("ERROR: " + e); console.error(e); }); });
+$("togglePts").addEventListener("click", () => { viewer?.togglePoints(); });
