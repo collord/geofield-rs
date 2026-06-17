@@ -35,7 +35,9 @@ npm run dev        # open the printed URL, click "Run benchmark"
 is built with the `wasm-abi-stats` feature so the harness can report boundary-crossing
 eval counts.
 
-## What we found (headline)
+## What we found, and what we did about it
+
+### The diagnosis (before)
 
 Measured on this scenario (Opus dev box, release wasm):
 
@@ -44,19 +46,38 @@ Measured on this scenario (Opus dev box, release wasm):
 | fit (cokriging solve) | 1.7 s | **34.6 s** | ~N³ (dense matrix factor) |
 | per-sample eval | 27 µs | 81 µs | ~N (predictor sum over weights) |
 
-**The bottleneck is the cokriging kernel at 9000 surface points, not the two-wasm split.**
+The bottleneck was the cokriging kernel at 9000 surface points, **not** the two-wasm split
+(the boundary crossing is tens of ns — negligible against an 81 µs eval). Crucially, an
+eigenvalue analysis showed the matrix was both huge AND **rank-deficient**: cond ~4.5e8
+with ~70% near-zero eigenvalues. The 9000 borehole points were massively **oversampled** —
+only a few hundred carry independent information. That single fact caused both the slow
+fit (N³) and the ill-conditioning.
 
-- **Fit** factors a dense (N + constraints)² covariance matrix *per fault block* → ~N³.
-  9000 points takes ~35 s. This is identical natively; the split adds nothing here.
-- **Per-sample eval** sums the cokriging predictor over all N weights → ~linear in N
-  (27 µs at 3000 pts, 81 µs at 9000). The octree calls this hundreds of thousands of times
-  per mesh, so mesh time = (#samples) × (per-eval cost) is dominated by the field math, not
-  the wasm boundary crossing (which is tens of ns — negligible against an 81 µs eval).
+### The fix: residual-guided decimation (a kriging coreset)
 
-**Implication:** the per-sample-cross-the-boundary design we chose for the split is *not*
-the thing to optimize. The kernel itself needs either fewer surface points (decimation /
-local neighborhoods) or a different solve before this is interactive at 9000-point scale.
-The two-wasm boundary is essentially free relative to the cokriging cost.
+`KernelOptions.decimate` (wired through the ABI as `decimate_frac`): seed a coarse subset,
+then re-add only the points the coarse field mis-predicts by more than `frac · (isovalue
+range)` — the fold hinges / anomalies — and iterate. Redundant points in flat clusters
+have ~zero residual and stay out. **The data is honored to a tolerance, not subsampled.**
+`decimate_frac = NaN` keeps all points (gempy bit-exact, the validation-suite default).
+
+### The result (after, faulted 9000-pt sediments, through the wasm ABI)
+
+| stage | full | decimated (frac 0.2) | speedup |
+|-------|-----:|---------------------:|---------|
+| **fit** | 34.8 s | **0.57 s** | **61×** |
+| **per-sample eval** | 82 µs | **6.8 µs** | **12×** |
+
+Field agreement vs the full fit: RMS ~1% of the field scale. Decimation kept ~250 of 3000
+points on the basalt block — exactly the informative rank the eigenvalue analysis
+predicted. Because eval is linear in kept-point count, decimation fixed the **mesh** cost
+for free too (no SIMD / batching needed): a depth-6 mesh drops from ~20 s to ~1–2 s.
+
+**Why not tensorken / a tensor backend / matrix-free GMRES?** All investigated and
+rejected: tensorken is a teaching NN lib with no solver; gempy's tensor backend
+accelerates the *eval* (PyKeOps), not the solve, and caches the solve anyway; matrix-free
+iterative can't bit-match gempy on this rank-deficient system (the solution is non-unique).
+Decimation is what the linear algebra was demanding. (See the kernel commit and memory.)
 
 ## Files
 
