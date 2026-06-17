@@ -36,6 +36,10 @@ function colorFor(id: number): number {
 
 export interface Viewer {
   setSurfaces(meshes: RenderMesh[]): void;
+  /** Remove all surfaces (start of a progressive stream). */
+  clearSurfaces(): void;
+  /** Add ONE surface (progressive rendering as the worker streams them). */
+  addSurface(mesh: RenderMesh): void;
   setPoints(points: DataPoint[]): void;
   /** Toggle the data-point cloud; returns the new visibility. */
   togglePoints(): boolean;
@@ -121,29 +125,37 @@ export function createViewer(mount: HTMLElement, extent: number[]): Viewer {
   // keep the listener for the page lifetime (single-page bench); no teardown needed.
   void raf;
 
+  const addOne = (m: RenderMesh) => {
+    if (m.indices.length === 0) return;
+    const geom = new THREE.BufferGeometry();
+    geom.setAttribute("position", new THREE.BufferAttribute(m.positions, 3));
+    geom.setIndex(new THREE.BufferAttribute(m.indices, 1));
+    if (m.normals.length === m.positions.length) {
+      geom.setAttribute("normal", new THREE.BufferAttribute(m.normals, 3));
+    } else {
+      geom.computeVertexNormals();
+    }
+    const mat = new THREE.MeshStandardMaterial({
+      color: colorFor(m.interfaceId),
+      metalness: 0.1,
+      roughness: 0.7,
+      side: THREE.DoubleSide,
+      transparent: true,
+      opacity: 0.85,
+    });
+    surfaceGroup.add(new THREE.Mesh(geom, mat));
+  };
+
   return {
     setSurfaces(meshes: RenderMesh[]) {
       clear(surfaceGroup);
-      for (const m of meshes) {
-        if (m.indices.length === 0) continue;
-        const geom = new THREE.BufferGeometry();
-        geom.setAttribute("position", new THREE.BufferAttribute(m.positions, 3));
-        geom.setIndex(new THREE.BufferAttribute(m.indices, 1));
-        if (m.normals.length === m.positions.length) {
-          geom.setAttribute("normal", new THREE.BufferAttribute(m.normals, 3));
-        } else {
-          geom.computeVertexNormals();
-        }
-        const mat = new THREE.MeshStandardMaterial({
-          color: colorFor(m.interfaceId),
-          metalness: 0.1,
-          roughness: 0.7,
-          side: THREE.DoubleSide,
-          transparent: true,
-          opacity: 0.85,
-        });
-        surfaceGroup.add(new THREE.Mesh(geom, mat));
-      }
+      for (const m of meshes) addOne(m);
+    },
+    clearSurfaces() {
+      clear(surfaceGroup);
+    },
+    addSurface(m: RenderMesh) {
+      addOne(m);
     },
 
     setPoints(points: DataPoint[]) {

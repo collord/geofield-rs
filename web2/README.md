@@ -1,9 +1,28 @@
-# web2 — two-wasm scale benchmark
+# web2 — two-wasm scale benchmark + worker-driven viewer
 
 A throughput harness for the two-wasm split (EUPL kernel + BSD engine) on a realistic
 faulted, multi-series scenario at borehole scale. It loads both wasm modules, fits the
 stack across the module boundary, and times fit + octree meshing while counting the
-per-sample `gf_eval` calls that cross the boundary.
+per-sample `gf_eval` calls that cross the boundary — then renders the model in 3D.
+
+## Architecture: a solver worker keeps the UI live
+
+The heavy wasm work (a ~40 s full fit, multi-second deep meshes) runs in a **web worker**,
+not on the UI thread — so the page never freezes and a real status stream is possible:
+
+- `worker.ts` owns BOTH wasm instances + the kernel-bridge, runs the fit + mesh, and
+  **streams** typed events (`protocol.ts`): phase/progress, per-series fit timings as each
+  lands, each contact surface **as it is meshed** (transferred zero-copy), depth-sweep
+  rows, and the final stats.
+- `main.ts` (UI thread) spawns the worker, renders the live status bar + tables, and adds
+  surfaces to the three.js scene **progressively** as they arrive. The fit runs with the
+  page fully responsive (the progress bar animates during the 40 s fit — it would be frozen
+  solid on the main thread).
+- **Cancel** is a hard `worker.terminate()` + respawn: a single fit is one uninterruptible
+  wasm call, so killing the worker is the only way to stop mid-fit — and it is instant.
+  The cost is a ~1 s cold wasm re-init on the next run, which is accepted.
+- Surfaces are meshed and streamed **before** the timing sweep, so the geology appears as
+  soon as the (fast, decimated) fit completes rather than after the whole benchmark.
 
 ## The scenario
 
