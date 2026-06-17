@@ -361,7 +361,8 @@ fn solve3(a: [[f64; 3]; 3], b: [f64; 3]) -> Option<[f64; 3]> {
     ])
 }
 
-#[cfg(test)]
+// Builds an in-process kernel `Model`, so native-only (the wasm engine has no kernel).
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
     use geofield_kernel::assemble::KernelOptions;

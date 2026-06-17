@@ -1756,7 +1756,8 @@ fn keep_contact_faces(mesh: &mut Mesh, contact_face: &[bool]) {
     mesh.indices = kept;
 }
 
-#[cfg(test)]
+// Builds an in-process kernel `Model`, so native-only (the wasm engine has no kernel).
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
     use crate::assemble::KernelOptions;

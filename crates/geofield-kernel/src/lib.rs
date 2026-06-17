@@ -26,6 +26,12 @@ pub mod kernel;
 pub mod litho;
 pub mod solve;
 
+/// C-ABI exports for the standalone-wasm-module build (the two-wasm licensing split).
+/// `geofield.wasm` (the BSD engine) imports these to query the field oracle across the
+/// module boundary, so no kernel code is linked into the engine artifact.
+#[cfg(feature = "wasm-abi")]
+pub mod abi;
+
 use assemble::{assemble, KernelOptions, System};
 use data::{Orientation, Series, SurfacePoint};
 use evaluate::Field;

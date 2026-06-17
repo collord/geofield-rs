@@ -14,32 +14,98 @@
 
 pub mod mesh;
 pub mod octree;
+
+// The multi-series stack (erode/onlap masking) is built on the in-process kernel `Model`
+// and is native-only for now — the web harness drives single `WasmModel`s, not stacks. A
+// wasm stack would need `StackedSeries` ported onto `RemoteModel` (a follow-up).
+#[cfg(not(target_arch = "wasm32"))]
 pub mod stack;
 
 #[cfg(feature = "wasm")]
 pub mod wasm;
 
-pub use geofield_kernel::{
-    assemble, data, evaluate, fault, geometry, kernel, litho, solve,
-    Model, ScalarField, FaultStack, OneFault, PlanarFault,
-};
+// The field-oracle trait + boundary POD come from the permissive interface crate and
+// are available on BOTH targets (native in-process kernel, and the wasm remote module).
+pub use geofield_types::{HalfSpace, ScalarField};
 
+#[cfg(not(target_arch = "wasm32"))]
 pub use stack::{Relation, Stack, StackedSeries};
 
-// `Model`, `ScalarField`, and `fault` are already in module scope via the `pub use`
-// re-export above; importing them again here would be a duplicate. The meshing code
-// names them directly from that re-export. These remaining imports are the data /
-// lithology types the meshing layer's signatures and bodies refer to.
-#[allow(unused_imports)]
-use geofield_kernel::{
-    data::{Orientation, SurfacePoint},
-    litho::Lithology,
+// NATIVE ONLY: the in-process kernel. Re-exported so `geofield::Model` / `geofield::data`
+// etc. resolve for the CLI + native tests. The wasm build has NO kernel — it reaches the
+// field oracle through the `remote` module's wasm imports instead.
+#[cfg(not(target_arch = "wasm32"))]
+pub use geofield_kernel::{
+    assemble, data, evaluate, fault, geometry, kernel, litho, solve, FaultStack, Model,
+    OneFault, PlanarFault,
 };
+
+// WASM ONLY: the remote field oracle (imports from the separately-loaded kernel module).
+#[cfg(target_arch = "wasm32")]
+pub mod remote;
+#[cfg(target_arch = "wasm32")]
+pub use remote::RemoteModel;
+
 use mesh::{normalize, Mesh};
 use octree::{
     octree_dual_contour, octree_dual_contour_scene, AxisBox, Boundary, ContactHalfSpace,
     OctreeConfig, PlaneHalfSpace, Scene,
 };
+
+/// What the meshing layer needs from a fitted model, abstracted so the SAME meshing code
+/// serves the in-process kernel [`Model`] (native) and the [`RemoteModel`] that forwards
+/// to the kernel wasm module (browser). Returns OWNED data (e.g. isovalues as a `Vec`),
+/// because the remote model cannot hand out references into another wasm instance.
+pub trait BlockModel {
+    /// A per-block smooth-field oracle (one block's contact extrapolated over the box).
+    type Field<'a>: ScalarField
+    where
+        Self: 'a;
+
+    /// Number of fault-bounded blocks (1 if non-faulted).
+    fn nblocks(&self) -> usize;
+    /// Block `b`'s smooth field as a [`ScalarField`], or `None` if field-less.
+    fn block_field(&self, b: usize) -> Option<Self::Field<'_>>;
+    /// Block `b`'s interface isovalues, ascending (empty if field-less).
+    fn block_interface_isovalues(&self, b: usize) -> Vec<f64>;
+    /// Number of meshable interfaces in block `b`.
+    fn block_interface_count(&self, b: usize) -> usize {
+        self.block_interface_isovalues(b).len()
+    }
+    /// Number of lithology units in block `b` (`interfaces + 1`, 0 if field-less).
+    fn block_unit_count(&self, b: usize) -> usize {
+        match self.block_interface_count(b) {
+            0 => 0,
+            n => n + 1,
+        }
+    }
+    /// The fault half-spaces bounding block `b` (for clipping its mesh to the block).
+    fn block_half_spaces(&self, b: usize) -> Vec<HalfSpace>;
+}
+
+/// `geofield_kernel::Model` as a [`BlockModel`] for the native (in-process) meshing path.
+#[cfg(not(target_arch = "wasm32"))]
+impl BlockModel for Model {
+    type Field<'a> = geofield_kernel::BlockField<'a>;
+    fn nblocks(&self) -> usize {
+        Model::nblocks(self)
+    }
+    fn block_field(&self, b: usize) -> Option<Self::Field<'_>> {
+        Model::block_field(self, b)
+    }
+    fn block_interface_isovalues(&self, b: usize) -> Vec<f64> {
+        match self.block_lithology(b) {
+            Some(l) => l.interfaces.iter().map(|iv| iv.isovalue).collect(),
+            None => Vec::new(),
+        }
+    }
+    fn block_half_spaces(&self, b: usize) -> Vec<HalfSpace> {
+        Model::block_half_spaces(self, b)
+            .into_iter()
+            .map(|h| HalfSpace { point: h.point, normal: h.normal, keep_positive: h.keep_positive })
+            .collect()
+    }
+}
 
 /// Per-block meshing for a fitted [`Model`] — an extension trait so the geometry layer
 /// lives in this crate while the cokriging [`Model`] stays in `geofield-kernel`. Each
@@ -124,7 +190,9 @@ pub trait MeshModel {
     ) -> Option<Mesh>;
 }
 
-impl MeshModel for Model {
+/// Blanket impl: any [`BlockModel`] gets the per-block meshing. Native uses the kernel
+/// `Model`; wasm uses `RemoteModel`. The meshing code is written once against the trait.
+impl<M: BlockModel> MeshModel for M {
     fn mesh_block_interface(
         &self,
         b: usize,
@@ -133,12 +201,12 @@ impl MeshModel for Model {
         size: f64,
         cfg: OctreeConfig,
     ) -> Option<Mesh> {
-        let iv = *self.block_lithology(b)?.interfaces.get(interface_idx)?;
+        let iso = *self.block_interface_isovalues(b).get(interface_idx)?;
 
         // Contour ONLY this block's field (smooth everywhere) as an open sheet.
         let field = self.block_field(b)?;
         let cfg = OctreeConfig { cap: false, ..cfg };
-        let mut mesh = octree_dual_contour(&field, min, size, iv.isovalue, cfg);
+        let mut mesh = octree_dual_contour(&field, min, size, iso, cfg);
 
         // Drop triangles outside the block: a triangle is kept iff its centroid is on
         // the kept side of every fault half-space bounding this block. (Centroid test
@@ -159,9 +227,9 @@ impl MeshModel for Model {
         size: f64,
         cfg: OctreeConfig,
     ) -> Option<Mesh> {
-        let interfaces = &self.block_lithology(b)?.interfaces;
-        let n = interfaces.len();
-        if unit_idx > n {
+        let isovalues = self.block_interface_isovalues(b);
+        let n = isovalues.len();
+        if n == 0 || unit_idx > n {
             return None;
         }
         let field = self.block_field(b)?;
@@ -171,14 +239,14 @@ impl MeshModel for Model {
         // (the box top caps it). `primary` is always the "below the upper bound" side.
         let big = max_abs_field_in_box(&field, min, size) + 1.0;
         let upper_iso = if unit_idx < n {
-            interfaces[unit_idx].isovalue
+            isovalues[unit_idx]
         } else {
             big // top unit: no upper contact, box caps it
         };
 
         // Lower bound (the ABOVE side of the unit's lower contact), if any.
         let lower: Option<ContactHalfSpace> = if unit_idx > 0 {
-            Some(ContactHalfSpace::new(&field, interfaces[unit_idx - 1].isovalue, false))
+            Some(ContactHalfSpace::new(&field, isovalues[unit_idx - 1], false))
         } else {
             None
         };
@@ -211,15 +279,14 @@ impl MeshModel for Model {
         size: f64,
         cfg: OctreeConfig,
     ) -> Vec<Mesh> {
-        let Some(lithology) = self.block_lithology(b) else {
+        let n_interfaces = self.block_interface_count(b);
+        if n_interfaces == 0 {
             return Vec::new();
-        };
-        let interfaces = &lithology.interfaces;
+        }
         // Canonical height field z(x,y) per contact, meshed ONCE (surface contour of
         // the block's smooth field, clipped to the block). Only valid for single-valued
         // (height-field) contacts — the geological norm; a near-vertical contact would
         // fall back to no weld (the column lookup just misses).
-        let n_interfaces = interfaces.len();
         let canon: Vec<ContactHeightField> = (0..n_interfaces)
             .map(|k| ContactHeightField::build(self, b, k, min, size, cfg))
             .collect();
@@ -294,14 +361,14 @@ fn max_abs_field_in_box(field: &dyn ScalarField, min: [f64; 3], size: f64) -> f6
 /// keep/drop. New vertices created on a plane get interpolated positions AND normals
 /// (so shading stays smooth up to the cut). Vertices that become unreferenced are left
 /// in the buffers (harmless).
-fn clip_mesh_to_half_spaces(mesh: &mut Mesh, half_spaces: &[fault::HalfSpace]) {
+fn clip_mesh_to_half_spaces(mesh: &mut Mesh, half_spaces: &[HalfSpace]) {
     for hs in half_spaces {
         clip_mesh_to_plane(mesh, hs);
     }
 }
 
 /// One Sutherland–Hodgman pass: clip every triangle to the kept side of `hs`.
-fn clip_mesh_to_plane(mesh: &mut Mesh, hs: &fault::HalfSpace) {
+fn clip_mesh_to_plane(mesh: &mut Mesh, hs: &HalfSpace) {
     let has_normals = mesh.normals.len() == mesh.positions.len();
     let vpos = |m: &Mesh, i: u32| {
         let b = (i as usize) * 3;
@@ -404,7 +471,14 @@ struct ContactHeightField {
 }
 
 impl ContactHeightField {
-    fn build(model: &Model, b: usize, k: usize, min: [f64; 3], size: f64, cfg: OctreeConfig) -> Self {
+    fn build<M: MeshModel + ?Sized>(
+        model: &M,
+        b: usize,
+        k: usize,
+        min: [f64; 3],
+        size: f64,
+        cfg: OctreeConfig,
+    ) -> Self {
         // Bucket at ~one finest octree cell: a cap vertex's nearest canonical vertex is
         // within a cell, so a 3×3×3 bucket neighbourhood always contains it.
         let cell = (size / 2f64.powi(cfg.max_depth as i32)).max(1.0);
@@ -478,7 +552,9 @@ impl ContactHeightField {
     }
 }
 
-#[cfg(test)]
+// These tests build an in-process kernel `Model`, so they only apply to the native path
+// (the wasm engine has no kernel linked — it talks to the kernel module over imports).
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
     use super::MeshModel;

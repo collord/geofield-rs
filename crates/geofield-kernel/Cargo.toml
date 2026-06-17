@@ -18,9 +18,13 @@ faer = { version = "0.24", default-features = false, features = ["std", "linalg"
 default = []
 # Native builds opt into rayon for parallel BLAS; wasm omits it.
 native-parallel = ["faer/rayon"]
+# Build the C-ABI export layer (src/abi.rs) for the standalone kernel wasm module.
+wasm-abi = []
 
 [lib]
-crate-type = ["rlib"]
+# rlib for the in-process native path (engine native tests + CLI); cdylib so the kernel
+# can be built as its OWN wasm module (geofield_kernel.wasm) for the two-wasm split.
+crate-type = ["rlib", "cdylib"]
 
 [dev-dependencies]
 # Fixture I/O for the validation/reference tests (gempy dumps .npy + .json).
