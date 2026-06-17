@@ -213,7 +213,14 @@ def build_series(collars, ori_every, seed):
             bas["sp_xyz"].extend([x, y, z])
             bas["sp_if"].append(ERO_ID)
             if take_ori:
+                # FLIP the pole to point DOWN. The stack's convention is "series present
+                # where field < iso_top", and the field increases in the +pole direction.
+                # The basalt FILLS ABOVE the erosion surface (younger unit on the eroded
+                # topography), so "basalt present" must be the z > z_ero side — which
+                # requires the field to DECREASE upward, i.e. pole pointing down. (The
+                # sediments keep upward poles: their rock is present below each contact.)
                 pole = grad_pole(lambda xx, yy: apply_fault_offset(xx, yy, ero_surface_z(xx, yy)), x, y)
+                pole = [-c for c in pole]  # point into the ROCK side (down), basalt above
                 bas["ori_xyz"].extend([x, y, z])
                 bas["ori_pole"].extend(pole)
 
