@@ -5,7 +5,7 @@
 // stays responsive (progress animates, Cancel works instantly).
 
 import { createViewer, type RenderMesh, type DataPoint, type Viewer, type ColorMode } from "./viewer";
-import type { Command, Scenario, SeriesJson, WorkerEvent } from "./protocol";
+import type { Command, RenderMode, Scenario, SeriesJson, WorkerEvent } from "./protocol";
 import { interfaceColor, relationInfo, cssHex } from "./relations";
 
 const $ = (id: string) => document.getElementById(id)!;
@@ -15,6 +15,8 @@ const setBar = (p: number) => { ($("bar") as HTMLProgressElement).value = Math.m
 let viewer: Viewer | null = null;
 let worker: Worker | null = null;
 let colorMode: ColorMode = "interface";
+let renderMode: RenderMode = "contact";
+let lastScenario: Scenario | null = null;
 
 const DECIMATE_FRAC = 0.2;
 const DEPTHS = [4, 5, 6]; // depth 7 is the long pole; 4–6 already shows the scaling
@@ -120,6 +122,7 @@ function startRun(scn: Scenario) {
   // Fresh worker each run (hard-cancel terminates the previous one).
   worker?.terminate();
   worker = new Worker(new URL("./worker.ts", import.meta.url), { type: "module" });
+  lastScenario = scn;
 
   if (!viewer) viewer = createViewer($("scene"), scn.extent);
   viewer.clearSurfaces();
@@ -130,6 +133,8 @@ function startRun(scn: Scenario) {
   renderStackPanel(scn);
   $("togglePts").removeAttribute("disabled");
   $("colorMode").removeAttribute("disabled");
+  // renderMode stays disabled until the fit finishes — a remesh mid-run would race the
+  // run's own surface stream. finishRun() re-enables it.
 
   const a: Accum = {
     scn, fullFit: [], decFit: [], depthRows: [], surfaces: 0, evalLive: 0,
@@ -147,6 +152,9 @@ function startRun(scn: Scenario) {
           name: ev.seriesName, points: ev.points, ms: ev.ms,
         };
         renderTables(a);
+        break;
+      case "surfaces-cleared":
+        viewer!.clearSurfaces();
         break;
       case "surface":
         viewer!.addSurface({
@@ -182,17 +190,20 @@ function startRun(scn: Scenario) {
 
   const cmd: Command = {
     type: "run", scenario: scn, decimateFrac: DECIMATE_FRAC,
-    fullBaseline: true, depths: DEPTHS, viewDepth: VIEW_DEPTH,
+    fullBaseline: true, depths: DEPTHS, viewDepth: VIEW_DEPTH, renderMode,
   };
   worker.postMessage(cmd);
 
   $("run").setAttribute("disabled", "true");
   $("cancel").removeAttribute("disabled");
+  $("renderMode").setAttribute("disabled", "true");
 }
 
 function finishRun() {
   $("run").removeAttribute("disabled");
   $("cancel").setAttribute("disabled", "true");
+  // The worker now holds a fitted stack — allow instant contact↔solid remeshes.
+  if (worker) $("renderMode").removeAttribute("disabled");
 }
 
 function cancelRun() {
@@ -201,6 +212,7 @@ function cancelRun() {
   setStatus("cancelled.");
   setBar(0);
   finishRun();
+  $("renderMode").setAttribute("disabled", "true"); // no fitted stack after a terminate
 }
 
 /** All borehole surface points across series, for the data-point cloud. */
@@ -224,6 +236,19 @@ async function onRun() {
   startRun(scn);
 }
 
+/** Flip contact↔solid. If a fitted stack is live, ask the worker to re-mesh in the new mode
+ *  (instant — no refit); otherwise just record the mode for the next Run. */
+function toggleRenderMode() {
+  renderMode = renderMode === "contact" ? "solid" : "contact";
+  $("renderMode").textContent =
+    renderMode === "solid" ? "Surfaces: closed solids" : "Surfaces: contacts";
+  // A live worker that has finished a run still holds the fitted stack — remesh it.
+  if (worker) {
+    const cmd: Command = { type: "remesh", renderMode, viewDepth: VIEW_DEPTH };
+    worker.postMessage(cmd);
+  }
+}
+
 $("run").addEventListener("click", () => { onRun().catch((e) => setStatus("ERROR: " + e)); });
 $("cancel").addEventListener("click", cancelRun);
 $("togglePts").addEventListener("click", () => { viewer?.togglePoints(); });
@@ -233,3 +258,4 @@ $("colorMode").addEventListener("click", () => {
   $("colorMode").textContent =
     colorMode === "relation" ? "Color: by relation" : "Color: by contact";
 });
+$("renderMode").addEventListener("click", toggleRenderMode);

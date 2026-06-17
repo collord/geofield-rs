@@ -33,6 +33,12 @@ export interface Scenario {
 // Main -> worker
 // ---------------------------------------------------------------------------
 
+/** How surfaces are meshed for the viewer:
+ *  - "contact" — open contact sheets (one per interface), the default;
+ *  - "solid"   — watertight CLOSED lithology-unit slabs (one per unit), which daylight
+ *                against the erosion surface instead of being trimmed back. */
+export type RenderMode = "contact" | "solid";
+
 export interface RunCommand {
   type: "run";
   scenario: Scenario;
@@ -44,9 +50,19 @@ export interface RunCommand {
   depths: number[];
   /** Octree depth to mesh the surfaces for the 3D viewer. */
   viewDepth: number;
+  /** Which surface representation to mesh for the viewer. */
+  renderMode: RenderMode;
 }
 
-export type Command = RunCommand;
+/** Re-mesh the ALREADY-FITTED stack in a new render mode, without re-fitting. Lets the UI
+ *  flip contact↔solid instantly (a refit would be ~minutes). No-op if nothing is fitted. */
+export interface RemeshCommand {
+  type: "remesh";
+  renderMode: RenderMode;
+  viewDepth: number;
+}
+
+export type Command = RunCommand | RemeshCommand;
 
 // ---------------------------------------------------------------------------
 // Worker -> main (streamed status + results)
@@ -73,16 +89,30 @@ export interface FitDoneEvent {
   ms: number;
 }
 
-/** A meshed contact surface, streamed as it is produced (rendered progressively). The
- *  typed arrays are TRANSFERRED (zero-copy) — do not read them on the worker after post. */
+/** Clear all viewer surfaces — sent before a remesh stream so the scene starts empty. */
+export interface SurfacesClearedEvent {
+  type: "surfaces-cleared";
+}
+
+/** A meshed surface, streamed as it is produced (rendered progressively). The typed arrays
+ *  are TRANSFERRED (zero-copy) — do not read them on the worker after post. In "contact"
+ *  mode this is one open sheet per interface; in "solid" mode one closed slab per unit. */
 export interface SurfaceEvent {
   type: "surface";
+  /** "contact" = open sheet (keyed by interface); "solid" = closed unit slab. */
+  kind: RenderMode;
   seriesIndex: number;
-  /** Which fault block this sheet belongs to (0-based). A faulted contact is streamed as
-   *  one SurfaceEvent per block, each cut flush at the fault — matching the web/ harness. */
+  /** Which fault block this surface belongs to (0-based). A faulted surface is streamed as
+   *  one event per block, each cut flush at the fault — matching the web/ harness. */
   block: number;
+  /** Interface index within the block (contact mode) or the unit's lower-contact index
+   *  (solid mode); -1 for a unit with no lower contact (the bottom slab). */
   interfaceIndex: number;
+  /** Color key: the contact's interface id (contact mode) or the unit's lower-contact id
+   *  (solid mode; the series' first id for the bottom slab). */
   interfaceId: number;
+  /** Lithology unit index within the block, for solid mode (`-1` in contact mode). */
+  unit: number;
   /** The owning series' relation (0=Erode 1=Onlap 2=Conformable 3=Basement). */
   relation: number;
   positions: Float32Array;
@@ -123,6 +153,7 @@ export interface ErrorEvent {
 
 export type WorkerEvent =
   | PhaseEvent
+  | SurfacesClearedEvent
   | FitDoneEvent
   | SurfaceEvent
   | DepthRowEvent

@@ -548,6 +548,40 @@ impl WasmStack {
             .map(Into::into)
             .unwrap_or_else(EMPTY_MESH)
     }
+
+    /// Number of lithology UNIT solids in `block` of `series` (`interfaces + 1`; 0 if out
+    /// of range or field-less). Loop `unit` over this for the closed-solid view
+    /// [`WasmStack::mesh_series_block_unit_solid`].
+    pub fn block_unit_count(&self, series: usize, block: usize) -> usize {
+        self.inner.block_unit_count(series, block)
+    }
+
+    /// Adaptive octree mesh of ONE lithology UNIT of `block` of `series` as a watertight
+    /// CLOSED solid — the slab between consecutive contacts, capped by the box, the block's
+    /// fault planes, and every younger erosion (so it daylights against the erosion surface
+    /// instead of being trimmed away like the open-sheet view). The `cap` flag is implied
+    /// `true`; the octree params mirror the other meshers. EMPTY mesh if any index is out
+    /// of range or the block is field-less.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mesh_series_block_unit_solid(
+        &self,
+        series: usize,
+        block: usize,
+        unit: usize,
+        min_x: f64,
+        min_y: f64,
+        min_z: f64,
+        size: f64,
+        max_depth: u32,
+        min_depth: u32,
+        qef_threshold: f64,
+    ) -> WasmMesh {
+        let cfg = octree_cfg(max_depth, min_depth, qef_threshold, true);
+        self.inner
+            .mesh_one_block_unit_solid(series, block, unit, [min_x, min_y, min_z], size, cfg)
+            .map(Into::into)
+            .unwrap_or_else(EMPTY_MESH)
+    }
 }
 
 impl Default for WasmStack {

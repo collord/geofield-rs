@@ -28,6 +28,14 @@ not on the UI thread — so the page never freezes and a real status stream is p
   cut flush at the fault plane, so the offset reads as two clean sheets instead of one
   surface stretched across the discontinuity. `WasmStack.mesh_series_block_interface` /
   `series_block_count` back this; a non-faulted series is a single block (the whole domain).
+- **Surfaces: contacts / closed solids** toggles the surface representation. *Contacts* are
+  open sheets (one per interface); an eroded contact ends SHORT of the erosion surface because
+  the cut edge is a dropped cap face (open-sheet view). *Closed solids* are watertight
+  lithology-unit slabs (one per unit) capped by the box, the fault, AND every younger erosion
+  — so an eroded unit DAYLIGHTS against the erosion surface instead of stopping short.
+  `WasmStack.mesh_series_block_unit_solid` / `block_unit_count` back this. The toggle sends a
+  `remesh` command that re-meshes the already-fitted stack (no refit — instant fit, ~seconds
+  to re-mesh) rather than re-running the whole pipeline.
 
 ## The scenario
 

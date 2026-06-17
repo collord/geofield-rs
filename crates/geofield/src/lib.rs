@@ -376,7 +376,7 @@ fn bounding_contacts(u: usize, n: usize) -> [Option<usize>; 2] {
 /// sampled on a coarse grid (the cokriging field is smooth, so a coarse sample
 /// bounds it with margin). Used as the top lithology unit's "upper bound" so
 /// `field < upper` holds everywhere and the box top caps the unit.
-fn max_abs_field_in_box(field: &dyn ScalarField, min: [f64; 3], size: f64) -> f64 {
+pub(crate) fn max_abs_field_in_box(field: &dyn ScalarField, min: [f64; 3], size: f64) -> f64 {
     let mut m = 0.0_f64;
     let steps = 6;
     for i in 0..=steps {

@@ -11,6 +11,7 @@ import { initKernel, setEngineMemory, evalCount, evalCountReset } from "../../we
 import kernelWasmUrl from "../public/geofield_kernel.wasm?url";
 import type {
   Command,
+  RenderMode,
   Scenario,
   SeriesJson,
   WorkerEvent,
@@ -19,6 +20,10 @@ import type {
 
 const NAN = Number.NaN;
 const now = () => performance.now();
+
+// The most recently fitted stack + its scenario, kept so a "remesh" command can re-mesh in a
+// new render mode WITHOUT re-fitting (a refit is ~minutes; a re-mesh is ~1 s).
+let fitted: { stack: WasmStack; scn: Scenario } | null = null;
 
 /** Post a typed event. `transfer` lists ArrayBuffers to move zero-copy. */
 function emit(ev: WorkerEvent, transfer: Transferable[] = []) {
@@ -95,36 +100,68 @@ function meshAtDepth(stack: WasmStack, scn: Scenario, depth: number) {
   return { meshMs: now() - t0, tris, verts, evals: evalCount() };
 }
 
-/** Mesh every interface at `depth` and STREAM each surface back (transferred). A faulted
- *  series is meshed PER FAULT BLOCK — each block's contact is a separate sheet cut flush at
- *  the fault plane (matching the web/ harness), rather than one surface stretched across the
- *  offset. A non-faulted series has a single block (block 0 = whole domain). */
-function streamSurfaces(stack: WasmStack, scn: Scenario, depth: number): number {
+/** Mesh + STREAM the viewer surfaces (transferred), per FAULT BLOCK — each block's surface
+ *  is a separate piece cut flush at the fault (matching the web/ harness), not one surface
+ *  stretched across the offset. A non-faulted series is a single block (the whole domain).
+ *
+ *  `mode` picks the representation:
+ *   - "contact": one OPEN contact sheet per interface (cap=false). The erosion cut trims the
+ *     sheet back (the cut edge is a dropped cap face), so an eroded contact ends short of the
+ *     erosion surface.
+ *   - "solid": one watertight CLOSED slab per lithology unit (cap=true), capped by box +
+ *     fault + erosion — so an eroded unit DAYLIGHTS against the erosion surface. */
+function streamSurfaces(stack: WasmStack, scn: Scenario, depth: number, mode: RenderMode): number {
   const [x0, x1, y0, y1, z0, z1] = scn.extent;
   const size = Math.max(x1 - x0, y1 - y0, z1 - z0);
   const minDepth = Math.min(2, depth);
   let count = 0;
   for (let si = 0; si < stack.series_count; si++) {
     const ids = seriesInterfaceIds(scn.series[si]);
-    const n = stack.interface_count(si);
     const blocks = Math.max(1, stack.series_block_count(si));
     for (let b = 0; b < blocks; b++) {
-      for (let k = 0; k < n; k++) {
-        const m = stack.mesh_series_block_interface(si, b, k, x0, y0, z0, size, depth, minDepth, 1e-6, false);
-        if (m.triangle_count > 0) {
-          const positions = m.positions();
-          const normals = m.normals();
-          const indices = m.indices();
-          const ev: SurfaceEvent = {
-            type: "surface", seriesIndex: si, block: b, interfaceIndex: k,
-            interfaceId: ids[k] ?? ids[0] ?? 0,
-            relation: scn.series[si].relation,
-            positions, normals, indices,
-          };
-          emit(ev, [positions.buffer, normals.buffer, indices.buffer]);
-          count++;
+      if (mode === "solid") {
+        // One closed solid per lithology unit (interfaces + 1). Unit u sits above
+        // interface u-1; tag with that lower contact's id (the bottom unit has none).
+        const units = stack.block_unit_count(si, b);
+        for (let u = 0; u < units; u++) {
+          const m = stack.mesh_series_block_unit_solid(si, b, u, x0, y0, z0, size, depth, minDepth, 1e-6);
+          if (m.triangle_count > 0) {
+            const positions = m.positions();
+            const normals = m.normals();
+            const indices = m.indices();
+            const ev: SurfaceEvent = {
+              type: "surface", kind: "solid", seriesIndex: si, block: b,
+              interfaceIndex: u > 0 ? u - 1 : -1, unit: u,
+              interfaceId: ids[u > 0 ? u - 1 : 0] ?? ids[0] ?? 0,
+              relation: scn.series[si].relation,
+              positions, normals, indices,
+            };
+            emit(ev, [positions.buffer, normals.buffer, indices.buffer]);
+            count++;
+          }
+          m.free();
         }
-        m.free();
+      } else {
+        // One open contact sheet per interface.
+        const n = stack.interface_count(si);
+        for (let k = 0; k < n; k++) {
+          const m = stack.mesh_series_block_interface(si, b, k, x0, y0, z0, size, depth, minDepth, 1e-6, false);
+          if (m.triangle_count > 0) {
+            const positions = m.positions();
+            const normals = m.normals();
+            const indices = m.indices();
+            const ev: SurfaceEvent = {
+              type: "surface", kind: "contact", seriesIndex: si, block: b,
+              interfaceIndex: k, unit: -1,
+              interfaceId: ids[k] ?? ids[0] ?? 0,
+              relation: scn.series[si].relation,
+              positions, normals, indices,
+            };
+            emit(ev, [positions.buffer, normals.buffer, indices.buffer]);
+            count++;
+          }
+          m.free();
+        }
       }
     }
   }
@@ -132,7 +169,7 @@ function streamSurfaces(stack: WasmStack, scn: Scenario, depth: number): number 
 }
 
 async function run(cmd: Extract<Command, { type: "run" }>) {
-  const { scenario: scn, decimateFrac, fullBaseline, depths, viewDepth } = cmd;
+  const { scenario: scn, decimateFrac, fullBaseline, depths, viewDepth, renderMode } = cmd;
 
   emit({ type: "phase", phase: "loading-wasm", label: "loading kernel + engine wasm…", progress: 0.02 });
   await initWasm();
@@ -147,11 +184,12 @@ async function run(cmd: Extract<Command, { type: "run" }>) {
 
   emit({ type: "phase", phase: "fitting", label: `fitting decimated (frac ${decimateFrac})…`, progress: 0.4 });
   const { stack, totalMs: decimatedFitMs } = buildStack(scn, decimateFrac, "decimated");
+  fitted = { stack, scn }; // keep for instant remesh in another render mode
 
   // Stream the renderable surfaces FIRST, so the model APPEARS as soon as it is fit — the
   // user shouldn't wait through the (slower) timing sweep just to see the geology.
-  emit({ type: "phase", phase: "rendering", label: `meshing surfaces for the viewer (depth ${viewDepth})…`, progress: 0.55 });
-  const surfaceCount = streamSurfaces(stack, scn, viewDepth);
+  emit({ type: "phase", phase: "rendering", label: `meshing ${renderMode === "solid" ? "closed solids" : "contact surfaces"} for the viewer (depth ${viewDepth})…`, progress: 0.55 });
+  const surfaceCount = streamSurfaces(stack, scn, viewDepth, renderMode);
 
   // Then the depth sweep (timing). Warm pass discarded, second pass reported.
   for (let i = 0; i < depths.length; i++) {
@@ -172,11 +210,31 @@ async function run(cmd: Extract<Command, { type: "run" }>) {
   emit({ type: "done", fullFitMs, decimatedFitMs, surfaceCount, dataPointCount });
 }
 
+/** Re-mesh the already-fitted stack in a new render mode, without re-fitting. */
+function remesh(cmd: Extract<Command, { type: "remesh" }>) {
+  if (!fitted) return; // nothing fitted yet — the UI will have triggered a full run instead
+  const { stack, scn } = fitted;
+  emit({ type: "surfaces-cleared" });
+  emit({
+    type: "phase", phase: "rendering",
+    label: `re-meshing ${cmd.renderMode === "solid" ? "closed solids" : "contact surfaces"} (depth ${cmd.viewDepth})…`,
+    progress: 0.9,
+  });
+  const surfaceCount = streamSurfaces(stack, scn, cmd.viewDepth, cmd.renderMode);
+  emit({ type: "phase", phase: "done", label: `done — ${surfaceCount} surfaces.`, progress: 1 });
+}
+
 self.onmessage = (e: MessageEvent<Command>) => {
   const cmd = e.data;
-  if (cmd.type === "run") {
-    run(cmd).catch((err) => {
-      emit({ type: "error", message: err instanceof Error ? err.message : String(err) });
-    });
+  try {
+    if (cmd.type === "run") {
+      run(cmd).catch((err) => {
+        emit({ type: "error", message: err instanceof Error ? err.message : String(err) });
+      });
+    } else if (cmd.type === "remesh") {
+      remesh(cmd);
+    }
+  } catch (err) {
+    emit({ type: "error", message: err instanceof Error ? err.message : String(err) });
   }
 };

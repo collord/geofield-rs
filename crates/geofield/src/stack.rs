@@ -44,9 +44,10 @@
 
 use crate::mesh::Mesh;
 use crate::octree::{
-    octree_dual_contour_scene, AxisBox, Boundary, ContactHalfSpace, OctreeConfig, Scene,
+    octree_dual_contour_scene, AxisBox, Boundary, ContactHalfSpace, OctreeConfig, PlaneHalfSpace,
+    Scene,
 };
-use crate::{clip_mesh_to_half_spaces, BlockModel, SeriesModel};
+use crate::{clip_mesh_to_half_spaces, max_abs_field_in_box, BlockModel, SeriesModel};
 
 /// How a series relates to the (older) series beneath it (GemPy `StackRelationType`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -276,6 +277,89 @@ impl<M: SeriesModel + BlockModel> Stack<M> {
             clip_mesh_to_half_spaces(&mut mesh, &half_spaces);
         }
         Some(mesh)
+    }
+
+    /// Number of lithology UNIT solids in block `b` of series `i` (`interfaces + 1`, 0 if
+    /// field-less or out of range). Loop `unit` over this for
+    /// [`Stack::mesh_one_block_unit_solid`].
+    pub fn block_unit_count(&self, i: usize, b: usize) -> usize {
+        self.series.get(i).map(|s| s.model.block_unit_count(b)).unwrap_or(0)
+    }
+
+    /// Mesh ONE lithology UNIT of block `b` of series `i` as a watertight CLOSED solid —
+    /// the slab between consecutive contacts `{ iso[unit-1] ≤ field_b < iso[unit] }`,
+    /// capped by the domain box, the block's fault planes, AND every younger erosion (so
+    /// the slab is truncated where a younger Erode series removed it — the same clip the
+    /// open-sheet [`Stack::mesh_one_block`] applies, here as a real cap face that daylights
+    /// against the erosion surface instead of being dropped).
+    ///
+    /// `unit` is `0..=interfaces` (bottom unit `0` has no lower contact; top unit
+    /// `interfaces` has no upper contact, the box caps it). Returns `None` if `i`/`b`/`unit`
+    /// is out of range or block `b` is field-less; the mesh may still be empty if the unit
+    /// has no volume in this block's visible region.
+    pub fn mesh_one_block_unit_solid(
+        &self,
+        i: usize,
+        b: usize,
+        unit: usize,
+        min: [f64; 3],
+        size: f64,
+        cfg: OctreeConfig,
+    ) -> Option<Mesh> {
+        let s = self.series.get(i)?;
+        let isovalues = s.model.block_interface_isovalues(b);
+        let n = isovalues.len();
+        if n == 0 || unit > n {
+            return None;
+        }
+        let block_field = s.model.block_field(b)?;
+
+        // Upper bound of the slab: the unit's upper contact, or (top unit) a value above
+        // every field in the box so the box top caps it. The primary isosurface.
+        let upper_iso = if unit < n {
+            isovalues[unit]
+        } else {
+            max_abs_field_in_box(&block_field, min, size) + 1.0
+        };
+        // Lower bound: the ABOVE side of the unit's lower contact, if any.
+        let lower: Option<ContactHalfSpace> = if unit > 0 {
+            Some(ContactHalfSpace::new(&block_field, isovalues[unit - 1], false))
+        } else {
+            None
+        };
+
+        let box_b = AxisBox::new(min, size);
+        // The block's fault planes (kept as real caps so slabs stitch to the fault wall).
+        let planes: Vec<PlaneHalfSpace> = s
+            .model
+            .block_half_spaces(b)
+            .into_iter()
+            .map(|hs| PlaneHalfSpace::new(hs.point, hs.normal, hs.keep_positive))
+            .collect();
+        // Younger-erosion clips (whole-model fields), so the closed slab respects erosion
+        // exactly like the open sheet — but here the cut is a kept cap face.
+        let masker_fields = self.erode_masker_fields(i);
+        let maskers: Vec<ContactHalfSpace<'_>> = masker_fields
+            .iter()
+            .map(|(field, iso_top)| ContactHalfSpace::new(field, *iso_top, false))
+            .collect();
+
+        let mut contributors: Vec<&dyn Boundary> =
+            Vec::with_capacity(planes.len() + maskers.len() + 2);
+        contributors.push(&box_b);
+        for p in &planes {
+            contributors.push(p);
+        }
+        if let Some(lo) = &lower {
+            contributors.push(lo);
+        }
+        for m in &maskers {
+            contributors.push(m);
+        }
+
+        let cfg = OctreeConfig { cap: true, ..cfg };
+        let scene = Scene::new(&block_field, upper_iso, contributors);
+        Some(octree_dual_contour_scene(&scene, min, size, cfg))
     }
 }
 
@@ -567,5 +651,68 @@ mod tests {
             }
             assert!(contact_vs > 0, "block {b} has no contact vertices near z={expect_z}");
         }
+    }
+
+    /// The closed-solid path (`mesh_one_block_unit_solid`) produces watertight lithology
+    /// slabs, and — for an ERODED older series — the slab DAYLIGHTS against the erosion
+    /// surface: its closed solid reaches up to the eroding contact (a kept cap face),
+    /// where the open-sheet view (`mesh_one_block`) is instead trimmed back. This is the
+    /// difference the web2 "closed solids" toggle exposes.
+    #[test]
+    fn closed_solids_daylight_against_erosion() {
+        let stack = two_series_stack(Relation::Erode); // older bed eroded on the left
+        let cfg = OctreeConfig { max_depth: 6, min_depth: 2, qef_threshold: 1e-6, cap: true };
+
+        // The older series (index 1) is non-faulted → one block. block_unit_count = 2 (one
+        // interface ⇒ units below/above the bed). Every unit solid must be watertight.
+        assert_eq!(stack.series_block_count(1), 1, "non-faulted series has one block");
+        let units = stack.block_unit_count(1, 0);
+        assert!(units >= 2, "older series should have ≥2 unit slabs, got {units}");
+
+        let mut total_solid_tris = 0usize;
+        for u in 0..units {
+            let mesh = stack
+                .mesh_one_block_unit_solid(1, 0, u, [0.0, 0.0, 0.0], 1000.0, cfg)
+                .expect("unit in range");
+            if mesh.triangle_count() == 0 {
+                continue; // a unit with no volume in the visible region
+            }
+            total_solid_tris += mesh.triangle_count();
+            let (nm, open, _total) = edge_stats(&mesh);
+            assert_eq!(nm, 0, "unit {u} closed solid non-manifold: {nm}");
+            assert_eq!(open, 0, "unit {u} closed solid not watertight: open {open}");
+        }
+        assert!(total_solid_tris > 0, "closed solids produced no geometry");
+
+        // Daylighting: the closed solid of the older series carries cap faces lying ON the
+        // erosion contact (the younger series' top isovalue surface), which the open sheet
+        // drops. Probe the younger erosion elevation at a point where it cuts the older bed
+        // — the closed solids must include vertices up near that contact, proving they
+        // reach the erosion surface rather than stopping short of it.
+        let younger = &stack.series[0];
+        let iso_top = younger.iso_top().unwrap();
+        // A point where the younger contact (z=600+0.4(x-500)) is near the older bed z=500:
+        // 600+0.4(x-500)=500 ⇒ x≈250. Around there the erosion truncates the older bed.
+        let mut reaches_erosion = false;
+        for u in 0..units {
+            let mesh = stack
+                .mesh_one_block_unit_solid(1, 0, u, [0.0, 0.0, 0.0], 1000.0, cfg)
+                .unwrap();
+            for v in mesh.positions.chunks_exact(3) {
+                let p = [v[0] as f64, v[1] as f64, v[2] as f64];
+                // On the erosion contact, the younger field ≈ its top isovalue.
+                if (younger.model.scalar_field(p) - iso_top).abs() < 0.05 * iso_top.abs().max(1.0) {
+                    reaches_erosion = true;
+                    break;
+                }
+            }
+            if reaches_erosion {
+                break;
+            }
+        }
+        assert!(
+            reaches_erosion,
+            "closed solids should daylight ON the erosion contact (cap faces there), not stop short"
+        );
     }
 }
