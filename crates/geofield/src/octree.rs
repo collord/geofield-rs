@@ -403,6 +403,15 @@ impl AxisBox {
         }
     }
 
+    /// An arbitrary (non-cube) axis-aligned box from explicit bounds. Used to clip a mesh
+    /// to the TRUE data extent when the octree cube (side = max span) balloons one axis far
+    /// beyond the geology — without this, the cokriging field's linear drift re-crosses the
+    /// isovalue out in the empty extrapolated space and the contour grows spurious lobes on
+    /// the cube's floor/ceiling.
+    pub fn from_bounds(min: [f64; 3], max: [f64; 3]) -> Self {
+        Self { min, max }
+    }
+
     /// Signed "box field": negative strictly inside, zero on a face, positive
     /// outside. The classic box SDF (max of per-axis slab distances) — its sign
     /// is the membership test and its zero set is the six faces.

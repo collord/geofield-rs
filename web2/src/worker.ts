@@ -90,7 +90,7 @@ function meshAtDepth(stack: WasmStack, scn: Scenario, depth: number) {
     const blocks = Math.max(1, stack.series_block_count(si));
     for (let b = 0; b < blocks; b++) {
       for (let k = 0; k < n; k++) {
-        const m = stack.mesh_series_block_interface(si, b, k, x0, y0, z0, size, depth, minDepth, 1e-6, false);
+        const m = stack.mesh_series_block_interface(si, b, k, x0, y0, z0, size, x1, y1, z1, depth, minDepth, 1e-6, false);
         tris += m.triangle_count;
         verts += m.vertex_count;
         m.free();
@@ -120,11 +120,13 @@ function streamSurfaces(stack: WasmStack, scn: Scenario, depth: number, mode: Re
     const blocks = Math.max(1, stack.series_block_count(si));
     for (let b = 0; b < blocks; b++) {
       if (mode === "solid") {
-        // One closed solid per lithology unit (interfaces + 1). Unit u sits above
-        // interface u-1; tag with that lower contact's id (the bottom unit has none).
-        const units = stack.block_unit_count(si, b);
+        // One closed solid per PRESENT lithology unit (the rock-bearing units below this
+        // series' bounding contact — the topmost unit is the void above it, owned by a
+        // younger series, so it is NOT rendered). Unit u sits above interface u-1; tag with
+        // that lower contact's id (the bottom unit has none).
+        const units = stack.present_unit_count(si, b);
         for (let u = 0; u < units; u++) {
-          const m = stack.mesh_series_block_unit_solid(si, b, u, x0, y0, z0, size, depth, minDepth, 1e-6);
+          const m = stack.mesh_series_block_unit_solid(si, b, u, x0, y0, z0, size, x1, y1, z1, depth, minDepth, 1e-6);
           if (m.triangle_count > 0) {
             const positions = m.positions();
             const normals = m.normals();
@@ -145,7 +147,7 @@ function streamSurfaces(stack: WasmStack, scn: Scenario, depth: number, mode: Re
         // One open contact sheet per interface.
         const n = stack.interface_count(si);
         for (let k = 0; k < n; k++) {
-          const m = stack.mesh_series_block_interface(si, b, k, x0, y0, z0, size, depth, minDepth, 1e-6, false);
+          const m = stack.mesh_series_block_interface(si, b, k, x0, y0, z0, size, x1, y1, z1, depth, minDepth, 1e-6, false);
           if (m.triangle_count > 0) {
             const positions = m.positions();
             const normals = m.normals();

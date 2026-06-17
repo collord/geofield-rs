@@ -172,9 +172,25 @@ impl<M: SeriesModel> Stack<M> {
         size: f64,
         cfg: OctreeConfig,
     ) -> Option<Mesh> {
+        self.mesh_one_clipped(i, interface_idx, min, size, [min[0] + size, min[1] + size, min[2] + size], cfg)
+    }
+
+    /// As [`Stack::mesh_one`], but clip the contour to the TRUE extent box `[min, ext_max]`
+    /// rather than the octree cube `[min, min+size]³`. When the cube balloons one axis past
+    /// the geology (a wide-flat domain), this drops the spurious floor/ceiling lobes the
+    /// cokriging drift produces in the empty extrapolated space.
+    pub fn mesh_one_clipped(
+        &self,
+        i: usize,
+        interface_idx: usize,
+        min: [f64; 3],
+        size: f64,
+        ext_max: [f64; 3],
+        cfg: OctreeConfig,
+    ) -> Option<Mesh> {
         let s = self.series.get(i)?;
         let isovalue = *s.model.interface_isovalues().get(interface_idx)?;
-        let box_b = AxisBox::new(min, size);
+        let box_b = AxisBox::from_bounds(min, ext_max);
         // Hold the masker fields in a local so the half-spaces (which borrow them) and the
         // field reference below all outlive the `Scene`.
         let masker_fields = self.erode_masker_fields(i);
@@ -249,6 +265,7 @@ impl<M: SeriesModel + BlockModel> Stack<M> {
         interface_idx: usize,
         min: [f64; 3],
         size: f64,
+        ext_max: [f64; 3],
         cfg: OctreeConfig,
     ) -> Option<Mesh> {
         let s = self.series.get(i)?;
@@ -256,7 +273,8 @@ impl<M: SeriesModel + BlockModel> Stack<M> {
         // isovalue — use the block's own isovalue so the contour lands on the block field.
         let isovalue = *s.model.block_interface_isovalues(b).get(interface_idx)?;
         let block_field = s.model.block_field(b)?;
-        let box_b = AxisBox::new(min, size);
+        // Clip to the TRUE extent box, not the (possibly ballooned) octree cube.
+        let box_b = AxisBox::from_bounds(min, ext_max);
         // Younger-erosion clip half-spaces, exactly as `mesh_one` (whole-model fields —
         // erosion is geological and dispatches per-block correctly).
         let masker_fields = self.erode_masker_fields(i);
@@ -280,10 +298,26 @@ impl<M: SeriesModel + BlockModel> Stack<M> {
     }
 
     /// Number of lithology UNIT solids in block `b` of series `i` (`interfaces + 1`, 0 if
-    /// field-less or out of range). Loop `unit` over this for
-    /// [`Stack::mesh_one_block_unit_solid`].
+    /// field-less or out of range). This counts EVERY unit including the topmost — for the
+    /// renderable (rock-present) units use [`Stack::present_unit_count`].
     pub fn block_unit_count(&self, i: usize, b: usize) -> usize {
         self.series.get(i).map(|s| s.model.block_unit_count(b)).unwrap_or(0)
+    }
+
+    /// Number of PRESENT (rock-bearing) lithology units in block `b` of series `i` — the
+    /// units that are actually this series' rock, to render as closed solids.
+    ///
+    /// A series is present where `field < iso_top` (below its bounding/unconformity
+    /// contact). With `N` interfaces there are `N + 1` units `0..=N`; the present side
+    /// `field < iso[N-1]` is units `0..N` — the topmost unit `N` (`field ≥ iso[N-1]`) is
+    /// the VOID above the series' bounding contact, owned by whatever younger series sits
+    /// there, NOT by this series. So the renderable count is `block_unit_count - 1`
+    /// (`= interfaces`). Returns 0 for a field-less block.
+    pub fn present_unit_count(&self, i: usize, b: usize) -> usize {
+        match self.block_unit_count(i, b) {
+            0 => 0,
+            n => n - 1, // drop the topmost (above-the-bounding-contact) void unit
+        }
     }
 
     /// Mesh ONE lithology UNIT of block `b` of series `i` as a watertight CLOSED solid —
@@ -304,6 +338,7 @@ impl<M: SeriesModel + BlockModel> Stack<M> {
         unit: usize,
         min: [f64; 3],
         size: f64,
+        ext_max: [f64; 3],
         cfg: OctreeConfig,
     ) -> Option<Mesh> {
         let s = self.series.get(i)?;
@@ -328,7 +363,8 @@ impl<M: SeriesModel + BlockModel> Stack<M> {
             None
         };
 
-        let box_b = AxisBox::new(min, size);
+        // Clip to the TRUE extent box, not the (possibly ballooned) octree cube.
+        let box_b = AxisBox::from_bounds(min, ext_max);
         // The block's fault planes (kept as real caps so slabs stitch to the fault wall).
         let planes: Vec<PlaneHalfSpace> = s
             .model
@@ -626,7 +662,7 @@ mod tests {
         // Block 0 = left (x<500), contact at z=600; block 1 = right (x>=500), contact z=700.
         for (b, side_lo, side_hi, expect_z) in [(0usize, 0.0, 500.0, 600.0), (1, 500.0, 1000.0, 700.0)] {
             let mesh = stack
-                .mesh_one_block(0, b, 0, [0.0, 0.0, 0.0], 1000.0, cfg)
+                .mesh_one_block(0, b, 0, [0.0, 0.0, 0.0], 1000.0, [1000.0, 1000.0, 1000.0], cfg)
                 .expect("block in range");
             assert!(mesh.triangle_count() > 0, "block {b} produced an empty mesh");
             // Contact vertices (near the bed, not box-cap walls) must sit on this block's
@@ -672,7 +708,7 @@ mod tests {
         let mut total_solid_tris = 0usize;
         for u in 0..units {
             let mesh = stack
-                .mesh_one_block_unit_solid(1, 0, u, [0.0, 0.0, 0.0], 1000.0, cfg)
+                .mesh_one_block_unit_solid(1, 0, u, [0.0, 0.0, 0.0], 1000.0, [1000.0, 1000.0, 1000.0], cfg)
                 .expect("unit in range");
             if mesh.triangle_count() == 0 {
                 continue; // a unit with no volume in the visible region
@@ -696,7 +732,7 @@ mod tests {
         let mut reaches_erosion = false;
         for u in 0..units {
             let mesh = stack
-                .mesh_one_block_unit_solid(1, 0, u, [0.0, 0.0, 0.0], 1000.0, cfg)
+                .mesh_one_block_unit_solid(1, 0, u, [0.0, 0.0, 0.0], 1000.0, [1000.0, 1000.0, 1000.0], cfg)
                 .unwrap();
             for v in mesh.positions.chunks_exact(3) {
                 let p = [v[0] as f64, v[1] as f64, v[2] as f64];
@@ -714,5 +750,36 @@ mod tests {
             reaches_erosion,
             "closed solids should daylight ON the erosion contact (cap faces there), not stop short"
         );
+    }
+
+    /// The extent-box clip bounds the contour to the TRUE extent, not the octree cube. With
+    /// a cube `size` much taller than `ext_max`, a contact must not produce geometry above
+    /// `ext_max` — this is what keeps the cokriging drift's spurious lobes (which form out
+    /// in the empty extrapolated column beyond the data) from being meshed. Without the
+    /// clip the field re-crosses its isovalue far above the bed and grows a ceiling lobe.
+    #[test]
+    fn extent_clip_bounds_contour_to_true_extent() {
+        // One flat bed at z=500 over a 1000-cube octree, but clip the TRUE extent z to 650.
+        let stack = Stack::new(vec![StackedSeries::new(dipping_plane(500.0, 0.0, 0.0), Relation::Basement)]);
+        let cfg = OctreeConfig { max_depth: 6, min_depth: 2, qef_threshold: 1e-6, cap: false };
+        let ext_max = [1000.0, 1000.0, 650.0]; // z capped well below the cube top (1000)
+
+        let mesh = stack
+            .mesh_one_clipped(0, 0, [0.0, 0.0, 0.0], 1000.0, ext_max, cfg)
+            .expect("interface in range");
+        assert!(mesh.triangle_count() > 0, "produced no geometry");
+
+        // No REFERENCED vertex may exceed the clipped extent (allow a one-cell slop at the
+        // cut). The contact at z=500 is inside; any z≫650 vertex would be a cube-driven lobe.
+        let cell = 1000.0 / 2f64.powi(6) + 1.0;
+        let referenced: std::collections::HashSet<u32> = mesh.indices.iter().copied().collect();
+        for &vi in &referenced {
+            let z = mesh.positions[vi as usize * 3 + 2] as f64;
+            assert!(
+                z <= ext_max[2] + cell,
+                "vertex z={z:.1} exceeds clipped extent {} (+{cell:.1}) — cube lobe not clipped",
+                ext_max[2]
+            );
+        }
     }
 }

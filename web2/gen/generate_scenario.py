@@ -241,6 +241,17 @@ def main():
     collars = gen_boreholes(args.n, args.grid, args.jitter, args.seed)
     sed, bas = build_series(collars, args.ori_every, args.seed)
 
+    # Tighten the z-extent to HUG the logged data (a small margin below/above the deepest
+    # and shallowest surface point). The cokriging field's linear drift re-crosses its
+    # isovalue out in unconstrained space far from data, growing spurious contact lobes;
+    # meshing only the data-supported interval (what you would actually trust) keeps those
+    # out. The horizontal extent stays the full map. (The mesher additionally clips to this
+    # box, but the box must not itself extend hundreds of ft of empty column below the data.)
+    all_z = sed["sp_xyz"][2::3] + bas["sp_xyz"][2::3]
+    z_lo, z_hi = min(all_z), max(all_z)
+    margin = 0.05 * (z_hi - z_lo)  # ~5% pad so surfaces are not clipped at the very edge
+    EXTENT["z"] = (z_lo - margin, z_hi + margin)
+
     # Stack order: youngest first. Basalt (Erode) over sediments (Basement). The late
     # fault is applied to BOTH series' fits (same plane), so the whole column offsets.
     # Relation codes: 0=Erode 1=Onlap 2=Conformable 3=Basement.
