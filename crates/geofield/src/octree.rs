@@ -54,15 +54,11 @@
 
 use crate::mesh::{corner_offset, normalize, qef_vertex, Mesh, CELL_EDGES};
 
-/// A scalar field the contourer can sample: the value and analytic gradient at a
-/// world point. Implemented by [`crate::Model`] (which dispatches per fault block) and
-/// by a single-block view, so the contourer can mesh either the whole faulted model or
-/// ONE block's smooth field in isolation (the latter avoids the cross-fault
-/// discontinuity that crumples the contact at the fault).
-pub trait ScalarField {
-    fn scalar_field(&self, p: [f64; 3]) -> f64;
-    fn scalar_field_gradient(&self, p: [f64; 3]) -> [f64; 3];
-}
+/// The contourer samples a scalar field through the kernel's [`ScalarField`] contract
+/// (value + analytic gradient at a world point). Implemented by the kernel's `Model`
+/// (per-block dispatch) and its `BlockField` (one block's smooth field), so the octree
+/// can mesh the whole faulted model or one block in isolation.
+pub use geofield_kernel::ScalarField;
 
 // ---------------------------------------------------------------------------
 // Boundary: the domain wall as just-another-implicit-surface.

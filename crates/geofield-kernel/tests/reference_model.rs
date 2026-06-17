@@ -11,10 +11,10 @@
 
 use std::path::{Path, PathBuf};
 
-use geofield_rs::assemble::{assemble, KernelOptions};
-use geofield_rs::data::{Orientation, Series, SurfacePoint};
-use geofield_rs::evaluate::Field;
-use geofield_rs::solve::solve;
+use geofield_kernel::assemble::{assemble, KernelOptions};
+use geofield_kernel::data::{Orientation, Series, SurfacePoint};
+use geofield_kernel::evaluate::Field;
+use geofield_kernel::solve::solve;
 
 fn fixture_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))

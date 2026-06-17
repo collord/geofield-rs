@@ -18,7 +18,7 @@ use crate::fault::{BlockIndex, OneFault, PlanarFault};
 use crate::mesh::{dual_contour, MeshGrid};
 use crate::octree::{octree_dual_contour, OctreeConfig};
 use crate::stack::{Relation, Stack, StackedSeries};
-use crate::Model;
+use crate::{MeshModel, Model};
 
 #[wasm_bindgen]
 extern "C" {

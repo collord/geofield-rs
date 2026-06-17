@@ -1,0 +1,25 @@
+[package]
+name = "geofield-kernel"
+version = "0.1.0"
+edition = "2021"
+description = "Universal-cokriging scalar field — the gempy-validated interpolation kernel (assemble, solve, evaluate, lithology), plus the fitted Model and field-level faults. WASM-safe; no meshing."
+license = "EUPL"
+
+[dependencies]
+# Trimmed faer: std + dense linalg + npy (no rand/getrandom → wasm-safe). See the
+# root README/Cargo history for why each feature is set. The Bunch-Kaufman solver
+# lives under `linalg`.
+faer = { version = "0.24", default-features = false, features = ["std", "linalg", "npy"] }
+
+[features]
+default = []
+# Native builds opt into rayon for parallel BLAS; wasm omits it.
+native-parallel = ["faer/rayon"]
+
+[lib]
+crate-type = ["rlib"]
+
+[dev-dependencies]
+# Fixture I/O for the validation/reference tests (gempy dumps .npy + .json).
+npyz = "0.8"
+serde_json = "1"

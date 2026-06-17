@@ -1,42 +1,13 @@
-[package]
-name = "geofield-rs"
-version = "0.1.0"
-edition = "2021"
-description = "Universal-cokriging scalar field (single series, non-faulted) — WASM-targetable"
-license = "MIT OR Apache-2.0"
+[workspace]
+members = ["crates/geofield-kernel", "crates/geofield"]
+resolver = "2"
 
-[dependencies]
-# Trim faer to std + dense linalg + npy: its default `rand` feature pulls in
-# getrandom (breaks wasm32-unknown-unknown) and `rayon` has no wasm threads, so
-# both are dropped. `npy` is kept because faer 0.21.9's src/io.rs references npyz
-# unconditionally (not gated by the feature), so disabling it fails to compile;
-# npyz is pure-Rust and wasm-safe. The Bunch-Kaufman solver lives under `linalg`.
-# faer 0.24+: 0.21's faer-traits sets `type Index = u64` for the f64
-# ComplexField but only impls Index for u32/usize, so `u64: Index` fails on
-# wasm32 (usize = u32). 0.24 fixes this; the Lblt/Solve API is unchanged.
-faer = { version = "0.24", default-features = false, features = ["std", "linalg", "npy"] }
-wasm-bindgen = { version = "0.2", optional = true }
-# Fixture I/O for the geofield-cli validation binary (feature = "cli").
-npyz = { version = "0.8", optional = true }
-serde_json = { version = "1", optional = true }
-
-[features]
-default = []
-# Native builds opt into rayon for parallel BLAS; wasm omits it.
-native-parallel = ["faer/rayon"]
-wasm = ["dep:wasm-bindgen"]
-# The validation CLI (geofield-cli) reads/writes .npy + .json fixtures.
-cli = ["dep:npyz", "dep:serde_json"]
-
-[lib]
-crate-type = ["cdylib", "rlib"]
-
-[[bin]]
-name = "geofield-cli"
-path = "src/bin/geofield_cli.rs"
-required-features = ["cli"]
-
-[dev-dependencies]
-# Fixture I/O for the validation tests (gempy dumps .npy + .json).
-npyz = "0.8"
-serde_json = "1"
+# Two crates:
+#   geofield-kernel — the gempy-validated universal-cokriging interpolation kernel
+#                     (assemble/solve/evaluate/litho), the fitted Model, and field-level
+#                     faults. No meshing; WASM-safe.
+#   geofield        — meshing (octree dual contouring), multi-series stacking, per-block
+#                     fault meshing, the CLI, and WASM bindings. Depends on the kernel.
+#
+# The validation/ harness drives `geofield-cli` (built from the geofield crate); the
+# web harness builds the geofield crate to wasm.

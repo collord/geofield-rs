@@ -4,8 +4,8 @@
 //! rather than smoothly bending them).
 //!
 //! This is the **field-assembly** layer, deliberately separate from the mesh-time
-//! [`crate::octree::Boundary`] (which clips an already-solved field). Block
-//! membership is a pure sign test: "which side of the fault is `p` on?" A
+//! `octree::Boundary` in the `geofield` crate (which clips an already-solved field).
+//! Block membership is a pure sign test: "which side of the fault is `p` on?" A
 //! [`BlockIndex`] maps a point to a block id; [`crate::Model::fit_faulted`] solves
 //! one cokriging field per block and dispatches eval to the block at the query
 //! point. Surface points/orientations are assigned to a block by the SAME

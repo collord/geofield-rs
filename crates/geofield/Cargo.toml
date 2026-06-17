@@ -1,0 +1,33 @@
+[package]
+name = "geofield"
+version = "0.1.0"
+edition = "2021"
+description = "Geological meshing on top of geofield-kernel: adaptive octree dual contouring, multi-series stacking, per-block fault meshing, and WASM bindings."
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+geofield-kernel = { path = "../geofield-kernel" }
+wasm-bindgen = { version = "0.2", optional = true }
+# Fixture I/O for the geofield-cli validation binary (feature = "cli").
+npyz = { version = "0.8", optional = true }
+serde_json = { version = "1", optional = true }
+
+[features]
+default = []
+# Native builds opt into rayon for parallel BLAS (via the kernel).
+native-parallel = ["geofield-kernel/native-parallel"]
+wasm = ["dep:wasm-bindgen"]
+# The validation CLI (geofield-cli) reads/writes .npy + .json fixtures.
+cli = ["dep:npyz", "dep:serde_json"]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "geofield-cli"
+path = "src/bin/geofield_cli.rs"
+required-features = ["cli"]
+
+[dev-dependencies]
+npyz = "0.8"
+serde_json = "1"

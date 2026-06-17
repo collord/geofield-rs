@@ -1,7 +1,7 @@
 // WASM glue: turn editable rows into a fitted WasmModel and a dual-contoured
 // isosurface mesh. Mirrors the conversions in src/bin/geofield_cli.rs.
 
-import init, { WasmModel } from "./wasm/geofield_rs.js";
+import init, { WasmModel } from "./wasm/geofield.js";
 import {
   SurfacePointRow,
   OrientationRow,

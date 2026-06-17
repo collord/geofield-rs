@@ -7,7 +7,7 @@
 //!   - `cubic_a(r,a)` equals `d²/dr² C(r)` (central FD)
 //! across several `r ∈ (0, a)` and several `a`.
 
-use geofield_rs::kernel::{cubic_a, cubic_c, cubic_p_div_r};
+use geofield_kernel::kernel::{cubic_a, cubic_c, cubic_p_div_r};
 
 /// Central finite difference of `C` (first derivative).
 fn fd_first(r: f64, a: f64, h: f64) -> f64 {

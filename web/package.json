@@ -4,7 +4,7 @@
   "version": "0.1.0",
   "type": "module",
   "scripts": {
-    "wasm": "wasm-pack build .. --target web --out-dir web/src/wasm -- --features wasm",
+    "wasm": "wasm-pack build ../crates/geofield --target web --out-dir ../../web/src/wasm -- --features wasm",
     "dev": "vite",
     "build": "tsc -b && vite build",
     "preview": "vite preview"

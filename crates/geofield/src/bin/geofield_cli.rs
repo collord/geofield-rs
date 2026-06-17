@@ -24,9 +24,9 @@
 
 use std::path::{Path, PathBuf};
 
-use geofield_rs::assemble::KernelOptions;
-use geofield_rs::data::{Orientation, Series, SurfacePoint};
-use geofield_rs::Model;
+use geofield_kernel::assemble::KernelOptions;
+use geofield_kernel::data::{Orientation, Series, SurfacePoint};
+use geofield_kernel::Model;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -88,7 +88,7 @@ fn print_help() {
 /// Assemble the kriging system for the fixture inputs and write the dense K
 /// (row-major (dim,dim)) and b ((dim,)) as .npy for the block diff.
 fn dump_kernel(dir: &Path) -> Result<(), String> {
-    use geofield_rs::assemble::assemble;
+    use geofield_kernel::assemble::assemble;
     let series = read_inputs(dir)?;
     let opts = read_kernel_options(dir)?;
     let sys = assemble(&series, opts);

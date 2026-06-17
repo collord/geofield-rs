@@ -26,10 +26,10 @@
 //! Do NOT use a pass here to conclude a sign/scale convention is correct.
 //! See the cross-referenced history note in `src/assemble.rs`.
 
-use geofield_rs::assemble::{assemble, KernelOptions, System};
-use geofield_rs::data::{Orientation, Series, SurfacePoint};
-use geofield_rs::evaluate::Field;
-use geofield_rs::solve::{solve, Solution};
+use geofield_kernel::assemble::{assemble, KernelOptions, System};
+use geofield_kernel::data::{Orientation, Series, SurfacePoint};
+use geofield_kernel::evaluate::Field;
+use geofield_kernel::solve::{solve, Solution};
 
 /// Within-interface spread the corrected (gempy-faithful) system stays under.
 /// Calibrated to the CORRECT field's behavior (~2e-6 on the tiny model), with

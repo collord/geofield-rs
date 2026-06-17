@@ -10,10 +10,10 @@
 //! A failure in (1) means the analytic derivative is wrong; a failure in (2)
 //! means the orientation constraint is not being honored by the field.
 
-use geofield_rs::assemble::{assemble, KernelOptions};
-use geofield_rs::data::{Orientation, Series, SurfacePoint};
-use geofield_rs::evaluate::Field;
-use geofield_rs::solve::solve;
+use geofield_kernel::assemble::{assemble, KernelOptions};
+use geofield_kernel::data::{Orientation, Series, SurfacePoint};
+use geofield_kernel::evaluate::Field;
+use geofield_kernel::solve::solve;
 
 fn dipping_series() -> Series {
     let sps = vec![

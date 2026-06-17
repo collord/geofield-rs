@@ -14,7 +14,7 @@
 //! Output is a triangle mesh: a flat `Vec<f32>` of vertex positions (`3*V`) and a
 //! flat `Vec<u32>` of triangle indices (`3*T`), ready for a GPU buffer.
 
-use crate::Model;
+use geofield_kernel::ScalarField;
 
 /// An axis-aligned sampling box and resolution for dual contouring.
 #[derive(Debug, Clone, Copy)]
@@ -88,7 +88,7 @@ pub(crate) fn corner_offset(c: usize) -> (usize, usize, usize) {
 ///   3. for each interior grid edge that changes sign, emit the quad formed by
 ///      the vertices of the 4 cells sharing that edge (two triangles), wound so
 ///      the normal points along increasing field (toward higher values).
-pub fn dual_contour(model: &Model, grid: &MeshGrid, isovalue: f64) -> Mesh {
+pub fn dual_contour(model: &dyn ScalarField, grid: &MeshGrid, isovalue: f64) -> Mesh {
     let n = grid.res;
     let nc = n + 1; // corners per axis
     let corner_idx = |i: usize, j: usize, k: usize| (i * nc + j) * nc + k;
@@ -364,8 +364,9 @@ fn solve3(a: [[f64; 3]; 3], b: [f64; 3]) -> Option<[f64; 3]> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::assemble::KernelOptions;
-    use crate::data::{Orientation, Series, SurfacePoint};
+    use geofield_kernel::assemble::KernelOptions;
+    use geofield_kernel::data::{Orientation, Series, SurfacePoint};
+    use geofield_kernel::Model;
 
     /// A flat-lying interface at z≈1 should dual-contour to a roughly planar
     /// sheet near z=1 when meshed at isovalue 0.
