@@ -20,6 +20,19 @@ pub mod octree;
 // (the wasm import bridge) in the browser.
 pub mod stack;
 
+// Hierarchy UI↔core DTOs (feature 001). The single source of truth for the grammar that
+// crosses the boundary; generic over `SeriesModel` like `stack`, so it builds on both
+// targets and is exercised by native DTO tests.
+pub mod schema;
+
+// Faults as an outer partition (feature 001 §4): the fault network instances the whole
+// stack per block. Single-block stub for now (research R3); generic over `SeriesModel`.
+pub mod faulted;
+
+// Shared surface entities (feature 001 §5): a surface stored once, referenced by two
+// boundaries (correlative conformity) without duplication. Data layer only in v1.
+pub mod surface;
+
 #[cfg(feature = "wasm")]
 pub mod wasm;
 

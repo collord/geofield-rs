@@ -15,6 +15,10 @@ wasm-bindgen = { version = "0.2", optional = true }
 # Fixture I/O for the geofield-cli validation binary (feature = "cli").
 npyz = { version = "0.8", optional = true }
 serde_json = { version = "1", optional = true }
+# Hierarchy UI↔core DTOs (feature 001 / contract D5). serde for (de)serialization across
+# the wasm boundary; derive only. Used by both the `wasm` ABI layer and native DTO tests,
+# so it is a normal (non-optional) dep — it is tiny and pulls no platform-specific code.
+serde = { version = "1", features = ["derive"] }
 
 # NATIVE ONLY. The kernel is linked in-process for native tests + the CLI so they can
 # build a real Model and mesh it. This dependency is `cfg(not(wasm32))`, so it is NOT
@@ -27,7 +31,7 @@ geofield-kernel = { path = "../geofield-kernel" }
 default = []
 # Native parallel BLAS (via the kernel, native only).
 native-parallel = []
-wasm = ["dep:wasm-bindgen"]
+wasm = ["dep:wasm-bindgen", "dep:serde_json"]
 # The validation CLI (geofield-cli) reads/writes .npy + .json fixtures (native).
 cli = ["dep:npyz", "dep:serde_json"]
 

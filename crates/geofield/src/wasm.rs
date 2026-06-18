@@ -23,7 +23,7 @@ use wasm_bindgen::prelude::*;
 
 use crate::octree::{octree_dual_contour, OctreeConfig};
 use crate::remote::{self, RemoteModel};
-use crate::stack::{Relation, Stack, StackedSeries};
+use crate::stack::{Envelope, Intrusion, Relation, Stack, StackElement, StackedSeries, Vein};
 use crate::{BlockModel, MeshModel};
 
 #[wasm_bindgen]
@@ -388,18 +388,22 @@ impl WasmModel {
     }
 }
 
-/// Map a JS relation code to a [`Relation`]. `0=Erode 1=Onlap 2=Conformable
-/// 3=Basement`; anything else falls back to `Erode` (GemPy's default).
+/// Map a JS relation code to an Axis-A [`Relation`]. `0=Erode 1=Onlap 2=Conformable`;
+/// anything else falls back to `Erode` (the Lajaunie–Calcagno / GemPy / LoopStructural
+/// default). This is ONLY the seam-below axis; whether a series is the floor is the
+/// separate `unbounded_above` parameter (two-axis model, feature 001 / contract D1).
+/// The legacy `3=Basement` code is retired — the floor is now `unbounded_above=true`.
 fn relation_from_code(code: u32) -> Relation {
     match code {
         1 => Relation::Onlap,
         2 => Relation::Conformable,
-        3 => Relation::Basement,
         _ => Relation::Erode,
     }
 }
 
-/// A multi-series stack exposed to JS (GemPy-style unconformities), over the two-wasm
+/// A multi-series stack exposed to JS (Lajaunie–Calcagno potential-field
+/// unconformities, as in GemPy / LoopStructural — erode/onlap composed by
+/// per-series scalar-field clipping), over the two-wasm
 /// split: each series is fitted in the kernel module and held here as a [`RemoteModel`]
 /// handle, so the stack's erode/onlap meshing runs in the BSD engine while the cokriging
 /// lives in the EUPL kernel.
@@ -413,6 +417,40 @@ pub struct WasmStack {
     inner: Stack<RemoteModel>,
 }
 
+// Private helpers (NOT exported — kept out of the `#[wasm_bindgen]` impl).
+impl WasmStack {
+    /// Fit a [`RemoteModel`] from the flat ABI inputs + optional fault. Shared by
+    /// `add_series` / `add_vein` / `add_intrusion` so the marshalling lives in one place.
+    #[allow(clippy::too_many_arguments)]
+    fn fit_model(
+        &self,
+        sp_xyz: &[f64],
+        sp_interface: &[f64],
+        ori_xyz: &[f64],
+        ori_pole: &[f64],
+        range: f64,
+        c_o: f64,
+        i_res: f64,
+        gi_res: f64,
+        uni_degree: u32,
+        nugget: f64,
+        decimate_frac: f64,
+        fault_point: &[f64],
+        fault_normal: &[f64],
+    ) -> Result<RemoteModel, JsError> {
+        let fault = fault_from_flat(fault_point, fault_normal);
+        let buf = build_fit_buffer(
+            sp_xyz, sp_interface, ori_xyz, ori_pole, range, c_o, i_res, gi_res, uni_degree,
+            nugget, decimate_frac, fault,
+        )?;
+        Ok(if fault.is_some() {
+            remote::fit_faulted(&buf)
+        } else {
+            remote::fit(&buf)
+        })
+    }
+}
+
 #[wasm_bindgen]
 impl WasmStack {
     /// An empty stack. Add series youngest→oldest with [`WasmStack::add_series`].
@@ -422,11 +460,19 @@ impl WasmStack {
         WasmStack { inner: Stack::new(Vec::new()) }
     }
 
-    /// Fit and append one series (the next-oldest). Arrays and kernel options match
-    /// [`WasmModel::new`]; `relation` is the code in [`relation_from_code`]
-    /// (`0=Erode 1=Onlap 2=Conformable 3=Basement`). `fault_point`/`fault_normal` apply a
-    /// single planar fault to THIS series' fit (a degenerate normal = no fault). Appends
-    /// in call order, so the FIRST `add_series` is the youngest.
+    /// Fit and append one series (the next-oldest), in the **two-axis model**
+    /// (`docs/stack_hierarchy_spec.md` §1–§2 / contract D1). Arrays and kernel options
+    /// match [`WasmModel::new`]. The two axes are independent:
+    ///   * `relation` — Axis A, the seam below: `0=Erode 1=Onlap 2=Conformable` (see
+    ///     [`relation_from_code`]). Ignored when `unbounded_above` is set (the floor has
+    ///     no series beneath it).
+    ///   * `unbounded_above` — Axis B: `true` makes this the floor / fill-upward series
+    ///     ([`StackedSeries::floor`]); `false` is a normally-bounded series.
+    ///
+    /// `fault_point`/`fault_normal` apply a single planar fault to THIS series' fit (a
+    /// degenerate normal = no fault). Appends in call order, so the FIRST `add_series` is
+    /// the youngest. (The legacy `relation=3=Basement` code is retired; pass
+    /// `unbounded_above=true` instead.)
     #[allow(clippy::too_many_arguments)]
     pub fn add_series(
         &mut self,
@@ -441,24 +487,94 @@ impl WasmStack {
         uni_degree: u32,
         nugget: f64,
         relation: u32,
+        unbounded_above: bool,
         decimate_frac: f64,
         fault_point: &[f64],
         fault_normal: &[f64],
     ) -> Result<(), JsError> {
         install_panic_hook();
-        let fault = fault_from_flat(fault_point, fault_normal);
-        let buf = build_fit_buffer(
+        let model = self.fit_model(
             sp_xyz, sp_interface, ori_xyz, ori_pole, range, c_o, i_res, gi_res, uni_degree,
-            nugget, decimate_frac, fault,
+            nugget, decimate_frac, fault_point, fault_normal,
         )?;
-        let model = if fault.is_some() {
-            remote::fit_faulted(&buf)
+        // Axis B decides the constructor; Axis A (relation) applies only to a bounded series.
+        self.inner.series.push(if unbounded_above {
+            StackedSeries::floor(model).into()
         } else {
-            remote::fit(&buf)
+            StackedSeries::new(model, relation_from_code(relation)).into()
+        });
+        Ok(())
+    }
+
+    /// Fit and append a cross-cutting **vein** (contract D2). Fit inputs match
+    /// [`WasmStack::add_series`]; the vein is the tabular body BETWEEN interfaces
+    /// `foot_wall` and `hanging_wall` (indices into the fitted interfaces). It cross-cuts
+    /// everything older it intersects within that band — no Axis-A relation.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_vein(
+        &mut self,
+        sp_xyz: &[f64],
+        sp_interface: &[f64],
+        ori_xyz: &[f64],
+        ori_pole: &[f64],
+        range: f64,
+        c_o: f64,
+        i_res: f64,
+        gi_res: f64,
+        uni_degree: u32,
+        nugget: f64,
+        foot_wall: usize,
+        hanging_wall: usize,
+        decimate_frac: f64,
+        fault_point: &[f64],
+        fault_normal: &[f64],
+    ) -> Result<(), JsError> {
+        install_panic_hook();
+        let model = self.fit_model(
+            sp_xyz, sp_interface, ori_xyz, ori_pole, range, c_o, i_res, gi_res, uni_degree,
+            nugget, decimate_frac, fault_point, fault_normal,
+        )?;
+        self.inner
+            .series
+            .push(StackElement::Vein(Vein::new(model, foot_wall, hanging_wall)));
+        Ok(())
+    }
+
+    /// Fit and append a cross-cutting **intrusion** (contract D2). Fit inputs match
+    /// [`WasmStack::add_series`]. `envelope_inner == envelope_outer` ⇒ a single-envelope
+    /// body (interior = below that contact); otherwise a shell between the two interfaces.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_intrusion(
+        &mut self,
+        sp_xyz: &[f64],
+        sp_interface: &[f64],
+        ori_xyz: &[f64],
+        ori_pole: &[f64],
+        range: f64,
+        c_o: f64,
+        i_res: f64,
+        gi_res: f64,
+        uni_degree: u32,
+        nugget: f64,
+        envelope_inner: usize,
+        envelope_outer: usize,
+        decimate_frac: f64,
+        fault_point: &[f64],
+        fault_normal: &[f64],
+    ) -> Result<(), JsError> {
+        install_panic_hook();
+        let model = self.fit_model(
+            sp_xyz, sp_interface, ori_xyz, ori_pole, range, c_o, i_res, gi_res, uni_degree,
+            nugget, decimate_frac, fault_point, fault_normal,
+        )?;
+        let envelope = if envelope_inner == envelope_outer {
+            Envelope::Single(envelope_inner)
+        } else {
+            Envelope::Shell { inner: envelope_inner, outer: envelope_outer }
         };
         self.inner
             .series
-            .push(StackedSeries::new(model, relation_from_code(relation)));
+            .push(StackElement::Intrusion(Intrusion::new(model, envelope)));
         Ok(())
     }
 
@@ -468,12 +584,38 @@ impl WasmStack {
         self.inner.len()
     }
 
+    /// The hierarchy round-trip payload (contract D3+D5): the canonical declared state
+    /// (`model`) plus the read-only derived view (`derived` — `effectiveRelation`,
+    /// `validation`, `cutsBelow`) as a JSON string. The UI worker parses this into
+    /// `CoreUpdate` after any mutation and treats `derived` as a read-only cache
+    /// (core-api.md invariants). Meshes travel on the typed-array mesh ABI, not here.
+    ///
+    /// One getter rather than N flat derived-getters keeps the boundary a single
+    /// serialized DTO (the design doc §7 contract) — the same payload the round-trip
+    /// purity test (`schema::tests`) pins.
+    pub fn core_update_json(&self) -> String {
+        serde_json::to_string(&self.inner.core_update())
+            .unwrap_or_else(|e| format!("{{\"error\":\"serialize CoreUpdate: {e}\"}}"))
+    }
+
+    /// Number of fault blocks in the OUTER partition (contract D4). **Currently 1** — the
+    /// fault-network partition geometry is a deferred stub ([`crate::faulted`], research R3),
+    /// so the whole stack instances into a single whole-domain block. This getter is the
+    /// real, honest ABI surface for the partition; per-block overrides + the fault sub-panel
+    /// UI (tasks T046/T047) arrive WITH the >1-block partition geometry, not before — wiring
+    /// them against the single-block stub would be UI chrome over no observable behaviour
+    /// (Constitution Principle IV/VI). The interface shape is real so callers can already
+    /// iterate blocks.
+    pub fn fault_block_count(&self) -> usize {
+        crate::faulted::FaultNetwork::default().blocks().len()
+    }
+
     /// Number of interfaces (meshable contacts) in series `series`. `0` if out of range.
     pub fn interface_count(&self, series: usize) -> usize {
         self.inner
             .series
             .get(series)
-            .map(|s| s.model.interface_isovalues().len())
+            .map(|s| s.model().interface_isovalues().len())
             .unwrap_or(0)
     }
 

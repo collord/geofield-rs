@@ -3,9 +3,36 @@
 //! A [`Stack`] is an ordered list of geological series, **youngest first** (index
 //! 0) **→ oldest last**, each an independently-fitted [`Model`] (one per-series
 //! cokriging field — the same per-series solve as [`crate::Model::fit`]; there is
-//! no global multi-field solve). Each series carries a [`Relation`] describing how
-//! it sits on the (older) series beneath it — the GemPy `StackRelationType`:
-//! `Erode`, `Onlap`, `Conformable`, `Basement`.
+//! no global multi-field solve). Each series carries **two independent axes**
+//! (`docs/stack_hierarchy_spec.md` §1–§2):
+//!   * **Axis A — [`Relation`]** (`relation: Option<Relation>`): how it clips the
+//!     (older) series beneath it — `Erode`, `Onlap`, `Conformable`, or `None` for
+//!     the floor (no series below, so no clip is representable);
+//!   * **Axis B — `unbounded_above: bool`**: whether the series is bounded by its
+//!     own top contact or fills upward until a younger series claims the space.
+//!
+//! These were previously conflated in a single `Relation::Basement` variant, which
+//! was a category error — `Basement` overloaded "present-everywhere",
+//! "never-clips", and "keep-topmost-unit", three behaviours that all follow from
+//! the one property `unbounded_above`. Splitting them makes the branch in
+//! `present_unit_count` semantically honest (it asks `unbounded_above`, not
+//! `matches!(relation, Basement)`) and removes the latent bug where mislabelling
+//! the floor `Conformable` silently dropped its top unit. The old floor
+//! (`Relation::Basement`) is now `relation: None` + `unbounded_above: true`.
+//!
+//! The ancestor of this scheme is the Lajaunie–Calcagno potential-field formalism
+//! (Lajaunie et al. 1997; Calcagno et al. 2008): a model is an ordered stack of
+//! series, each modelled as isovalues of one co-kriged scalar field, carrying a
+//! single inter-series relationship drawn from the binary `erode | onlap`. GemPy's
+//! `StackRelationType` (`BASEMENT/ERODE/ONLAP/FAULT`) and LoopStructural's
+//! `UnconformityType` (`ERODE/ONLAP`) are both implementations of that formalism;
+//! Leapfrog surfaces the SAME degree of freedom per-surface as its Deposit (onlap-
+//! like) vs Erosion toggle. Our `Erode`/`Onlap` are Calcagno's binary; `Basement`
+//! is GemPy's floor-of-the-model relation. `Conformable`, by contrast, is NOT a
+//! relation in any of those tools — in the formalism family conformity is EMERGENT
+//! (two surfaces are conformable iff they are isovalues of the same series field),
+//! so we model `Conformable` as a series that simply never clips older series (the
+//! same no-op an unoverridden Leapfrog deposit produces). See `docs/contact_grammar`.
 //!
 //! # What the relation controls
 //!
@@ -18,9 +45,9 @@
 //! (`iso_top = interfaces.last()`); the series is present where `field < iso_top`.
 //!
 //! **Lithology is youngest-present-wins**: walk youngest→oldest, return the first
-//! series present at the point (a `Basement` is present everywhere). This single
-//! rule is correct for ALL relations — erode and onlap do NOT differ in the
-//! lithology lookup.
+//! series present at the point (an `unbounded_above` series is present
+//! everywhere not already claimed). This single rule is correct for ALL relations
+//! — erode and onlap do NOT differ in the lithology lookup.
 //!
 //! **The erode/onlap difference is in surface clipping.** When meshing an OLDER
 //! series' contact:
@@ -31,11 +58,16 @@
 //!   * a younger **Onlap** series does NOT clip it — the onlapping series laps onto
 //!     and pinches out against the older surface, which is preserved as the contact.
 //!     The onlapping younger series is OMITTED from the older series' `Scene`.
-//!   * `Conformable` / `Basement` never clip older series.
+//!   * `Conformable` (and the floor, `relation: None`) never clip older series.
 //!
 //! So: **erode maskers go into older series' Scenes; onlap maskers do not.** That
-//! one wiring difference is the whole erode-vs-onlap semantics. (If both clipped
-//! identically the two relations would be indistinguishable — see the
+//! one wiring difference is the whole erode-vs-onlap semantics — Calcagno's "erode
+//! truncates the older side it reaches, onlap laps against and pinches out" stated
+//! as a clip vs no-clip. LoopStructural implements the same asymmetry as region
+//! masks (`add_unconformity` walks back masking older features and stops at the next
+//! unconformity; `add_onlap_unconformity` skips past them and inverts the mask),
+//! and Leapfrog as the Erosion-cuts / Deposit-doesn't toggle on a surface. (If both
+//! clipped identically the two relations would be indistinguishable — see the
 //! `onlap_vs_erode_differ` test, which pins this.)
 //!
 //! Each per-series-per-interface mesh is still a SINGLE [`Scene`] (the series'
@@ -49,35 +81,59 @@ use crate::octree::{
 };
 use crate::{clip_mesh_to_half_spaces, max_abs_field_in_box, BlockModel, SeriesModel};
 
-/// How a series relates to the (older) series beneath it (GemPy `StackRelationType`).
+/// How a series relates to the (older) series beneath it. `Erode`/`Onlap` are the
+/// Lajaunie–Calcagno binary; GemPy's `StackRelationType` and LoopStructural's
+/// `UnconformityType` are the same two values under different names, and Leapfrog's
+/// Erosion/Deposit surface toggle is the same choice per-surface (see module docs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Relation {
     /// Removes everything older wherever this series is present (truncation): the
-    /// younger contact cuts the older surfaces along it.
+    /// younger contact cuts the older surfaces along it. Calcagno's `erode`; GemPy
+    /// `ERODE` (its default); LoopStructural `UnconformityType.ERODE`; Leapfrog's
+    /// Erosion surface type.
     Erode,
     /// Laps onto the older surface and pinches out against it: present only on its
-    /// deposited side, does NOT cut the older series where it pinches out.
+    /// deposited side, does NOT cut the older series where it pinches out. Calcagno's
+    /// `onlap`; GemPy `ONLAP`; LoopStructural `ONLAP`; Leapfrog's Deposit (onlap-like)
+    /// surface type.
     Onlap,
     /// Stacks normally (no unconformity); its interfaces subdivide within its own
-    /// visible region but it does not clip older series.
+    /// visible region but it does not clip older series. NOT a relation in Calcagno /
+    /// GemPy / LoopStructural — there conformity is EMERGENT from a shared series
+    /// field — so this is modelled as a non-clipping series (an unoverridden Leapfrog
+    /// deposit produces the same no-op).
     Conformable,
-    /// The oldest series; never masks anything and is present everywhere not claimed
-    /// by a younger series.
-    Basement,
 }
 
-/// One series in a [`Stack`]: its own fitted field plus its relationship to the
-/// series beneath it. Generic over the fitted model `M` so the SAME stack logic drives
-/// the native kernel [`Model`] and the wasm [`RemoteModel`] (see [`SeriesModel`]). The
+/// One series in a [`Stack`]: its own fitted field plus its two independent axes —
+/// how it clips the series beneath it ([`StackedSeries::relation`], Axis A) and
+/// whether it is bounded by its own top contact ([`StackedSeries::unbounded_above`],
+/// Axis B). Generic over the fitted model `M` so the SAME stack logic drives the
+/// native kernel [`Model`] and the wasm [`RemoteModel`] (see [`SeriesModel`]). The
 /// series' interfaces (and their isovalues) come from `model.interface_isovalues()`.
 pub struct StackedSeries<M> {
     pub model: M,
-    pub relation: Relation,
+    /// Axis A — how this series clips the (older) series beneath it. `None` for the
+    /// floor (oldest series), which has no series below and so no representable clip.
+    pub relation: Option<Relation>,
+    /// Axis B — is this series bounded by its own top contact, or does it fill upward
+    /// until a younger series claims the space? The floor is conventionally `true`.
+    /// This is the single honest bit the old `Relation::Basement` variant smuggled in.
+    pub unbounded_above: bool,
 }
 
 impl<M: SeriesModel> StackedSeries<M> {
+    /// A normally-bounded series with an explicit Axis-A relation to the series
+    /// beneath it (`unbounded_above = false`).
     pub fn new(model: M, relation: Relation) -> Self {
-        Self { model, relation }
+        Self { model, relation: Some(relation), unbounded_above: false }
+    }
+
+    /// The floor (oldest) series: no series beneath it (`relation = None`) and it
+    /// fills upward until a younger series claims the space (`unbounded_above = true`).
+    /// Replaces the old `Relation::Basement`.
+    pub fn floor(model: M) -> Self {
+        Self { model, relation: None, unbounded_above: true }
     }
 
     /// The series' bounding/unconformity isovalue — its TOP interface (highest
@@ -97,6 +153,158 @@ impl<M: SeriesModel> StackedSeries<M> {
     }
 }
 
+/// A cross-cutting **vein**: a tabular body occupying the region BETWEEN a co-kriged
+/// hanging-wall/foot-wall interface pair (`docs/stack_hierarchy_spec.md` §3.2). Unlike a
+/// stratigraphic series (present *below* one top contact), a vein is present in a *band*
+/// (`foot_wall_iso < field < hanging_wall_iso`) and cross-cuts: it clips everything older
+/// it intersects, but only WITHIN that band — two ANDed `ContactHalfSpace`s, not one.
+///
+/// `hanging_wall` / `foot_wall` are indices into `model.interface_isovalues()` (ascending);
+/// the band is `[iso[foot_wall], iso[hanging_wall]]`.
+pub struct Vein<M> {
+    pub model: M,
+    pub hanging_wall: usize,
+    pub foot_wall: usize,
+}
+
+impl<M: SeriesModel> Vein<M> {
+    pub fn new(model: M, foot_wall: usize, hanging_wall: usize) -> Self {
+        Self { model, hanging_wall, foot_wall }
+    }
+
+    /// `(foot_wall_iso, hanging_wall_iso)` — the band bounds, lower first. `None` if either
+    /// index is out of range. (We normalize lower≤upper so callers needn't assume order.)
+    pub fn band(&self) -> Option<(f64, f64)> {
+        let isos = self.model.interface_isovalues();
+        let fw = *isos.get(self.foot_wall)?;
+        let hw = *isos.get(self.hanging_wall)?;
+        Some(if fw <= hw { (fw, hw) } else { (hw, fw) })
+    }
+
+    /// Present BETWEEN the foot-wall and hanging-wall isovalues (the tabular body), not
+    /// below a single top. Out-of-range indices ⇒ present nowhere.
+    pub fn present_at(&self, p: [f64; 3]) -> bool {
+        match self.band() {
+            Some((lo, hi)) => {
+                let f = self.model.scalar_field(p);
+                f > lo && f < hi
+            }
+            None => false,
+        }
+    }
+}
+
+/// The closed surface(s) bounding an [`Intrusion`]. `Single` is one envelope interface (the
+/// body is the side of it the geometry deems interior); `Shell` is an inner/outer pair (the
+/// body is between them — a hollow-cored intrusion). Indices into `interface_isovalues()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Envelope {
+    Single(usize),
+    Shell { inner: usize, outer: usize },
+}
+
+/// A cross-cutting **intrusion**: a closed body present INSIDE its envelope, cross-cutting
+/// everything older it intersects (`docs/stack_hierarchy_spec.md` §3.3). Geometry comes from
+/// the body model's field thresholded at the envelope isovalue(s), not from a stratigraphic
+/// top. The interior convention matches the field sign used elsewhere: `field < iso` is the
+/// inside of the body (below the envelope contact).
+pub struct Intrusion<M> {
+    pub model: M,
+    pub envelope: Envelope,
+}
+
+impl<M: SeriesModel> Intrusion<M> {
+    pub fn new(model: M, envelope: Envelope) -> Self {
+        Self { model, envelope }
+    }
+
+    /// Present inside the envelope: for `Single(i)`, `field < iso[i]`; for `Shell`, between
+    /// the inner and outer isovalues. Out-of-range indices ⇒ present nowhere.
+    pub fn present_at(&self, p: [f64; 3]) -> bool {
+        let isos = self.model.interface_isovalues();
+        let f = self.model.scalar_field(p);
+        match self.envelope {
+            Envelope::Single(i) => match isos.get(i) {
+                Some(&iso) => f < iso,
+                None => false,
+            },
+            Envelope::Shell { inner, outer } => match (isos.get(inner), isos.get(outer)) {
+                (Some(&a), Some(&b)) => {
+                    let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+                    f > lo && f < hi
+                }
+                _ => false,
+            },
+        }
+    }
+}
+
+/// One element of a [`Stack`]'s chronology: a stratigraphic [`StackedSeries`], or a
+/// cross-cutting [`Vein`] / [`Intrusion`] (`docs/stack_hierarchy_spec.md` §3.1, Option A).
+/// Lithology ([`Stack::global_unit`]) is uniform across kinds — youngest-present-wins —
+/// so the only kind-specific behaviour is `present_at` (band/interior vs. below-top) and
+/// the masker geometry a cross-cutting body contributes to older elements' Scenes.
+pub enum StackElement<M> {
+    Series(StackedSeries<M>),
+    Vein(Vein<M>),
+    Intrusion(Intrusion<M>),
+}
+
+impl<M: SeriesModel> StackElement<M> {
+    /// Is this element's rock present at `p`? Dispatches to the kind's own test.
+    pub fn present_at(&self, p: [f64; 3]) -> bool {
+        match self {
+            StackElement::Series(s) => s.present_at(p),
+            StackElement::Vein(v) => v.present_at(p),
+            StackElement::Intrusion(it) => it.present_at(p),
+        }
+    }
+
+    /// The fitted model, for lithology lookup (uniform across kinds).
+    pub fn model(&self) -> &M {
+        match self {
+            StackElement::Series(s) => &s.model,
+            StackElement::Vein(v) => &v.model,
+            StackElement::Intrusion(it) => &it.model,
+        }
+    }
+
+    /// `true` if this is a stratigraphic series (vs. a cross-cutting body). Cross-cutting
+    /// bodies are never the `unbounded_above` floor and carry no Axis-A relation.
+    pub fn is_series(&self) -> bool {
+        matches!(self, StackElement::Series(_))
+    }
+
+    /// Borrow as a stratigraphic series, if it is one.
+    pub fn as_series(&self) -> Option<&StackedSeries<M>> {
+        match self {
+            StackElement::Series(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// Axis B — `true` only for an unbounded-above series; always `false` for a
+    /// cross-cutting body (which is bounded by its band/envelope).
+    pub fn unbounded_above(&self) -> bool {
+        matches!(self, StackElement::Series(s) if s.unbounded_above)
+    }
+
+    /// Axis A — the seam-below relation of a series (`None` for the floor or a
+    /// cross-cutting body, which has no seam-below).
+    pub fn relation(&self) -> Option<Relation> {
+        match self {
+            StackElement::Series(s) => s.relation,
+            _ => None,
+        }
+    }
+}
+
+impl<M> From<StackedSeries<M>> for StackElement<M> {
+    fn from(s: StackedSeries<M>) -> Self {
+        StackElement::Series(s)
+    }
+}
+
 /// One series' clipped contact meshes — one [`Mesh`] per interface of the series,
 /// tagged with the interface id, all clipped to the series' visible region.
 pub struct SeriesMeshes {
@@ -107,14 +315,17 @@ pub struct SeriesMeshes {
 }
 
 /// An ordered stack of series, **youngest (index 0) → oldest (last)**. The oldest
-/// series is conventionally a [`Relation::Basement`]. Generic over the fitted model `M`
-/// ([`SeriesModel`]) so the native and wasm paths share one implementation.
+/// series is conventionally the floor ([`StackedSeries::floor`]: `relation = None`,
+/// `unbounded_above = true`). Generic over the fitted model `M` ([`SeriesModel`]) so
+/// the native and wasm paths share one implementation.
 pub struct Stack<M> {
-    pub series: Vec<StackedSeries<M>>,
+    /// The chronology, youngest first. Each entry is a stratigraphic series or a
+    /// cross-cutting body ([`StackElement`]).
+    pub series: Vec<StackElement<M>>,
 }
 
 impl<M: SeriesModel> Stack<M> {
-    pub fn new(series: Vec<StackedSeries<M>>) -> Self {
+    pub fn new(series: Vec<StackElement<M>>) -> Self {
         Self { series }
     }
 
@@ -126,33 +337,81 @@ impl<M: SeriesModel> Stack<M> {
         self.series.is_empty()
     }
 
-    /// The lithology at `p`: `(series_index, unit_within_series)`.
+    /// Borrow element `i` as a stratigraphic series, if it is one (`None` for a
+    /// cross-cutting body or out of range). Used by the series-specific meshing/unit logic.
+    fn series_at(&self, i: usize) -> Option<&StackedSeries<M>> {
+        match self.series.get(i)? {
+            StackElement::Series(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// The lithology at `p`: `(element_index, unit_within_element)`.
     ///
-    /// Youngest-present-wins — the youngest series present at `p` claims it, and the
-    /// unit within that series is its own single-field assignment
-    /// ([`Model::lithology_unit`], thresholding the series' field at all its
-    /// isovalues). A `Basement` is present everywhere. Returns `(len, 0)` only if no
-    /// series is present (a stack with no basement, a point above everything).
+    /// Youngest-present-wins — the youngest element present at `p` claims it, and the
+    /// unit within it is its own single-field assignment ([`Model::lithology_unit`]).
+    /// An `unbounded_above` series is present everywhere (it fills upward until claimed);
+    /// a cross-cutting body is present in its band/interior. This rule is uniform across
+    /// element kinds (`docs/stack_hierarchy_spec.md` §3.4 — cross-cutting needs no special
+    /// lithology case). Returns `(len, 0)` only if no element is present.
     pub fn global_unit(&self, p: [f64; 3]) -> (usize, usize) {
-        for (i, s) in self.series.iter().enumerate() {
-            if s.relation == Relation::Basement || s.present_at(p) {
-                return (i, s.model.lithology_unit(p));
+        for (i, e) in self.series.iter().enumerate() {
+            let unbounded = matches!(e, StackElement::Series(s) if s.unbounded_above);
+            if unbounded || e.present_at(p) {
+                return (i, e.model().lithology_unit(p));
             }
         }
         (self.series.len(), 0)
     }
 
-    /// The younger-`Erode` series (indices `< i`) that CLIP series `i`'s surfaces, as
-    /// `(field, iso_top)` pairs. Onlap/Conformable/Basement younger series do not clip.
-    /// Returned as owned fields (not yet `ContactHalfSpace`s) so the caller can keep them
-    /// alive while the half-spaces borrow them — a `ContactHalfSpace` borrows its field.
-    fn erode_masker_fields(&self, i: usize) -> Vec<(M::Field<'_>, f64)> {
+    /// The younger CROSS-CUTTING contributions (indices `< i`) that CLIP element `i`'s
+    /// surfaces, as owned-field + half-space-descriptor pairs. A younger `Erode` series
+    /// contributes its top contact's ABOVE side (one half-space); a younger vein/intrusion
+    /// contributes its band/interior (the body's own clip). Onlap/Conformable series (and
+    /// the floor) contribute nothing. Returned as owned fields so the caller can keep them
+    /// alive while the borrowed `ContactHalfSpace`s reference them.
+    ///
+    /// Each entry is `(field, isovalue, below)`: a `ContactHalfSpace::new(field, isovalue,
+    /// below)`. An erode masker is the single `(iso_top, below=false)`; a vein is TWO entries
+    /// (above FW, below HW); an intrusion the envelope interior.
+    fn erode_masker_fields(&self, i: usize) -> Vec<(M::Field<'_>, f64, bool)> {
         let mut out = Vec::new();
-        for sj in &self.series[..i] {
-            if sj.relation == Relation::Erode {
-                if let Some(iso_top) = sj.iso_top() {
-                    out.push((sj.model.field(), iso_top));
+        for ej in &self.series[..i] {
+            match ej {
+                // A younger erode series: its top contact's ABOVE side clips older surfaces.
+                StackElement::Series(sj) if sj.relation == Some(Relation::Erode) => {
+                    if let Some(iso_top) = sj.iso_top() {
+                        out.push((sj.model.field(), iso_top, false));
+                    }
                 }
+                // A younger vein: present BETWEEN fw/hw — clips older surfaces inside that
+                // band = two ANDed half-spaces (above the lower iso, below the upper iso).
+                StackElement::Vein(v) => {
+                    if let Some((lo, hi)) = v.band() {
+                        out.push((v.model.field(), lo, false)); // above the foot wall
+                        out.push((v.model.field(), hi, true)); // below the hanging wall
+                    }
+                }
+                // A younger intrusion: present inside its envelope — clips older surfaces
+                // there. Single(i): interior is `field < iso` (below=true). Shell: between.
+                StackElement::Intrusion(it) => {
+                    let isos = it.model.interface_isovalues();
+                    match it.envelope {
+                        Envelope::Single(k) => {
+                            if let Some(&iso) = isos.get(k) {
+                                out.push((it.model.field(), iso, true));
+                            }
+                        }
+                        Envelope::Shell { inner, outer } => {
+                            if let (Some(&a), Some(&b)) = (isos.get(inner), isos.get(outer)) {
+                                let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+                                out.push((it.model.field(), lo, false));
+                                out.push((it.model.field(), hi, true));
+                            }
+                        }
+                    }
+                }
+                _ => {}
             }
         }
         out
@@ -188,7 +447,9 @@ impl<M: SeriesModel> Stack<M> {
         ext_max: [f64; 3],
         cfg: OctreeConfig,
     ) -> Option<Mesh> {
-        let s = self.series.get(i)?;
+        // This contact mesher is for stratigraphic series; a cross-cutting body has its own
+        // present region and is meshed via its own path. Series-only here.
+        let s = self.series_at(i)?;
         let isovalue = *s.model.interface_isovalues().get(interface_idx)?;
         let box_b = AxisBox::from_bounds(min, ext_max);
         // Hold the masker fields in a local so the half-spaces (which borrow them) and the
@@ -196,9 +457,10 @@ impl<M: SeriesModel> Stack<M> {
         let masker_fields = self.erode_masker_fields(i);
         let maskers: Vec<ContactHalfSpace<'_>> = masker_fields
             .iter()
-            // Series `i` survives where it is OUTSIDE younger `j`'s body, i.e.
-            // `field_j >= iso_top(j)` — the ABOVE side (`below = false`).
-            .map(|(field, iso_top)| ContactHalfSpace::new(field, *iso_top, false))
+            // Each younger cross-cutting contribution is clipped on the side that leaves
+            // element `i` visible OUTSIDE the younger body (erode: above its top; vein:
+            // outside its band; intrusion: outside its envelope).
+            .map(|(field, iso, below)| ContactHalfSpace::new(field, *iso, *below))
             .collect();
         let mut contributors: Vec<&dyn Boundary> = Vec::with_capacity(maskers.len() + 1);
         contributors.push(&box_b);
@@ -219,17 +481,15 @@ impl<M: SeriesModel> Stack<M> {
     /// clip half-spaces), so the watertight single-sign-field guarantee is preserved.
     pub fn mesh_surfaces(&self, min: [f64; 3], size: f64, cfg: OctreeConfig) -> Vec<SeriesMeshes> {
         let mut out = Vec::with_capacity(self.series.len());
-        for (i, s) in self.series.iter().enumerate() {
-            let ids = s.model.interface_ids();
+        for (i, e) in self.series.iter().enumerate() {
+            // `mesh_one` is the stratigraphic-contact mesher and returns `None` for a
+            // cross-cutting body (which has its own present region); such elements emit no
+            // SeriesMeshes here. Series contacts mesh as before.
+            let ids = e.model().interface_ids();
             let interfaces = ids
                 .iter()
                 .enumerate()
-                .map(|(k, &iid)| {
-                    let mesh = self
-                        .mesh_one(i, k, min, size, cfg)
-                        .expect("i,k in range by construction");
-                    (iid, mesh)
-                })
+                .filter_map(|(k, &iid)| self.mesh_one(i, k, min, size, cfg).map(|m| (iid, m)))
                 .collect();
             out.push(SeriesMeshes {
                 series: i,
@@ -238,13 +498,51 @@ impl<M: SeriesModel> Stack<M> {
         }
         out
     }
+
+    /// Older elements (indices `> i`, i.e. OLDER in the youngest-first order) whose present
+    /// region a cross-cutting element at `i` spatially intersects — DERIVED from chronology
+    /// + geometry, never declared (`docs/stack_hierarchy_spec.md` §3.4). Returns `[]` for a
+    /// stratigraphic series (only cross-cutting bodies have a cut-set) and for a body that
+    /// reaches nothing. Sampled on a coarse grid over `[min, min+size]³` — this is a derived
+    /// reporting/UI quantity (which older elements a body cuts), not a meshing input.
+    pub fn cuts_below(&self, i: usize, min: [f64; 3], size: f64) -> Vec<usize> {
+        let body = match self.series.get(i) {
+            Some(e) if !e.is_series() => e,
+            _ => return Vec::new(), // series have no cut-set; out of range → none
+        };
+        const N: usize = 12; // coarse sample grid per axis
+        let mut hits = Vec::new();
+        for j in (i + 1)..self.series.len() {
+            let older = &self.series[j];
+            let mut overlaps = false;
+            'scan: for a in 0..N {
+                for b in 0..N {
+                    for c in 0..N {
+                        let p = [
+                            min[0] + size * (a as f64 + 0.5) / N as f64,
+                            min[1] + size * (b as f64 + 0.5) / N as f64,
+                            min[2] + size * (c as f64 + 0.5) / N as f64,
+                        ];
+                        if body.present_at(p) && older.present_at(p) {
+                            overlaps = true;
+                            break 'scan;
+                        }
+                    }
+                }
+            }
+            if overlaps {
+                hits.push(j);
+            }
+        }
+        hits
+    }
 }
 
 impl<M: SeriesModel + BlockModel> Stack<M> {
     /// Number of fault blocks in series `i` (1 if that series is not faulted). `0` if `i`
     /// is out of range.
     pub fn series_block_count(&self, i: usize) -> usize {
-        self.series.get(i).map(|s| s.model.nblocks()).unwrap_or(0)
+        self.series_at(i).map(|s| s.model.nblocks()).unwrap_or(0)
     }
 
     /// Mesh ONE interface of series `i` **within a single fault block `b`** — the
@@ -268,7 +566,7 @@ impl<M: SeriesModel + BlockModel> Stack<M> {
         ext_max: [f64; 3],
         cfg: OctreeConfig,
     ) -> Option<Mesh> {
-        let s = self.series.get(i)?;
+        let s = self.series_at(i)?; // per-block contact mesher is series-only
         // The block carries the same interfaces as the series, at this block's (offset)
         // isovalue — use the block's own isovalue so the contour lands on the block field.
         let isovalue = *s.model.block_interface_isovalues(b).get(interface_idx)?;
@@ -280,7 +578,7 @@ impl<M: SeriesModel + BlockModel> Stack<M> {
         let masker_fields = self.erode_masker_fields(i);
         let maskers: Vec<ContactHalfSpace<'_>> = masker_fields
             .iter()
-            .map(|(field, iso_top)| ContactHalfSpace::new(field, *iso_top, false))
+            .map(|(field, iso, below)| ContactHalfSpace::new(field, *iso, *below))
             .collect();
         let mut contributors: Vec<&dyn Boundary> = Vec::with_capacity(maskers.len() + 1);
         contributors.push(&box_b);
@@ -301,22 +599,45 @@ impl<M: SeriesModel + BlockModel> Stack<M> {
     /// field-less or out of range). This counts EVERY unit including the topmost — for the
     /// renderable (rock-present) units use [`Stack::present_unit_count`].
     pub fn block_unit_count(&self, i: usize, b: usize) -> usize {
-        self.series.get(i).map(|s| s.model.block_unit_count(b)).unwrap_or(0)
+        self.series_at(i).map(|s| s.model.block_unit_count(b)).unwrap_or(0)
     }
 
     /// Number of PRESENT (rock-bearing) lithology units in block `b` of series `i` — the
     /// units that are actually this series' rock, to render as closed solids.
     ///
-    /// A series is present where `field < iso_top` (below its bounding/unconformity
-    /// contact). With `N` interfaces there are `N + 1` units `0..=N`; the present side
-    /// `field < iso[N-1]` is units `0..N` — the topmost unit `N` (`field ≥ iso[N-1]`) is
-    /// the VOID above the series' bounding contact, owned by whatever younger series sits
-    /// there, NOT by this series. So the renderable count is `block_unit_count - 1`
-    /// (`= interfaces`). Returns 0 for a field-less block.
+    /// With `N` interfaces there are `N + 1` units `0..=N`. The topmost unit `N`
+    /// (`field ≥ iso[N-1]`, above the series' highest contact) is rock IFF this series owns
+    /// the space above that contact:
+    ///
+    ///   * a series BOUNDED above (`unbounded_above = false`) is present only BELOW its
+    ///     top interface (`field < iso_top` — see [`StackedSeries::present_at`]); its
+    ///     topmost unit is the VOID above the bounding/unconformity contact, owned by a
+    ///     younger series, so it is dropped → `block_unit_count - 1` (`= interfaces`).
+    ///   * an `unbounded_above` series (the floor) is present EVERYWHERE not claimed by a
+    ///     younger series ([`Stack::global_unit`]), so its top interface is just an internal
+    ///     subdivision, NOT a bounding contact — its topmost unit is real rock (truncated by
+    ///     younger erosions / the box top, where it daylights). Dropping it leaves a hole:
+    ///     the slab between the highest internal contact and the erosion surface vanishes,
+    ///     and with it the volume that daylights against that erosion. So an unbounded-above
+    ///     series keeps ALL its units → `block_unit_count`.
+    ///
+    /// This branches on `unbounded_above` — the one honest property — not on a relation
+    /// variant. The old code keyed on `Relation::Basement`, which coincided with
+    /// `unbounded_above` only at the bottom of the stack; keying on it directly removes
+    /// the latent bug where a floor mislabelled `Conformable` dropped its top unit.
+    ///
+    /// Returns 0 for a field-less block.
     pub fn present_unit_count(&self, i: usize, b: usize) -> usize {
-        match self.block_unit_count(i, b) {
-            0 => 0,
-            n => n - 1, // drop the topmost (above-the-bounding-contact) void unit
+        let n = self.block_unit_count(i, b);
+        if n == 0 {
+            return 0;
+        }
+        match self.series_at(i) {
+            // An unbounded-above series owns the column above its top contact, so its
+            // topmost unit is rock — keep every unit.
+            Some(s) if s.unbounded_above => n,
+            // A bounded series' topmost unit is the void above its bounding contact.
+            _ => n - 1,
         }
     }
 
@@ -341,7 +662,7 @@ impl<M: SeriesModel + BlockModel> Stack<M> {
         ext_max: [f64; 3],
         cfg: OctreeConfig,
     ) -> Option<Mesh> {
-        let s = self.series.get(i)?;
+        let s = self.series_at(i)?; // per-block unit-solid mesher is series-only
         let isovalues = s.model.block_interface_isovalues(b);
         let n = isovalues.len();
         if n == 0 || unit > n {
@@ -377,7 +698,7 @@ impl<M: SeriesModel + BlockModel> Stack<M> {
         let masker_fields = self.erode_masker_fields(i);
         let maskers: Vec<ContactHalfSpace<'_>> = masker_fields
             .iter()
-            .map(|(field, iso_top)| ContactHalfSpace::new(field, *iso_top, false))
+            .map(|(field, iso, below)| ContactHalfSpace::new(field, *iso, *below))
             .collect();
 
         let mut contributors: Vec<&dyn Boundary> =
@@ -479,7 +800,7 @@ mod tests {
 
     /// A 2-series stack: a younger contact (`Erode` or `Onlap`) dipping steeply so it
     /// is present over the LEFT of the domain and absent over the RIGHT, over an older
-    /// flat bed at z=500 (`Basement`). Same geometry for both relations — only the
+    /// flat bed at z=500 (the floor). Same geometry for both relations — only the
     /// younger relation changes.
     fn two_series_stack(younger: Relation) -> Stack<Model> {
         // Younger contact ~ z = 600 + 0.4*(x-500): below z≈400 at x=0, z≈800 at x=1000.
@@ -487,8 +808,8 @@ mod tests {
         // Older flat bed at z=500.
         let old = dipping_plane(500.0, 0.0, 0.0);
         Stack::new(vec![
-            StackedSeries::new(young, younger),
-            StackedSeries::new(old, Relation::Basement),
+            StackedSeries::new(young, younger).into(),
+            StackedSeries::floor(old).into(),
         ])
     }
 
@@ -543,6 +864,79 @@ mod tests {
             o_hi > e_hi + 100.0,
             "onlap older bed should extend right of the erode-clipped one: onlap_hi={o_hi:.0} erode_hi={e_hi:.0}"
         );
+    }
+
+    /// T011 [US1] — the three seam states (Erode / Onlap / Conformable) must produce
+    /// THREE distinct older-series meshes, not two. `onlap_vs_erode_differ` pins erode≠onlap;
+    /// this extends it to conformable. Onlap and Conformable both DON'T clip the older bed, so
+    /// their older-mesh extents match each other and exceed the erode-clipped one — the
+    /// discriminator is "erode clips, the other two don't," which is exactly the Axis-A
+    /// grammar. (SC-002.)
+    #[test]
+    fn three_seam_states_differ() {
+        let depth = 6;
+        let extent = |stack: Stack<Model>| -> (f64, f64) {
+            let meshes = stack.mesh_surfaces([0.0, 0.0, 0.0], 1000.0, cfg(depth));
+            let (_iid, mesh) = &meshes[1].interfaces[0];
+            let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
+            for v in mesh.positions.chunks_exact(3) {
+                let (x, z) = (v[0] as f64, v[2] as f64);
+                if (z - 500.0).abs() < 60.0 {
+                    lo = lo.min(x);
+                    hi = hi.max(x);
+                }
+            }
+            (lo, hi)
+        };
+        let (_, e_hi) = extent(two_series_stack(Relation::Erode));
+        let (_, o_hi) = extent(two_series_stack(Relation::Onlap));
+        let (_, c_hi) = extent(two_series_stack(Relation::Conformable));
+        eprintln!("erode_hi={e_hi:.0} onlap_hi={o_hi:.0} conformable_hi={c_hi:.0}");
+
+        // Erode clips the older bed on the right (small extent); onlap and conformable do
+        // NOT clip (full extent). So both non-clipping relations extend well past erode.
+        assert!(o_hi > e_hi + 100.0, "onlap must not be erode-clipped: o_hi={o_hi:.0} e_hi={e_hi:.0}");
+        assert!(c_hi > e_hi + 100.0, "conformable must not be erode-clipped: c_hi={c_hi:.0} e_hi={e_hi:.0}");
+        // The grammar's discriminating axis is clip-vs-no-clip; erode is the singular
+        // clipping state, distinct from the two that leave the older bed intact.
+        assert!(
+            e_hi < o_hi && e_hi < c_hi,
+            "erode (the clipping state) must yield a SMALLER older-bed extent than the two non-clipping states"
+        );
+    }
+
+    /// T012 [US1] — a floor (`unbounded_above`) series must NEVER have its top unit dropped,
+    /// regardless of what Axis-A relation a YOUNGER series carries above it. This generalizes
+    /// the missing-volume regression past the single erode case: the keep is a property of the
+    /// floor's `unbounded_above`, independent of the younger seam. (FR-003.)
+    #[test]
+    fn floor_top_unit_kept_under_any_younger_relation() {
+        let make = |younger: Relation| -> Stack<Model> {
+            // 3-contact floor (4 units), a younger series above it with the given relation.
+            let mut sps = Vec::new();
+            for (id, z0) in [(0u32, 300.0), (1, 500.0), (2, 700.0)] {
+                for i in 0..4 {
+                    for j in 0..4 {
+                        sps.push(SurfacePoint::new([i as f64 * 300.0 + 50.0, j as f64 * 300.0 + 50.0, z0], id));
+                    }
+                }
+            }
+            let oris = vec![Orientation::new([500.0, 500.0, 500.0], [0.0, 0.0, 1.0])];
+            let floor = Model::fit(&Series::new(sps, oris), KernelOptions::default());
+            Stack::new(vec![
+                StackedSeries::new(dipping_plane(650.0, 0.4, 0.0), younger).into(),
+                StackedSeries::floor(floor).into(),
+            ])
+        };
+        for younger in [Relation::Erode, Relation::Onlap, Relation::Conformable] {
+            let stack = make(younger);
+            assert!(stack.series[1].unbounded_above(), "series 1 is the floor");
+            assert_eq!(
+                stack.present_unit_count(1, 0),
+                stack.block_unit_count(1, 0),
+                "floor must keep ALL units under younger {younger:?} (top unit is rock, never dropped)"
+            );
+        }
     }
 
     /// Lithology is youngest-present-wins and is IDENTICAL for erode vs onlap (the
@@ -615,10 +1009,10 @@ mod tests {
     fn stack_four_series_watertight() {
         let build = || {
             Stack::new(vec![
-                StackedSeries::new(dipping_plane(750.0, 0.1, 0.0), Relation::Erode),
-                StackedSeries::new(dipping_plane(650.0, -0.2, 0.05), Relation::Onlap),
-                StackedSeries::new(dipping_plane(550.0, 0.15, 0.0), Relation::Erode),
-                StackedSeries::new(dipping_plane(400.0, 0.0, 0.0), Relation::Basement),
+                StackedSeries::new(dipping_plane(750.0, 0.1, 0.0), Relation::Erode).into(),
+                StackedSeries::new(dipping_plane(650.0, -0.2, 0.05), Relation::Onlap).into(),
+                StackedSeries::new(dipping_plane(550.0, 0.15, 0.0), Relation::Erode).into(),
+                StackedSeries::floor(dipping_plane(400.0, 0.0, 0.0)).into(),
             ])
         };
         assert_stack_watertight(build, "four-series");
@@ -645,7 +1039,7 @@ mod tests {
         ];
         let fault = Box::new(OneFault::new(PlanarFault::new([500.0, 0.0, 0.0], [1.0, 0.0, 0.0])));
         let model = Model::fit_faulted(&Series::new(sps, oris), fault, KernelOptions::default());
-        Stack::new(vec![StackedSeries::new(model, Relation::Basement)])
+        Stack::new(vec![StackedSeries::floor(model).into()])
     }
 
     /// Per-block meshing honors the fault: a faulted series has 2 blocks, and each block's
@@ -725,7 +1119,7 @@ mod tests {
         // drops. Probe the younger erosion elevation at a point where it cuts the older bed
         // — the closed solids must include vertices up near that contact, proving they
         // reach the erosion surface rather than stopping short of it.
-        let younger = &stack.series[0];
+        let younger = stack.series[0].as_series().unwrap();
         let iso_top = younger.iso_top().unwrap();
         // A point where the younger contact (z=600+0.4(x-500)) is near the older bed z=500:
         // 600+0.4(x-500)=500 ⇒ x≈250. Around there the erosion truncates the older bed.
@@ -752,6 +1146,82 @@ mod tests {
         );
     }
 
+    /// A multi-contact `Basement` under a younger `Erode` series — the scale scenario's
+    /// shape (3 sediment contacts as a basement, an erosion plane above). Its three
+    /// interfaces (ids 0,1,2) cut four units; the basement is present everywhere not claimed
+    /// by the younger series, so ALL four units are rock.
+    fn basement_under_erosion() -> Stack<Model> {
+        let mut sps = Vec::new();
+        for (id, z0) in [(0u32, 300.0), (1, 500.0), (2, 700.0)] {
+            for i in 0..4 {
+                for j in 0..4 {
+                    let x = i as f64 * 300.0 + 50.0;
+                    let y = j as f64 * 300.0 + 50.0;
+                    sps.push(SurfacePoint::new([x, y, z0], id));
+                }
+            }
+        }
+        let oris = vec![Orientation::new([500.0, 500.0, 500.0], [0.0, 0.0, 1.0])];
+        let basement = Model::fit(&Series::new(sps, oris), KernelOptions::default());
+        // Younger erosion dipping z = 650 + 0.4(x-500), basalt above, eroding the floor.
+        Stack::new(vec![
+            StackedSeries::new(dipping_plane(650.0, 0.4, 0.0), Relation::Erode).into(),
+            StackedSeries::floor(basement).into(),
+        ])
+    }
+
+    /// THE missing-volume regression, re-keyed onto `unbounded_above` (the two-axis
+    /// migration). An `unbounded_above` floor's topmost lithology unit is real rock (the
+    /// slab between its highest internal contact and the eroding surface), so
+    /// [`Stack::present_unit_count`] must KEEP it — for a BOUNDED series the topmost unit is
+    /// a void and is dropped, but applying that drop to the floor deletes the very slab
+    /// that daylights against the erosion, which read as "missing volumes" in the web2
+    /// solid view. This test pins the keep on `unbounded_above` directly — NOT on the old
+    /// `Relation::Basement` proxy — and guards the latent bug the migration closes: a floor
+    /// mislabelled as bounded would silently drop its top unit.
+    #[test]
+    fn floor_keeps_topmost_unit_which_daylights() {
+        let stack = basement_under_erosion();
+        let cfg = OctreeConfig { max_depth: 6, min_depth: 2, qef_threshold: 1e-6, cap: true };
+        let ext = [1000.0, 1000.0, 1000.0];
+
+        // Series 1 is the floor: it is the honest property under test.
+        assert!(stack.series[1].unbounded_above(), "series 1 must be the unbounded-above floor");
+        assert_eq!(stack.series[1].relation(), None, "the floor has no Axis-A relation");
+
+        // 3 interfaces ⇒ 4 units, and ALL are present (none is a void). A bounded series
+        // drops its top unit; an unbounded-above floor must not.
+        assert_eq!(stack.block_unit_count(1, 0), 4, "3-contact floor has 4 units");
+        assert_eq!(
+            stack.present_unit_count(1, 0),
+            4,
+            "an unbounded-above floor keeps ALL units (its top unit is rock, not a void)"
+        );
+        // The younger Erode series (index 0) DOES drop its top void unit.
+        assert_eq!(
+            stack.present_unit_count(0, 0),
+            stack.block_unit_count(0, 0) - 1,
+            "a younger-bounded series still drops its topmost (void) unit"
+        );
+
+        // The basement's topmost unit (index 3) is the slab that daylights against the
+        // erosion — it must mesh with volume AND carry vertices on the erosion contact.
+        let younger = stack.series[0].as_series().unwrap();
+        let iso_top = younger.iso_top().unwrap();
+        let top = stack
+            .mesh_one_block_unit_solid(1, 0, 3, [0.0, 0.0, 0.0], 1000.0, ext, cfg)
+            .expect("top unit in range");
+        assert!(top.triangle_count() > 0, "the top basement unit must have volume");
+        let on_erosion = top.positions.chunks_exact(3).filter(|v| {
+            let p = [v[0] as f64, v[1] as f64, v[2] as f64];
+            let f = younger.model.scalar_field(p) - iso_top;
+            let g = younger.model.scalar_field_gradient(p);
+            let gm = (g[0] * g[0] + g[1] * g[1] + g[2] * g[2]).sqrt().max(1e-9);
+            (f / gm).abs() < 15.0
+        }).count();
+        assert!(on_erosion > 0, "the top basement unit must daylight ON the erosion contact");
+    }
+
     /// The extent-box clip bounds the contour to the TRUE extent, not the octree cube. With
     /// a cube `size` much taller than `ext_max`, a contact must not produce geometry above
     /// `ext_max` — this is what keeps the cokriging drift's spurious lobes (which form out
@@ -760,7 +1230,7 @@ mod tests {
     #[test]
     fn extent_clip_bounds_contour_to_true_extent() {
         // One flat bed at z=500 over a 1000-cube octree, but clip the TRUE extent z to 650.
-        let stack = Stack::new(vec![StackedSeries::new(dipping_plane(500.0, 0.0, 0.0), Relation::Basement)]);
+        let stack = Stack::new(vec![StackedSeries::floor(dipping_plane(500.0, 0.0, 0.0)).into()]);
         let cfg = OctreeConfig { max_depth: 6, min_depth: 2, qef_threshold: 1e-6, cap: false };
         let ext_max = [1000.0, 1000.0, 650.0]; // z capped well below the cube top (1000)
 
@@ -781,5 +1251,92 @@ mod tests {
                 ext_max[2]
             );
         }
+    }
+
+    /// A 2-interface model: two stacked flat contacts (ids 0,1) at z0 and z1, so a [`Vein`]
+    /// can occupy the band between them. Field increases upward (pole +z).
+    fn two_contact_model(z0: f64, z1: f64) -> Model {
+        let mut sps = Vec::new();
+        for (id, z) in [(0u32, z0), (1u32, z1)] {
+            for i in 0..4 {
+                for j in 0..4 {
+                    sps.push(SurfacePoint::new([i as f64 * 300.0 + 50.0, j as f64 * 300.0 + 50.0, z], id));
+                }
+            }
+        }
+        let oris = vec![Orientation::new([500.0, 500.0, (z0 + z1) * 0.5], [0.0, 0.0, 1.0])];
+        Model::fit(&Series::new(sps, oris), KernelOptions::default())
+    }
+
+    /// T029 [US2] — a vein is present ONLY between its foot-wall/hanging-wall isovalues (a
+    /// band), not below a single top. Probe a point inside the band (present) and points
+    /// above/below it (absent). (FR-006.)
+    #[test]
+    fn vein_is_present_only_within_its_band() {
+        // FW at z≈400 (id 0), HW at z≈600 (id 1). The vein occupies the slab 400<z<600.
+        let v = Vein::new(two_contact_model(400.0, 600.0), 0, 1);
+        assert!(v.present_at([500.0, 500.0, 500.0]), "mid-band point is in the vein");
+        assert!(!v.present_at([500.0, 500.0, 300.0]), "below the foot wall is outside the vein");
+        assert!(!v.present_at([500.0, 500.0, 700.0]), "above the hanging wall is outside the vein");
+    }
+
+    /// T029 [US2] — a vein clips an older bed ONLY within its band, not as an unbounded
+    /// half-space. We check the masker contribution: a younger vein over a floor contributes
+    /// TWO half-spaces (above FW, below HW), so the floor's mesh survives OUTSIDE the band
+    /// and is removed INSIDE it. Verify by lithology: a point in the band is claimed by the
+    /// vein; a point below the band (still in the floor) is claimed by the floor.
+    #[test]
+    fn vein_cross_cuts_only_within_band() {
+        let vein = Vein::new(two_contact_model(400.0, 600.0), 0, 1);
+        let floor = StackedSeries::floor(dipping_plane(500.0, 0.0, 0.0));
+        let stack = Stack::new(vec![StackElement::Vein(vein), StackElement::Series(floor)]);
+
+        // In-band point ⇒ youngest-present-wins gives the vein (element 0).
+        assert_eq!(stack.global_unit([500.0, 500.0, 500.0]).0, 0, "vein claims its band");
+        // Below the band but inside the domain ⇒ the floor (element 1) shows through.
+        assert_eq!(stack.global_unit([500.0, 500.0, 200.0]).0, 1, "floor shows below the vein band");
+        // Above the band ⇒ also the floor (it is unbounded-above / present everywhere not
+        // claimed), confirming the vein does NOT clip as an unbounded half-space.
+        assert_eq!(stack.global_unit([500.0, 500.0, 800.0]).0, 1, "floor shows above the vein band");
+    }
+
+    /// T030 [US2] — an intrusion is present only INSIDE its envelope, and lithology needs no
+    /// special case (youngest-present-wins already routes interior points to it). (FR-007,
+    /// FR-009.)
+    #[test]
+    fn intrusion_claims_only_its_interior() {
+        // Envelope = a single contact at z≈500; interior is `field < iso` (below it).
+        let intr = Intrusion::new(dipping_plane(500.0, 0.0, 0.0), Envelope::Single(0));
+        assert!(intr.present_at([500.0, 500.0, 300.0]), "below the envelope contact is interior");
+        assert!(!intr.present_at([500.0, 500.0, 700.0]), "above the envelope contact is exterior");
+
+        // In a stack over a floor, the intrusion claims its interior (element 0).
+        let floor = StackedSeries::floor(dipping_plane(200.0, 0.0, 0.0));
+        let stack = Stack::new(vec![StackElement::Intrusion(intr), StackElement::Series(floor)]);
+        assert_eq!(stack.global_unit([500.0, 500.0, 300.0]).0, 0, "intrusion claims its interior");
+    }
+
+    /// T031 [US2] — `cuts_below` is DERIVED from chronology + spatial overlap, never declared:
+    /// it returns exactly the older elements a cross-cutting body actually intersects, an
+    /// empty set when it reaches none, and `[]` for a stratigraphic series. (FR-008.)
+    #[test]
+    fn cuts_below_is_derived_from_overlap() {
+        let min = [0.0, 0.0, 0.0];
+        let size = 1000.0;
+
+        // A vein (band 400–600) over a floor it overlaps → cuts the floor (index 1).
+        let vein = Vein::new(two_contact_model(400.0, 600.0), 0, 1);
+        let floor = StackedSeries::floor(dipping_plane(500.0, 0.0, 0.0));
+        let stack = Stack::new(vec![StackElement::Vein(vein), StackElement::Series(floor)]);
+        assert_eq!(stack.cuts_below(0, min, size), vec![1], "vein cuts the floor it overlaps");
+        // A stratigraphic series has no cut-set.
+        assert_eq!(stack.cuts_below(1, min, size), Vec::<usize>::new(), "a series has no cut-set");
+
+        // A vein whose band sits ABOVE the domain's data (band 1400–1600, outside [0,1000])
+        // reaches nothing → empty cut-set, not an error.
+        let high_vein = Vein::new(two_contact_model(1400.0, 1600.0), 0, 1);
+        let floor2 = StackedSeries::floor(dipping_plane(500.0, 0.0, 0.0));
+        let stack2 = Stack::new(vec![StackElement::Vein(high_vein), StackElement::Series(floor2)]);
+        assert_eq!(stack2.cuts_below(0, min, size), Vec::<usize>::new(), "a body reaching nothing cuts nothing");
     }
 }

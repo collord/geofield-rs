@@ -1,0 +1,65 @@
+/* T017 [US4] — the two drag affordances MUST be visually distinct (FR-015, SC-006).
+ *
+ *   - Container reorder (CHRONOLOGY, the consequential drag): a STRONG, full-width
+ *     insertion bar, accent-colored, thick.
+ *   - Within-group surface reorder (isovalue order, local): a LIGHTER, INDENTED, thin
+ *     bar — deliberately understated so the consequential drag is never confused with it.
+ *
+ * This is the visual half of the "one resolver, two semantics" design (dragResolver.ts).
+ * Build status: design only; not yet rendered/verified in a browser here. */
+
+.hierarchy {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  font-family: system-ui, sans-serif;
+}
+
+/* --- container nodes ----------------------------------------------------- */
+.container-node {
+  border: 1px solid #ccd;
+  border-radius: 6px;
+  padding: 0.5rem 0.75rem;
+  background: #fff;
+}
+.container-header { display: flex; align-items: center; gap: 0.5rem; }
+.container-name { font-weight: 600; }
+.kind-icon[data-kind="series"] { width: 10px; height: 10px; border-radius: 2px; background: #3a6; }
+
+.validation-badge.ok { color: #2a7; }
+.validation-badge.warn { color: #c83; font-weight: 700; }
+.floor-chip { margin-left: auto; font-size: 0.8em; color: #769; }
+.derived-summary { font-size: 0.8em; color: #678; margin-top: 0.25rem; }
+.unbounded-toggle { display: block; font-size: 0.8em; margin-top: 0.25rem; }
+
+.surface-list { margin: 0.25rem 0 0; padding-left: 1rem; }
+.surface-node { font-size: 0.85em; color: #445; cursor: grab; }
+
+/* --- seam controls (Axis A) --------------------------------------------- */
+.seam { text-align: center; padding: 0.15rem 0; }
+.seam-control { display: flex; justify-content: center; gap: 0.25rem; }
+.seam-state {
+  font-size: 0.75em; padding: 0.1rem 0.5rem; border: 1px solid #bcd;
+  border-radius: 10px; background: #f4f6fb; cursor: pointer;
+}
+.seam-state.active { background: #3a6; color: #fff; border-color: #3a6; }
+.cross-cut-chip { font-size: 0.75em; color: #939; }
+.floor-seam { font-size: 0.75em; color: #aab; }
+
+/* --- the two DISTINCT drop affordances ---------------------------------- */
+/* Container insertion: strong, full-width, accent, thick. */
+.drop-indicator-container {
+  height: 4px;
+  width: 100%;
+  background: #3a6;
+  border-radius: 2px;
+  box-shadow: 0 0 0 1px #3a6;
+}
+/* Within-group surface insertion: light, indented, thin. */
+.drop-indicator-within {
+  height: 1px;
+  width: calc(100% - 1.5rem);
+  margin-left: 1.5rem;
+  background: #aac;
+  opacity: 0.7;
+}

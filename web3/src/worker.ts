@@ -1,0 +1,136 @@
+// The testbed's solver worker: owns BOTH wasm instances (EUPL kernel + BSD engine) + the
+// kernel-bridge, fits the stack and meshes off the UI thread, and streams status, surfaces,
+// and the hierarchy `CoreUpdate` back. Adapted from web/src/worker.ts to the two-axis model
+// (feature 001): add_series carries `unboundedAbove`, and the worker posts the parsed
+// `CoreUpdate` (declared state + derived view) from `WasmStack.core_update_json()`.
+//
+// Cancellation is by hard terminate from the main thread (a single fit is one
+// uninterruptible wasm call). A new edit terminates the previous worker and spawns a fresh
+// one (an accepted ~1s cold start).
+//
+// Build status: type-checked design; not yet `tsc`-verified here (web3 deps uninstalled).
+
+import init, { WasmStack } from "./wasm/geofield.js";
+import { initKernel, setEngineMemory } from "./kernel-bridge";
+import kernelWasmUrl from "./wasm-kernel/geofield_kernel.wasm?url";
+import type {
+  Command,
+  RunCommand,
+  SeriesJson,
+  SurfacePayload,
+  WorkerMessage,
+} from "./protocol";
+import type { CoreUpdate } from "./HierarchyPanel/dto";
+
+const NAN = Number.NaN;
+const QEF_EPS = 1e-6;
+
+function emit(msg: WorkerMessage, transfer: Transferable[] = []) {
+  (self as unknown as Worker).postMessage(msg, transfer);
+}
+
+// Init the two wasm modules ONCE per worker lifetime, kernel-first (the engine's "kernel"
+// imports must be live before it runs), then register engine memory for the bridge.
+let ready: Promise<void> | null = null;
+function initWasm(): Promise<void> {
+  if (!ready) {
+    ready = (async () => {
+      await initKernel(kernelWasmUrl);
+      const wasm = await init();
+      setEngineMemory(wasm.memory as WebAssembly.Memory);
+    })();
+  }
+  return ready;
+}
+
+const f64 = (a: number[]) => new Float64Array(a);
+
+/** Fit the whole stack youngest-first. NaN kernel options → crate defaults; uni_degree = 1;
+ *  decimate off (testbed inputs are tiny). The new ABI arg order puts `unboundedAbove`
+ *  (Axis B) right after `relation` (Axis A) — see WasmStack::add_series (contract D1). */
+function buildStack(series: SeriesJson[]): WasmStack {
+  const stack = new WasmStack();
+  for (const s of series) {
+    const fit = [f64(s.sp_xyz), f64(s.sp_if), f64(s.ori_xyz), f64(s.ori_pole)] as const;
+    const opts = [NAN, NAN, NAN, NAN, 1, NAN] as const; // range, c_o, i_res, gi_res, uni_degree, nugget
+    const faults = [f64(s.fault_point), f64(s.fault_normal)] as const;
+    if (s.crossCut?.kind === "vein") {
+      stack.add_vein(...fit, ...opts, s.crossCut.footWall, s.crossCut.hangingWall, NAN, ...faults);
+    } else if (s.crossCut?.kind === "intrusion") {
+      stack.add_intrusion(...fit, ...opts, s.crossCut.envelopeInner, s.crossCut.envelopeOuter, NAN, ...faults);
+    } else {
+      stack.add_series(...fit, ...opts, s.relation, s.unboundedAbove, NAN, ...faults);
+    }
+  }
+  return stack;
+}
+
+/** Mesh + collect the viewer surfaces (open contact sheets, one per interface per block).
+ *  Contact mode is the MVP default; the solid-mode toggle is a later task. */
+function collectSurfaces(
+  stack: WasmStack,
+  series: SeriesJson[],
+  extent: [number, number, number, number, number, number],
+  depth: number,
+): SurfacePayload[] {
+  const [x0, x1, y0, y1, z0, z1] = extent;
+  const size = Math.max(x1 - x0, y1 - y0, z1 - z0);
+  const minDepth = Math.min(2, depth);
+  const out: SurfacePayload[] = [];
+
+  for (let si = 0; si < stack.series_count; si++) {
+    const blocks = Math.max(1, stack.series_block_count(si));
+    const n = stack.interface_count(si);
+    for (let b = 0; b < blocks; b++) {
+      for (let k = 0; k < n; k++) {
+        const m = stack.mesh_series_block_interface(
+          si, b, k, x0, y0, z0, size, x1, y1, z1, depth, minDepth, QEF_EPS, false,
+        );
+        if (m.triangle_count > 0) {
+          out.push({
+            series: si,
+            block: b,
+            interface: k,
+            positions: m.positions(),
+            normals: m.normals(),
+            indices: m.indices(),
+          });
+        }
+        m.free();
+      }
+    }
+    void series; // series metadata (names) used by the panel, not the mesh payload
+  }
+  return out;
+}
+
+async function run(cmd: RunCommand) {
+  emit({ type: "status", phase: "loading kernel + engine wasm…" });
+  await initWasm();
+
+  emit({ type: "status", phase: "fitting stack…" });
+  const stack = buildStack(cmd.series);
+
+  emit({ type: "status", phase: "meshing surfaces…" });
+  const surfaces = collectSurfaces(stack, cmd.series, cmd.extent, cmd.maxDepth);
+
+  // The hierarchy round-trip payload (declared state + derived view) — parsed from the
+  // core's single JSON getter (contract D3+D5). The UI treats `derived` as a read-only cache.
+  const update = JSON.parse(stack.core_update_json()) as CoreUpdate;
+  stack.free?.();
+
+  const transfer: Transferable[] = [];
+  for (const s of surfaces) {
+    transfer.push(s.positions.buffer, s.normals.buffer, s.indices.buffer);
+  }
+  emit({ type: "done", surfaces, update }, transfer);
+}
+
+self.onmessage = (e: MessageEvent<Command>) => {
+  const cmd = e.data;
+  if (cmd.type === "run") {
+    run(cmd).catch((err) => {
+      emit({ type: "error", message: err instanceof Error ? err.message : String(err) });
+    });
+  }
+};
