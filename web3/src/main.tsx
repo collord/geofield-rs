@@ -20,6 +20,8 @@ function App() {
   const [state, setState] = useState<HierarchyState>(emptyState());
   const [surfaces, setSurfaces] = useState<SurfacePayload[]>([]);
   const [status, setStatus] = useState<string>("idle");
+  // Extent is state (drives the viewer's axes) as well as a ref (read in runStack).
+  const [extent, setExtent] = useState<Scenario["extent"]>(SCENARIOS[0].extent);
   // The live series array (editable) — initialized from the scenario, mutated by the panel.
   const seriesRef = useRef<RunCommand["series"]>([]);
   const extentRef = useRef<Scenario["extent"]>(SCENARIOS[0].extent);
@@ -57,6 +59,7 @@ function App() {
     setScenarioId(id);
     seriesRef.current = sc.series.map((s) => ({ ...s }));
     extentRef.current = sc.extent;
+    setExtent(sc.extent);
     runStack();
   }
 
@@ -111,7 +114,7 @@ function App() {
         />
       </aside>
       <main>
-        <Viewer surfaces={surfaces} />
+        <Viewer surfaces={surfaces} extent={extent} />
       </main>
     </div>
   );

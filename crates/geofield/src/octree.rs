@@ -309,6 +309,18 @@ impl<'a> Scene<'a> {
         self.contributors.iter().all(|c| c.inside(p))
     }
 
+    /// Is `p` inside every TRUNCATING contributor — i.e. every contributor EXCEPT the
+    /// domain box (conventionally contributor 0)? `true` when there are no truncators
+    /// (box-only scene). Used to classify open-sheet faces: a contact face is kept only
+    /// where its primary crossing is on the un-eroded side of the truncators, so the open
+    /// sheet terminates exactly on the contact∩truncator crease — WITHOUT excluding the
+    /// box-daylight faces (which must stay flush on the domain wall).
+    fn contributors_inside_truncators(&self, p: [f64; 3]) -> bool {
+        // contributor 0 is the domain box (see `octree_dual_contour_bounded` and the
+        // stack's `mesh_one_clipped`, both of which push the box first).
+        self.contributors.iter().skip(1).all(|c| c.inside(p))
+    }
+
     /// Primary-contact gradient at `p`.
     fn primary_gradient(&self, p: [f64; 3]) -> [f64; 3] {
         self.model.scalar_field_gradient(p)
@@ -676,6 +688,9 @@ struct Leaf {
     corners: [f64; 8],
     /// Boundary membership at the 8 cell corners: `true` = inside (`b < 0`).
     inside: [bool; 8],
+    /// Inside every TRUNCATING contributor (all but the domain box) at the 8 corners.
+    /// Used only to classify open-sheet faces (terminate on the contact∩truncator crease).
+    inside_trunc: [bool; 8],
     /// Output mesh vertex index per surface COMPONENT (one sheet → one entry; a
     /// two-sheet cell → two). Filled in `assign_vertices` (which knows `cap`).
     /// Empty until then / for non-surface leaves.
@@ -908,11 +923,15 @@ fn orient_closed_outward(mesh: &mut Mesh) {
 
 /// Sample the scene at a node's 8 corners: `corners[c]` = primary contact field −
 /// isovalue (negative below the contact); `inside[c]` = inside EVERY contributor
-/// (the domain ∩ all truncating surfaces). The combined solid sign at a corner is
-/// `corners[c] <= 0 && inside[c]` (see `corner_sign`).
-fn sample_corners(scene: &Scene, min: [f64; 3], size: f64) -> ([f64; 8], [bool; 8]) {
+/// (the domain ∩ all truncating surfaces); `inside_trunc[c]` = inside every
+/// TRUNCATING contributor only (contributors `[1..]`, excluding the domain box).
+/// The combined solid sign at a corner is `corners[c] <= 0 && inside[c]` (see
+/// `corner_sign`); `inside_trunc` is used ONLY to classify open-sheet faces so the
+/// sheet terminates on the contact∩truncator crease while staying box-flush.
+fn sample_corners(scene: &Scene, min: [f64; 3], size: f64) -> ([f64; 8], [bool; 8], [bool; 8]) {
     let mut c = [0.0; 8];
     let mut ins = [false; 8];
+    let mut ins_trunc = [false; 8];
     for i in 0..8 {
         let (dx, dy, dz) = corner_offset(i);
         let p = [
@@ -922,8 +941,9 @@ fn sample_corners(scene: &Scene, min: [f64; 3], size: f64) -> ([f64; 8], [bool; 
         ];
         c[i] = scene.primary(p);
         ins[i] = scene.contributors_inside(p);
+        ins_trunc[i] = scene.contributors_inside_truncators(p);
     }
-    (c, ins)
+    (c, ins, ins_trunc)
 }
 
 /// Does any of the 12 cell edges change FIELD sign?
@@ -1257,7 +1277,7 @@ fn build(
     depth: u32,
     cfg: &OctreeConfig,
 ) -> NodeId {
-    let (corners, inside) = sample_corners(scene, min, size);
+    let (corners, inside, inside_trunc) = sample_corners(scene, min, size);
     let crossing = is_surface(&corners, &inside);
 
     let make_leaf = |tree: &mut Octree| -> NodeId {
@@ -1267,6 +1287,7 @@ fn build(
         tree.nodes.push(Node::Leaf(Leaf {
             corners,
             inside,
+            inside_trunc,
             out: Vec::new(),
             edge_owner: [u8::MAX; 12],
         }));
@@ -1623,9 +1644,9 @@ fn contour_edges(tree: &Octree, scene: &Scene, mesh: &mut Mesh, contact_face: &m
 
     for id in 0..tree.nodes.len() {
         let (lmin, lsize) = tree.bounds[id];
-        let (corners, inside) = match &tree.nodes[id] {
+        let (corners, inside, inside_trunc) = match &tree.nodes[id] {
             Node::Leaf(l) if has_contour_crossing(&l.corners, &l.inside, true) => {
-                (l.corners, l.inside)
+                (l.corners, l.inside, l.inside_trunc)
             }
             _ => continue,
         };
@@ -1652,10 +1673,17 @@ fn contour_edges(tree: &Octree, scene: &Scene, mesh: &mut Mesh, contact_face: &m
                 continue;
             }
 
-            // A contact face: the primary contact field crosses this minimal edge.
-            // (Otherwise the combined sign flipped only because a contributor surface
-            // crossed — a domain-cap face.)
-            let is_contact = (corners[ca] <= 0.0) != (corners[cb] <= 0.0);
+            // A contact face: the primary contact field crosses this minimal edge AND the
+            // crossing is on the un-eroded side of the TRUNCATING contributors (both
+            // endpoints inside them). On an erosion-driven crease edge one endpoint is
+            // eroded (`inside_trunc == false`), so the face is reclassified as a cap face
+            // and dropped by `keep_contact_faces` — terminating the open sheet exactly on
+            // the contact∩truncator crease. The domain box is excluded from `inside_trunc`,
+            // so box-daylight contact faces stay flush. (Otherwise the combined sign flipped
+            // only because a contributor surface crossed — a cap face.)
+            let is_contact = ((corners[ca] <= 0.0) != (corners[cb] <= 0.0))
+                && inside_trunc[ca]
+                && inside_trunc[cb];
             emit_quad(tree, &leaves, axis, mid, mesh, is_contact, contact_face);
         }
     }

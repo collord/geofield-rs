@@ -35,6 +35,12 @@ function dippingPlane(
   sy: number,
   relation: number,
   unboundedAbove: boolean,
+  // Where the unit's rock sits relative to its contact (the model is "present where
+  // field < iso_top"). "below" (default) = a unit bounded above by its contact; "above" =
+  // a unit DEPOSITED ON TOP of its contact (field decreases upward, pole points down). An
+  // erosional deposit caps the unconformity from ABOVE, which is what reads as erosion —
+  // the older beds survive below the contact, the deposit fills above it.
+  depositSide: "below" | "above" = "below",
 ): SeriesJson {
   const sp_xyz: number[] = [];
   const sp_if: number[] = [];
@@ -46,8 +52,10 @@ function dippingPlane(
       sp_if.push(0);
     }
   }
-  // pole = normalized (−sx, −sy, 1) (field increases upward).
+  // "below": pole (−sx,−sy,1) (field increases upward → present below the contact).
+  // "above": flip it (field increases downward → present above the contact).
   const n = Math.hypot(sx, sy, 1);
+  const s = depositSide === "above" ? -1 : 1;
   return {
     name,
     relation,
@@ -55,7 +63,7 @@ function dippingPlane(
     sp_xyz,
     sp_if,
     ori_xyz: [500, 500, z0],
-    ori_pole: [-sx / n, -sy / n, 1 / n],
+    ori_pole: [(s * -sx) / n, (s * -sy) / n, (s * 1) / n],
     ...NO_FAULT,
   };
 }
@@ -126,10 +134,14 @@ export const SCENARIOS: Scenario[] = [
     id: "erosional-unconformity",
     name: "Erosional unconformity",
     description:
-      "A younger dipping Erode contact truncates the 3-contact floor on the side it covers. " +
-      "Toggle its seam erode→onlap→conformable to see the floor beds clip vs. stay intact.",
+      "A dipping erosion surface truncates the 3-contact floor: the older beds survive BELOW " +
+      "the unconformity and daylight against it, while the younger 'basalt' is deposited ON " +
+      "TOP. Toggle the seam erode→onlap→conformable to see the floor beds clip vs. stay intact.",
     series: [
-      dippingPlane("basalt", 650, 0.4, 0, ERODE, false),
+      // The erosional deposit sits ABOVE its contact (depositSide: "above"), so the floor
+      // is truncated at the unconformity rather than erased down the whole column — the
+      // geologically legible erosion picture. (Model semantics unchanged; only the pole.)
+      dippingPlane("basalt", 650, 0.4, 0, ERODE, false, "above"),
       threeContactFloor("sediments"),
     ],
     extent: EXTENT,

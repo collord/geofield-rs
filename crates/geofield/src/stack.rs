@@ -939,6 +939,60 @@ mod tests {
         }
     }
 
+    /// A realistic erosional unconformity: the younger erode deposit sits ABOVE its dipping
+    /// contact (pole pointing down), so the older floor survives BELOW the unconformity and
+    /// is truncated at it — NOT erased down the whole column. This pins the geology the web3
+    /// `erosional-unconformity` scenario relies on (the deposit-above fix). Contrast
+    /// `floor_keeps_topmost_unit_which_daylights`, which uses the deposit-BELOW basalt.
+    #[test]
+    fn erode_deposit_above_truncates_floor_at_unconformity() {
+        // Basalt contact z = 650 + 0.4(x-500); pole DOWN so basalt is present ABOVE it.
+        let mut sps = Vec::new();
+        for i in 0..4 {
+            for j in 0..4 {
+                let x = i as f64 * 300.0 + 50.0;
+                let y = j as f64 * 300.0 + 50.0;
+                sps.push(SurfacePoint::new([x, y, 650.0 + 0.4 * (x - 500.0)], 0));
+            }
+        }
+        let nrm = (0.4f64 * 0.4 + 1.0).sqrt();
+        // pole = (+sx, 0, -1)/|..| → field increases downward → present above the contact.
+        let oris = vec![Orientation::new([500.0, 500.0, 650.0], [0.4 / nrm, 0.0, -1.0 / nrm])];
+        let basalt = Model::fit(&Series::new(sps, oris), KernelOptions::default());
+
+        // 3-contact floor at z = 300/500/700.
+        let mut fsps = Vec::new();
+        for (id, z0) in [(0u32, 300.0), (1, 500.0), (2, 700.0)] {
+            for i in 0..4 {
+                for j in 0..4 {
+                    fsps.push(SurfacePoint::new([i as f64 * 300.0 + 50.0, j as f64 * 300.0 + 50.0, z0], id));
+                }
+            }
+        }
+        let floor = Model::fit(
+            &Series::new(fsps, vec![Orientation::new([500.0, 500.0, 500.0], [0.0, 0.0, 1.0])]),
+            KernelOptions::default(),
+        );
+        let stack = Stack::new(vec![
+            StackElement::Series(StackedSeries::new(basalt, Relation::Erode)),
+            StackElement::Series(StackedSeries::floor(floor)),
+        ]);
+
+        // RIGHT (x=900): contact ≈ z=810. The floor must survive BELOW it (all three beds at
+        // 350/550/750 are floor), and basalt only caps ABOVE (z=950).
+        for (z, want_floor) in [(350.0, true), (550.0, true), (750.0, true), (950.0, false)] {
+            let (s, _u) = stack.global_unit([900.0, 500.0, z]);
+            if want_floor {
+                assert_eq!(s, 1, "x=900 z={z}: floor should survive below the unconformity");
+            } else {
+                assert_eq!(s, 0, "x=900 z={z}: basalt deposit caps above the unconformity");
+            }
+        }
+        // LEFT (x=100): contact ≈ z=490. Floor below (z=350), basalt above (z=750).
+        assert_eq!(stack.global_unit([100.0, 500.0, 350.0]).0, 1, "x=100 z=350: floor below");
+        assert_eq!(stack.global_unit([100.0, 500.0, 750.0]).0, 0, "x=100 z=750: basalt above");
+    }
+
     /// Lithology is youngest-present-wins and is IDENTICAL for erode vs onlap (the
     /// relation changes meshing, not the per-point unit). At a point inside the
     /// younger body, the younger series wins regardless of relation; in the younger's
@@ -1338,5 +1392,188 @@ mod tests {
         let floor2 = StackedSeries::floor(dipping_plane(500.0, 0.0, 0.0));
         let stack2 = Stack::new(vec![StackElement::Vein(high_vein), StackElement::Series(floor2)]);
         assert_eq!(stack2.cuts_below(0, min, size), Vec::<usize>::new(), "a body reaching nothing cuts nothing");
+    }
+
+    /// Where a younger erode deposit (present ABOVE its contact) fully covers an older
+    /// contact, that older contact's open sheet must be cleanly truncated at the
+    /// unconformity — emitting NO referenced geometry far below it on the eroded side, and
+    /// (the stronger guarantee, checked separately) no referenced vertex inside the eroding
+    /// body. This pins the deposit-above erosional-unconformity clip the web3 scenario uses.
+    ///
+    /// NB: this checks the field-PENETRATION guarantee (no referenced vertex inside the
+    /// eroding body). It does NOT catch lateral overshoot ALONG the crease — verts that sit
+    /// on the contact (`field ≈ iso`) but past the intersection — which was the visible
+    /// "brown through blue" artifact; that is pinned separately by
+    /// `eroded_open_sheet_does_not_overshoot_the_crease`. Both are now clean after the
+    /// open-sheet termination fix (the `inside_trunc` face gate in `octree::contour_edges`).
+    #[test]
+    fn eroded_contact_is_cleanly_truncated_at_unconformity() {
+        // Basalt deposited ABOVE a dipping contact z=650+0.4(x-500); pole points down.
+        let mut sps = Vec::new();
+        for i in 0..4 {
+            for j in 0..4 {
+                let x = i as f64 * 300.0 + 50.0;
+                let y = j as f64 * 300.0 + 50.0;
+                sps.push(SurfacePoint::new([x, y, 650.0 + 0.4 * (x - 500.0)], 0));
+            }
+        }
+        let nrm = (0.4f64 * 0.4 + 1.0).sqrt();
+        let basalt = Model::fit(
+            &Series::new(sps, vec![Orientation::new([500.0, 500.0, 650.0], [0.4 / nrm, 0.0, -1.0 / nrm])]),
+            KernelOptions::default(),
+        );
+        // Floor top bed at z≈700 (single interface suffices for the artifact).
+        let floor = dipping_plane(700.0, 0.0, 0.0);
+        let stack = Stack::new(vec![
+            StackElement::Series(StackedSeries::new(basalt, Relation::Erode)),
+            StackElement::Series(StackedSeries::floor(floor)),
+        ]);
+
+        let basalt_iso = match &stack.series[0] {
+            StackElement::Series(s) => s.iso_top().unwrap(),
+            _ => unreachable!(),
+        };
+        let cfg = OctreeConfig { max_depth: 6, min_depth: 2, qef_threshold: 1e-6, cap: false };
+        let mesh = stack
+            .mesh_one_clipped(1, 0, [0.0, 0.0, 0.0], 1000.0, [1000.0, 1000.0, 1000.0], cfg)
+            .expect("floor interface in range");
+
+        let referenced: std::collections::HashSet<u32> = mesh.indices.iter().copied().collect();
+        let basalt_field = match &stack.series[0] {
+            StackElement::Series(s) => &s.model,
+            _ => unreachable!(),
+        };
+        let cell = 1000.0 / 2f64.powi(6) + 1.0;
+        let (mut skirt, mut inside) = (0usize, 0usize);
+        for &vi in &referenced {
+            let o = vi as usize * 3;
+            let p = [mesh.positions[o] as f64, mesh.positions[o + 1] as f64, mesh.positions[o + 2] as f64];
+            // (a) No skirt: left of the seam (x<600, basalt covers the z=700 bed) AND far
+            // below the contact = a spurious closing skirt.
+            if p[0] < 600.0 - cell && p[2] < 600.0 {
+                skirt += 1;
+            }
+            // (b) No penetration: the basalt is present where field < iso; a floor vertex
+            // meaningfully inside that region would be brown-through-blue at the model level.
+            if basalt_field.scalar_field(p) - basalt_iso < -0.03 {
+                inside += 1;
+            }
+        }
+        assert_eq!(skirt, 0, "eroded floor contact emitted {skirt} skirt vertices below the unconformity");
+        assert_eq!(inside, 0, "eroded floor contact emitted {inside} vertices INSIDE the eroding basalt body");
+    }
+
+    /// REGRESSION (brown-through-blue): the open contact sheet must TERMINATE on the
+    /// floor∩erosion intersection, not overshoot LATERALLY past it. The earlier
+    /// penetration test misses this: the overshoot verts sit ON the floor contact (field
+    /// ≈ iso) but on the eroded SIDE of the crease, so they pass a field-penetration check
+    /// while still poking past the rendered erosion surface.
+    ///
+    /// Geometry = the web3 erosional-unconformity scenario: a deposit-above dipping basalt
+    /// over a 3-contact floor (beds at z=300/500/700). The crease (where the floor∩erosion
+    /// surfaces meet) is set by the FITTED basalt field, not the nominal plane: at z=500 the
+    /// basalt field crosses its isovalue near x≈150 (the cokriged + deposit-above field is
+    /// well left of the nominal `650+0.4(x-500)=500` ⇒ x=375). The open sheet must terminate
+    /// at that field crease — where `inside_trunc` flips — NOT overshoot left of it.
+    ///
+    /// We pin the fix two ways: (1) the surviving contact must not extend into the eroded
+    /// region where the basalt is meaningfully present (`field−iso < −ε`) — the lateral
+    /// overshoot the field-penetration test missed; and (2) it is depth-STABLE (the
+    /// pre-fix overshoot was angle-determined, depth-invariant).
+    #[test]
+    fn eroded_open_sheet_does_not_overshoot_the_crease() {
+        let make = || {
+            // Deposit-above basalt: z=650+0.4(x-500), pole down (present above the contact).
+            let mut bsps = Vec::new();
+            for i in 0..4 {
+                for j in 0..4 {
+                    let x = i as f64 * 300.0 + 50.0;
+                    let y = j as f64 * 300.0 + 50.0;
+                    bsps.push(SurfacePoint::new([x, y, 650.0 + 0.4 * (x - 500.0)], 0));
+                }
+            }
+            let nrm = (0.4f64 * 0.4 + 1.0).sqrt();
+            let basalt = Model::fit(
+                &Series::new(bsps, vec![Orientation::new([500.0, 500.0, 650.0], [0.4 / nrm, 0.0, -1.0 / nrm])]),
+                KernelOptions::default(),
+            );
+            // 3-contact floor (ids 0,1,2 at z=300/500/700), the web3 threeContactFloor.
+            let mut fsps = Vec::new();
+            for (id, z0) in [(0u32, 300.0), (1, 500.0), (2, 700.0)] {
+                for i in 0..4 {
+                    for j in 0..4 {
+                        fsps.push(SurfacePoint::new([i as f64 * 300.0 + 50.0, j as f64 * 300.0 + 50.0, z0], id));
+                    }
+                }
+            }
+            let floor = Model::fit(
+                &Series::new(fsps, vec![Orientation::new([500.0, 500.0, 500.0], [0.0, 0.0, 1.0])]),
+                KernelOptions::default(),
+            );
+            Stack::new(vec![
+                StackElement::Series(StackedSeries::new(basalt, Relation::Erode)),
+                StackElement::Series(StackedSeries::floor(floor)),
+            ])
+        };
+        // Middle bed (interface idx 1, z≈500). The basalt field defines the crease; assert
+        // the surviving sheet does not reach meaningfully into the basalt-present region.
+        // The crease at z=500 is where the basalt FIELD crosses its isovalue (NOT the
+        // nominal plane `650+0.4(x-500)=500`⇒x=375 — the cokriged + deposit-above field
+        // crosses well left of that). Locate it by bisection so the test pins true geometry.
+        let basalt_iso = match &make().series[0] {
+            StackElement::Series(s) => s.iso_top().unwrap(),
+            _ => unreachable!(),
+        };
+        let crease_x = {
+            let stack = make();
+            let f = |x: f64| match &stack.series[0] {
+                StackElement::Series(s) => s.model.scalar_field([x, 500.0, 500.0]) - basalt_iso,
+                _ => unreachable!(),
+            };
+            // f<0 (basalt present) left, f>0 right; bisect the zero in [0,1000].
+            let (mut lo, mut hi) = (0.0, 1000.0);
+            for _ in 0..50 {
+                let mid = (lo + hi) * 0.5;
+                if f(lo) * f(mid) <= 0.0 { hi = mid } else { lo = mid }
+            }
+            (lo + hi) * 0.5
+        };
+
+        // The surviving contact must not extend left of the crease by more than ~a cell.
+        // Pre-fix the sheet reached x≈94 (crease≈130) — fails; post-fix it sits at the
+        // crease. Checked at two depths for depth-stability (the overshoot was
+        // angle-determined / depth-invariant, so a too-lenient slop would still catch it).
+        let mut min_x_at_depth = Vec::new();
+        for depth in [6u32, 7] {
+            let stack = make();
+            let cfg = OctreeConfig { max_depth: depth, min_depth: 2, qef_threshold: 1e-6, cap: false };
+            let mesh = stack
+                .mesh_one_clipped(1, 1, [0.0, 0.0, 0.0], 1000.0, [1000.0, 1000.0, 1000.0], cfg)
+                .expect("floor interface in range");
+            let referenced: std::collections::HashSet<u32> = mesh.indices.iter().copied().collect();
+            let cell = 1000.0 / 2f64.powi(depth as i32);
+            let mut min_x = f64::INFINITY;
+            for &vi in &referenced {
+                let o = vi as usize * 3;
+                let (x, z) = (mesh.positions[o] as f64, mesh.positions[o + 2] as f64);
+                if (z - 500.0).abs() < 60.0 {
+                    min_x = min_x.min(x);
+                }
+            }
+            assert!(
+                min_x >= crease_x - 1.5 * cell,
+                "depth {depth}: middle bed open sheet overshoots the field crease — survives from \
+                 x={min_x:.0}, crease at x≈{crease_x:.0} (allowed ≥ {:.0})",
+                crease_x - 1.5 * cell
+            );
+            min_x_at_depth.push(min_x);
+        }
+        // Depth-stable: the termination is at the field crease, not a resolution staircase
+        // that would march left as cells shrink. The two depths agree within a couple cells.
+        let (a, b) = (min_x_at_depth[0], min_x_at_depth[1]);
+        assert!(
+            (a - b).abs() < 40.0,
+            "termination should be depth-stable (at the crease), got x={a:.0} (d6) vs x={b:.0} (d7)"
+        );
     }
 }
