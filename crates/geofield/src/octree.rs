@@ -918,10 +918,31 @@ fn orient_closed_outward(mesh: &mut Mesh) {
     }
 }
 
+/// Magnitude (in `field − iso` units) below which a corner is treated as a
+/// DEGENERATE graze — the contact passing through the corner exactly — and snapped
+/// to a single canonical sign. A geological contact aligned to a grid plane (e.g. a
+/// dipping plane that hits `z = z0` exactly at a cell boundary) lands `field − iso`
+/// at the round-off floor (~1e-17), whose discrete sign (`<= 0`) is otherwise
+/// build-dependent: native and wasm32 disagree in the last ULPs, flipping a corner
+/// between "below" and "above" the contact. That flip propagates into both the
+/// closed-solid topology (`corner_sign`) and the contact-face classification
+/// (`is_contact`), and produced the "ceiling spike" — a contact face wrongly kept
+/// and stretched to a domain-cap vertex on wasm only. Snapping any near-zero corner
+/// to a fixed side makes the contour IDENTICAL across builds (the parity the engine
+/// requires). `1e-9` sits ~1e8× above the round-off floor yet far below any genuine
+/// per-cell field variation (a depth-6 cell changes `field − iso` by ~1e-2), so it
+/// never reclassifies a real crossing.
+const CONTACT_GRAZE_EPS: f64 = 1e-9;
+
 /// Sample the scene at a node's 8 corners: `corners[c]` = primary contact field −
 /// isovalue (negative below the contact); `inside[c]` = inside EVERY contributor
 /// (the domain ∩ all truncating surfaces). The combined solid sign at a corner is
 /// `corners[c] <= 0 && inside[c]` (see `corner_sign`).
+///
+/// A corner within [`CONTACT_GRAZE_EPS`] of the contact is snapped to a single
+/// canonical sign (just ABOVE the contact, `+eps`) so a grid-aligned contact graze
+/// classifies identically across native/wasm — the same world point sampled by every
+/// cell that shares it gets the same value, so the snap preserves watertightness.
 fn sample_corners(scene: &Scene, min: [f64; 3], size: f64) -> ([f64; 8], [bool; 8]) {
     let mut c = [0.0; 8];
     let mut ins = [false; 8];
@@ -932,7 +953,10 @@ fn sample_corners(scene: &Scene, min: [f64; 3], size: f64) -> ([f64; 8], [bool; 
             min[1] + dy as f64 * size,
             min[2] + dz as f64 * size,
         ];
-        c[i] = scene.primary(p);
+        let f = scene.primary(p);
+        // Snap a degenerate graze (contact through the corner) to a fixed side so the
+        // sign is build-independent. See `CONTACT_GRAZE_EPS`.
+        c[i] = if f.abs() < CONTACT_GRAZE_EPS { CONTACT_GRAZE_EPS } else { f };
         ins[i] = scene.contributors_inside(p);
     }
     (c, ins)
@@ -2528,6 +2552,72 @@ mod tests {
             .filter(|((a, b), _)| !(on_box(p(*a)) && on_box(p(*b))))
             .count();
         assert_eq!(torn, 0, "open sheet has a torn (non-flush) perimeter: {torn}");
+    }
+
+    /// REGRESSION (the flipped-erosion "QEF ceiling spike"): a single dipping erosion plane
+    /// with a NEGATED orientation pole (the authoring "Flip orientation" bit), meshed through
+    /// the exact web3 path (`Stack::mesh_one_block`, `cap=false`, depth 6), must place every
+    /// referenced contact vertex ON the contact — none flung to the domain ceiling — and leave
+    /// no interior hole.
+    ///
+    /// The artifact: the dipping plane runs EXACTLY along the grid plane `z=750` at `x=750`,
+    /// so `field − iso` at that corner is at the round-off floor (~1e-17). Its discrete sign
+    /// (`<= 0`) is build-dependent — native and wasm32 land on opposite ULPs — flipping the
+    /// corner below/above the contact and, on wasm only, keeping a contact face stretched up
+    /// to a ceiling cap vertex. The `CONTACT_GRAZE_EPS` snap in `sample_corners` makes that
+    /// sign deterministic across builds. This native assertion was ALREADY green pre-fix (the
+    /// spike daylights only on wasm — see `web3/e2e/qef-spike.spec.ts`, the behaviour gate of
+    /// record); it is kept so the documented repro travels with the engine and the off-contact
+    /// invariant is pinned natively for the flipped case.
+    #[test]
+    fn flipped_erosion_contact_vertices_lie_on_the_contact() {
+        use crate::stack::{Relation, Stack, StackedSeries};
+        // The repro fixture (web3/e2e/fixtures/qef-spike-repro.geoproj.json): 16 contact points
+        // rising in x (z=470/590/710/830 at x=50/350/650/950) and one orientation at
+        // (500,500,650) with a FLIPPED pole (dip 21.8°, dipDir 270° → (sin d, 0, −cos d)).
+        let mut sps = Vec::new();
+        let zs = [470.0, 590.0, 710.0, 830.0];
+        let xs = [50.0, 350.0, 650.0, 950.0];
+        let ys = [50.0, 350.0, 650.0, 950.0];
+        for (xi, &x) in xs.iter().enumerate() {
+            for &y in &ys {
+                sps.push(SurfacePoint::new([x, y, zs[xi]], 0));
+            }
+        }
+        let d = 21.801409486351833_f64.to_radians();
+        let oris = vec![Orientation::new([500.0, 500.0, 650.0], [d.sin(), 0.0, -d.cos()])];
+        let model = Model::fit(&Series::new(sps, oris), KernelOptions::default());
+        // One bounded erode series — exactly what `toSeriesJson` emits for the repro.
+        let stack = Stack::new(vec![StackedSeries::new(model, Relation::Erode).into()]);
+        let model = stack.series[0].model();
+        let iso = model.lithology().interfaces[0].isovalue;
+        let cfg = OctreeConfig { max_depth: 6, min_depth: 2, qef_threshold: 1e-6, cap: false };
+        // web3 worker: min=[0,0,0], size=max extent dim=1000, ext_max=[1000;3].
+        let mesh = stack
+            .mesh_one_block(0, 0, 0, [0.0, 0.0, 0.0], 1000.0, [1000.0, 1000.0, 1000.0], cfg)
+            .expect("mesh_one_block returned None");
+        assert!(mesh.triangle_count() > 0, "empty mesh");
+
+        let p = |i: u32| {
+            let b = (i as usize) * 3;
+            [mesh.positions[b] as f64, mesh.positions[b + 1] as f64, mesh.positions[b + 2] as f64]
+        };
+        // Every REFERENCED vertex sits near the contact (distance = |field-iso|/|grad|), a
+        // fraction of a cell, and none is flung to the ceiling. A spike fails both.
+        let referenced: std::collections::HashSet<u32> = mesh.indices.iter().copied().collect();
+        let mut off_max = 0.0_f64;
+        let mut z_max = 0.0_f64;
+        for &i in &referenced {
+            let pv = p(i);
+            z_max = z_max.max(pv[2]);
+            let f = model.scalar_field(pv) - iso;
+            let g = model.scalar_field_gradient(pv);
+            let gm = (g[0] * g[0] + g[1] * g[1] + g[2] * g[2]).sqrt().max(1e-9);
+            off_max = off_max.max((f / gm).abs());
+        }
+        // depth-6 cell ≈ 15.6; the contact tops at z≈830 (the dipping rise stays under 900).
+        assert!(off_max < 8.0, "flipped-erosion sheet vertices stray off the contact: {off_max:.1}");
+        assert!(z_max < 900.0, "flipped-erosion vertex flung toward the ceiling: z_max={z_max:.1}");
     }
 
     /// Contact vertices are projected onto the contact (`field == iso`) — interior
