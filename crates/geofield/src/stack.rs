@@ -1560,11 +1560,22 @@ mod tests {
                     min_x = min_x.min(x);
                 }
             }
+            // No OVERSHOOT: the sheet must not extend left of the crease (into the eroded
+            // region) by more than ~a cell.
             assert!(
                 min_x >= crease_x - 1.5 * cell,
-                "depth {depth}: middle bed open sheet overshoots the field crease — survives from \
+                "depth {depth}: middle bed open sheet OVERSHOOTS the field crease — survives from \
                  x={min_x:.0}, crease at x≈{crease_x:.0} (allowed ≥ {:.0})",
                 crease_x - 1.5 * cell
+            );
+            // No UNDERSHOOT: the sheet must REACH the crease, not stop short of it (the gap).
+            // Pre-fix-2 the `&&` corner test stopped a cell short here. The bed must daylight
+            // up to the unconformity, so its surviving edge reaches ~the crease.
+            assert!(
+                min_x <= crease_x + 1.5 * cell,
+                "depth {depth}: middle bed open sheet UNDERSHOOTS the field crease (visible gap) — \
+                 stops at x={min_x:.0}, crease at x≈{crease_x:.0} (allowed ≤ {:.0})",
+                crease_x + 1.5 * cell
             );
             min_x_at_depth.push(min_x);
         }

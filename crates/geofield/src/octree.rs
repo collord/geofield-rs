@@ -688,9 +688,6 @@ struct Leaf {
     corners: [f64; 8],
     /// Boundary membership at the 8 cell corners: `true` = inside (`b < 0`).
     inside: [bool; 8],
-    /// Inside every TRUNCATING contributor (all but the domain box) at the 8 corners.
-    /// Used only to classify open-sheet faces (terminate on the contact∩truncator crease).
-    inside_trunc: [bool; 8],
     /// Output mesh vertex index per surface COMPONENT (one sheet → one entry; a
     /// two-sheet cell → two). Filled in `assign_vertices` (which knows `cap`).
     /// Empty until then / for non-surface leaves.
@@ -923,15 +920,11 @@ fn orient_closed_outward(mesh: &mut Mesh) {
 
 /// Sample the scene at a node's 8 corners: `corners[c]` = primary contact field −
 /// isovalue (negative below the contact); `inside[c]` = inside EVERY contributor
-/// (the domain ∩ all truncating surfaces); `inside_trunc[c]` = inside every
-/// TRUNCATING contributor only (contributors `[1..]`, excluding the domain box).
-/// The combined solid sign at a corner is `corners[c] <= 0 && inside[c]` (see
-/// `corner_sign`); `inside_trunc` is used ONLY to classify open-sheet faces so the
-/// sheet terminates on the contact∩truncator crease while staying box-flush.
-fn sample_corners(scene: &Scene, min: [f64; 3], size: f64) -> ([f64; 8], [bool; 8], [bool; 8]) {
+/// (the domain ∩ all truncating surfaces). The combined solid sign at a corner is
+/// `corners[c] <= 0 && inside[c]` (see `corner_sign`).
+fn sample_corners(scene: &Scene, min: [f64; 3], size: f64) -> ([f64; 8], [bool; 8]) {
     let mut c = [0.0; 8];
     let mut ins = [false; 8];
-    let mut ins_trunc = [false; 8];
     for i in 0..8 {
         let (dx, dy, dz) = corner_offset(i);
         let p = [
@@ -941,9 +934,8 @@ fn sample_corners(scene: &Scene, min: [f64; 3], size: f64) -> ([f64; 8], [bool; 
         ];
         c[i] = scene.primary(p);
         ins[i] = scene.contributors_inside(p);
-        ins_trunc[i] = scene.contributors_inside_truncators(p);
     }
-    (c, ins, ins_trunc)
+    (c, ins)
 }
 
 /// Does any of the 12 cell edges change FIELD sign?
@@ -1277,7 +1269,7 @@ fn build(
     depth: u32,
     cfg: &OctreeConfig,
 ) -> NodeId {
-    let (corners, inside, inside_trunc) = sample_corners(scene, min, size);
+    let (corners, inside) = sample_corners(scene, min, size);
     let crossing = is_surface(&corners, &inside);
 
     let make_leaf = |tree: &mut Octree| -> NodeId {
@@ -1287,7 +1279,6 @@ fn build(
         tree.nodes.push(Node::Leaf(Leaf {
             corners,
             inside,
-            inside_trunc,
             out: Vec::new(),
             edge_owner: [u8::MAX; 12],
         }));
@@ -1635,7 +1626,6 @@ fn edge_axis(ca: usize, cb: usize) -> Option<usize> {
 /// minimal edge (a contact-surface face), `false` if only a contributor surface
 /// crosses it (a domain-cap face). Winding is provisional — orientation fixes it.
 fn contour_edges(tree: &Octree, scene: &Scene, mesh: &mut Mesh, contact_face: &mut Vec<bool>) {
-    let _ = scene;
     let Some(finest) = finest_leaf_size(tree) else {
         return;
     };
@@ -1644,9 +1634,9 @@ fn contour_edges(tree: &Octree, scene: &Scene, mesh: &mut Mesh, contact_face: &m
 
     for id in 0..tree.nodes.len() {
         let (lmin, lsize) = tree.bounds[id];
-        let (corners, inside, inside_trunc) = match &tree.nodes[id] {
+        let (corners, inside) = match &tree.nodes[id] {
             Node::Leaf(l) if has_contour_crossing(&l.corners, &l.inside, true) => {
-                (l.corners, l.inside, l.inside_trunc)
+                (l.corners, l.inside)
             }
             _ => continue,
         };
@@ -1674,16 +1664,27 @@ fn contour_edges(tree: &Octree, scene: &Scene, mesh: &mut Mesh, contact_face: &m
             }
 
             // A contact face: the primary contact field crosses this minimal edge AND the
-            // crossing is on the un-eroded side of the TRUNCATING contributors (both
-            // endpoints inside them). On an erosion-driven crease edge one endpoint is
-            // eroded (`inside_trunc == false`), so the face is reclassified as a cap face
-            // and dropped by `keep_contact_faces` — terminating the open sheet exactly on
-            // the contact∩truncator crease. The domain box is excluded from `inside_trunc`,
-            // so box-daylight contact faces stay flush. (Otherwise the combined sign flipped
-            // only because a contributor surface crossed — a cap face.)
-            let is_contact = ((corners[ca] <= 0.0) != (corners[cb] <= 0.0))
-                && inside_trunc[ca]
-                && inside_trunc[cb];
+            // PRIMARY CROSSING POINT is on the un-eroded side of the TRUNCATING contributors.
+            // Deciding at the crossing point (not the two corners) makes the open sheet
+            // terminate EXACTLY on the contact∩truncator crease: the crossing-point's
+            // truncator membership flips precisely at the crease, so the last kept face is
+            // the one whose primary crossing sits on the crease — neither undershooting (a
+            // corner-flag `&&` stops a cell short) nor overshooting (`||` keeps a cell too
+            // many). The domain box is excluded from the truncator test, so box-daylight
+            // faces stay flush. A combined-sign flip with NO primary crossing is a cap face.
+            let primary_crosses = (corners[ca] <= 0.0) != (corners[cb] <= 0.0);
+            let is_contact = primary_crosses && {
+                let pa = corner_pos(lmin, lsize, ca);
+                let pb = corner_pos(lmin, lsize, cb);
+                let (va, vb) = (corners[ca], corners[cb]);
+                let t = va / (va - vb); // primary crossing parameter (va != vb when crossing)
+                let cross = [
+                    pa[0] + (pb[0] - pa[0]) * t,
+                    pa[1] + (pb[1] - pa[1]) * t,
+                    pa[2] + (pb[2] - pa[2]) * t,
+                ];
+                scene.contributors_inside_truncators(cross)
+            };
             emit_quad(tree, &leaves, axis, mid, mesh, is_contact, contact_face);
         }
     }
