@@ -1,14 +1,9 @@
 import { useEffect, useRef } from "react";
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
-import { MeshData, surfaceKey, pickColor } from "./model";
-import {
-  SurfacePointRow,
-  OrientationRow,
-  EXTENT,
-  SERIES_ORDER,
-} from "./data";
-import { azimuthDipToPole } from "./model";
+import { MeshData, surfaceKey, pickColor, azimuthDipToPole } from "./model";
+import { SurfacePointRow, OrientationRow, SeriesDef, EXTENT } from "./data";
+import { relationInfo } from "./relations";
 
 interface Props {
   mesh: MeshData;
@@ -16,14 +11,10 @@ interface Props {
   hidden: Set<string>;
   surfacePoints: SurfacePointRow[];
   orientations: OrientationRow[];
+  series: SeriesDef[];
 }
 
-const FORMATION_COLORS: Record<string, number> = {
-  rock1: 0xe07b39,
-  rock2: 0x3d9be9,
-};
-
-export function Viewer({ mesh, hidden, surfacePoints, orientations }: Props) {
+export function Viewer({ mesh, hidden, surfacePoints, orientations, series }: Props) {
   const mountRef = useRef<HTMLDivElement>(null);
   const sceneRef = useRef<THREE.Scene>();
   const rendererRef = useRef<THREE.WebGLRenderer>();
@@ -33,6 +24,13 @@ export function Viewer({ mesh, hidden, surfacePoints, orientations }: Props) {
   // Latest hidden set, read by the geometry-build effect (which keys off `mesh` only)
   // so a re-solve re-applies the current visibility without depending on `hidden`.
   const hiddenRef = useRef(hidden);
+  // Latest series list, read by the data-marker effect for per-series coloring.
+  const seriesRef = useRef(series);
+  seriesRef.current = series;
+
+  // Color a data marker by the relation family of its series.
+  const colorForRow = (row: { series: number }): number =>
+    relationInfo(seriesRef.current[row.series]?.relation ?? 0).color;
 
   // One-time scene setup.
   useEffect(() => {
@@ -110,8 +108,8 @@ export function Viewer({ mesh, hidden, surfacePoints, orientations }: Props) {
     };
   }, []);
 
-  // Rebuild the contact surfaces whenever the mesh changes. One mesh per
-  // interface, colored by formation, at its recovered isovalue.
+  // Rebuild the surfaces whenever the mesh changes. One mesh per (series, block,
+  // interface/unit), colored by its series relation family.
   useEffect(() => {
     const group = surfaceGroupRef.current;
     if (!group) return;
@@ -126,8 +124,8 @@ export function Viewer({ mesh, hidden, surfacePoints, orientations }: Props) {
       );
       geom.setIndex(new THREE.BufferAttribute(surf.indices, 1));
       // Exact per-vertex normals from the analytic field gradient (smooth shading
-      // without the faceting of face-averaged normals). Fall back to computed
-      // normals only if the contourer didn't supply them.
+      // without the faceting of face-averaged normals). Fall back to computed normals
+      // only if the contourer didn't supply them.
       if (surf.normals && surf.normals.length === surf.positions.length) {
         geom.setAttribute("normal", new THREE.BufferAttribute(surf.normals, 3));
       } else {
@@ -135,12 +133,10 @@ export function Viewer({ mesh, hidden, surfacePoints, orientations }: Props) {
       }
 
       const color = pickColor(surf);
-      // Closed-volume unit solids render OPAQUE and front-face-only: they are
-      // watertight, so you should not see through one solid into the layers behind it
-      // (transparent solids made the stacked slabs unreadable — far walls bled through
-      // near ones). Open contact sheets stay translucent + double-sided so overlapping
-      // sheets remain visible.
-      const isSolid = surf.unit !== undefined;
+      // Closed-volume unit solids (unit >= 0) render OPAQUE and front-face-only: they are
+      // watertight, so you should not see through one solid into the layers behind it. Open
+      // contact sheets stay translucent + double-sided so overlapping sheets remain visible.
+      const isSolid = surf.unit >= 0;
       const mat = new THREE.MeshStandardMaterial({
         color,
         metalness: 0.1,
@@ -156,15 +152,14 @@ export function Viewer({ mesh, hidden, surfacePoints, orientations }: Props) {
         polygonOffsetUnits: 1,
       });
       const fill = new THREE.Mesh(geom, mat);
-      // Tag with the surface key so the visibility effect can toggle it, and apply
-      // the current hidden state immediately (so a re-solve keeps hidden objects hidden).
+      // Tag with the surface key so the visibility effect can toggle it, and apply the
+      // current hidden state immediately (so a re-solve keeps hidden objects hidden).
       const key = surfaceKey(surf);
       fill.userData.surfaceKey = key;
       fill.visible = !hiddenRef.current.has(key);
 
-      // Edge overlay: show every mesh edge (threshold 0 keeps coplanar quad
-      // edges too, so the dual-contour cell structure is visible). Darken the
-      // formation color for the lines.
+      // Edge overlay: show every mesh edge (threshold 0 keeps coplanar quad edges too, so
+      // the dual-contour cell structure is visible). Darken the surface color for the lines.
       const edges = new THREE.EdgesGeometry(geom, 0);
       const lineColor = new THREE.Color(color).multiplyScalar(0.45);
       const lines = new THREE.LineSegments(
@@ -188,7 +183,8 @@ export function Viewer({ mesh, hidden, surfacePoints, orientations }: Props) {
     }
   }, [hidden]);
 
-  // Rebuild data markers (surface points as spheres, orientations as arrows).
+  // Rebuild data markers (surface points as spheres, orientations as arrows), colored by
+  // each row's series relation family.
   useEffect(() => {
     const group = dataGroupRef.current;
     if (!group) return;
@@ -198,11 +194,9 @@ export function Viewer({ mesh, hidden, surfacePoints, orientations }: Props) {
     const r = span * 0.012;
 
     for (const sp of surfacePoints) {
-      const color =
-        FORMATION_COLORS[sp.formation] ?? colorFor(sp.formation);
       const s = new THREE.Mesh(
         new THREE.SphereGeometry(r, 16, 12),
-        new THREE.MeshStandardMaterial({ color }),
+        new THREE.MeshStandardMaterial({ color: colorForRow(sp) }),
       );
       s.position.set(sp.x, sp.y, sp.z);
       group.add(s);
@@ -212,19 +206,19 @@ export function Viewer({ mesh, hidden, surfacePoints, orientations }: Props) {
     for (const o of orientations) {
       const [gx, gy, gz] = azimuthDipToPole(o.azimuth, o.dip, o.polarity);
       const dir = new THREE.Vector3(gx, gy, gz).normalize();
-      const color =
-        FORMATION_COLORS[o.formation] ?? colorFor(o.formation);
       const arrow = new THREE.ArrowHelper(
         dir,
         new THREE.Vector3(o.x, o.y, o.z),
         arrowLen,
-        color,
+        colorForRow(o),
         arrowLen * 0.35,
         arrowLen * 0.22,
       );
       group.add(arrow);
     }
-  }, [surfacePoints, orientations]);
+    // `series` is read via seriesRef inside colorForRow; depend on it so markers recolor
+    // when a series' relation changes.
+  }, [surfacePoints, orientations, series]);
 
   return <div ref={mountRef} style={{ width: "100%", height: "100%" }} />;
 }
@@ -243,13 +237,3 @@ function clearGroup(group: THREE.Group) {
     });
   }
 }
-
-// Stable fallback color for any formation not in FORMATION_COLORS.
-function colorFor(name: string): number {
-  let h = 0;
-  for (let i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) >>> 0;
-  return h & 0xffffff;
-}
-
-// Keep SERIES_ORDER referenced so unused-import lint stays quiet if needed later.
-void SERIES_ORDER;

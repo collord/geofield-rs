@@ -258,3 +258,143 @@ button.del:hover {
   font-size: 10px;
   color: var(--muted);
 }
+
+.tree-rel {
+  color: var(--muted);
+  font-weight: 400;
+  font-size: 10px;
+}
+
+/* A faulted series' per-block sub-header, between the series head and its leaves. */
+.tree-blockhead {
+  padding-left: 16px;
+  font-size: 11px;
+  color: var(--text);
+}
+
+.tree-blockhead + div,
+.tree-blockhead ~ .tree-leaf {
+  padding-left: 28px;
+}
+
+/* Header render-mode toggle button. */
+.mode-toggle {
+  white-space: nowrap;
+}
+
+/* The editable stack panel: a column of series cards in the tables row. */
+.series-panel {
+  flex: 0 0 220px;
+  min-width: 220px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  overflow-y: auto;
+  padding-right: 4px;
+  border-right: 1px solid var(--line);
+}
+
+.series-panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.series-card {
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: #181c22;
+  padding: 7px 8px;
+  cursor: pointer;
+}
+
+.series-card.active {
+  border-color: var(--accent);
+  background: #1b2230;
+}
+
+.series-card-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 5px;
+}
+
+.series-name {
+  flex: 1;
+  min-width: 0;
+  border: none;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-weight: 600;
+  padding: 2px 4px;
+}
+
+.series-name:focus {
+  outline: 1px solid var(--accent);
+  background: #12151a;
+  border-radius: 3px;
+}
+
+.series-rel,
+.series-fault {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+  margin-bottom: 4px;
+}
+
+.series-rel select {
+  flex: 1;
+  background: #2a3038;
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 2px 4px;
+  font: inherit;
+}
+
+.series-gloss {
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.3;
+  margin-bottom: 5px;
+}
+
+.series-fault-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding-left: 4px;
+}
+
+.series-fault-controls .res {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--text);
+}
+
+.series-reading {
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.4;
+  padding: 4px 2px;
+}
+
+/* The series `<select>` column in the row tables. */
+td select {
+  width: 100%;
+  border: none;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  padding: 3px 4px;
+}
+
+td select:focus {
+  outline: 1px solid var(--accent);
+}

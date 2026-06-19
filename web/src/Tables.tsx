@@ -1,4 +1,4 @@
-import { SurfacePointRow, OrientationRow } from "./data";
+import { SurfacePointRow, OrientationRow, SeriesDef } from "./data";
 
 const NUM_COLS_SP: (keyof SurfacePointRow)[] = ["x", "y", "z"];
 const NUM_COLS_ORI: (keyof OrientationRow)[] = [
@@ -10,12 +10,35 @@ const NUM_COLS_ORI: (keyof OrientationRow)[] = [
   "polarity",
 ];
 
+/** The series `<select>` shared by both tables: pick which series a row belongs to. */
+function SeriesSelect({
+  series,
+  value,
+  onChange,
+}: {
+  series: SeriesDef[];
+  value: number;
+  onChange: (v: number) => void;
+}) {
+  return (
+    <select value={value} onChange={(e) => onChange(Number(e.target.value))}>
+      {series.map((s, i) => (
+        <option value={i} key={i}>
+          {s.name}
+        </option>
+      ))}
+    </select>
+  );
+}
+
 interface SPProps {
   rows: SurfacePointRow[];
+  series: SeriesDef[];
+  activeSeries: number;
   onChange: (rows: SurfacePointRow[]) => void;
 }
 
-export function SurfacePointTable({ rows, onChange }: SPProps) {
+export function SurfacePointTable({ rows, series, activeSeries, onChange }: SPProps) {
   const setCell = (i: number, key: keyof SurfacePointRow, raw: string) => {
     const next = rows.slice();
     if (key === "formation") next[i] = { ...next[i], formation: raw };
@@ -23,7 +46,10 @@ export function SurfacePointTable({ rows, onChange }: SPProps) {
     onChange(next);
   };
   const addRow = () =>
-    onChange([...rows, { x: 0, y: 0, z: 0, formation: "rock1" }]);
+    onChange([
+      ...rows,
+      { x: 0, y: 0, z: 0, formation: "rock1", series: activeSeries },
+    ]);
   const delRow = (i: number) => onChange(rows.filter((_, j) => j !== i));
 
   return (
@@ -39,6 +65,7 @@ export function SurfacePointTable({ rows, onChange }: SPProps) {
             <th>Y</th>
             <th>Z</th>
             <th>formation</th>
+            <th>series</th>
             <th></th>
           </tr>
         </thead>
@@ -61,6 +88,13 @@ export function SurfacePointTable({ rows, onChange }: SPProps) {
                 />
               </td>
               <td>
+                <SeriesSelect
+                  series={series}
+                  value={r.series}
+                  onChange={(v) => setCell(i, "series", String(v))}
+                />
+              </td>
+              <td>
                 <button className="del" onClick={() => delRow(i)}>
                   ×
                 </button>
@@ -75,10 +109,12 @@ export function SurfacePointTable({ rows, onChange }: SPProps) {
 
 interface OriProps {
   rows: OrientationRow[];
+  series: SeriesDef[];
+  activeSeries: number;
   onChange: (rows: OrientationRow[]) => void;
 }
 
-export function OrientationTable({ rows, onChange }: OriProps) {
+export function OrientationTable({ rows, series, activeSeries, onChange }: OriProps) {
   const setCell = (i: number, key: keyof OrientationRow, raw: string) => {
     const next = rows.slice();
     if (key === "formation") next[i] = { ...next[i], formation: raw };
@@ -88,7 +124,16 @@ export function OrientationTable({ rows, onChange }: OriProps) {
   const addRow = () =>
     onChange([
       ...rows,
-      { x: 0, y: 0, z: 0, azimuth: 90, dip: 0, polarity: 1, formation: "rock1" },
+      {
+        x: 0,
+        y: 0,
+        z: 0,
+        azimuth: 90,
+        dip: 0,
+        polarity: 1,
+        formation: "rock1",
+        series: activeSeries,
+      },
     ]);
   const delRow = (i: number) => onChange(rows.filter((_, j) => j !== i));
 
@@ -108,6 +153,7 @@ export function OrientationTable({ rows, onChange }: OriProps) {
             <th>dip</th>
             <th>polarity</th>
             <th>formation</th>
+            <th>series</th>
             <th></th>
           </tr>
         </thead>
@@ -127,6 +173,13 @@ export function OrientationTable({ rows, onChange }: OriProps) {
                 <input
                   value={r.formation}
                   onChange={(e) => setCell(i, "formation", e.target.value)}
+                />
+              </td>
+              <td>
+                <SeriesSelect
+                  series={series}
+                  value={r.series}
+                  onChange={(v) => setCell(i, "series", String(v))}
                 />
               </td>
               <td>

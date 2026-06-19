@@ -1,33 +1,20 @@
-// WASM glue: turn editable rows into a fitted WasmModel and a dual-contoured
-// isosurface mesh. Mirrors the conversions in src/bin/geofield_cli.rs.
+// The worker CLIENT: turn the editable series + rows into a `run` command, drive the solver
+// worker (which owns both wasm modules), collect the streamed surfaces, and resolve a
+// MeshData the Viewer / ObjectTree consume. The heavy fit+mesh runs in worker.ts off the UI
+// thread; this module is the thin async bridge + the surface-shaping conversions that mirror
+// src/bin/geofield_cli.rs.
 
-import init, { WasmModel } from "./wasm/geofield.js";
-import { initKernel, setEngineMemory } from "./kernel-bridge";
-import kernelWasmUrl from "./wasm-kernel/geofield_kernel.wasm?url";
 import {
   SurfacePointRow,
   OrientationRow,
-  SERIES_ORDER,
-  EXTENT,
+  SeriesDef,
+  FaultConfig,
+  seriesFormations,
 } from "./data";
+import type { Command, RenderMode, SeriesJson, WorkerEvent } from "./protocol";
+import { relationInfo, interfaceColor, cssHex } from "./relations";
 
-let ready: Promise<void> | null = null;
-
-/** Initialize BOTH WASM modules exactly once, in order:
- *   1. the EUPL kernel (geofield_kernel.wasm) — it imports nothing;
- *   2. the BSD engine (geofield.wasm) — its `"kernel"` imports resolve to the kernel
- *      bridge, so they must be live before the engine runs any model op.
- *  Then register the engine's memory so the bridge can copy bytes into it. */
-export function initWasm(): Promise<void> {
-  if (!ready) {
-    ready = (async () => {
-      await initKernel(kernelWasmUrl);
-      const wasm = await init();
-      setEngineMemory(wasm.memory as WebAssembly.Memory);
-    })();
-  }
-  return ready;
-}
+export type { RenderMode } from "./protocol";
 
 /** gempy azimuth/dip/polarity → pole (gradient) vector, in degrees.
  *  gx = sin(dip)·sin(az)·pol, gy = sin(dip)·cos(az)·pol, gz = cos(dip)·pol.
@@ -46,17 +33,23 @@ export function azimuthDipToPole(
   ];
 }
 
-/** One dual-contoured contact surface, at a recovered interface isovalue. */
+/** One dual-contoured contact surface (or closed unit slab), as the Viewer consumes it. */
 export interface SurfaceMesh {
-  interfaceId: number;
-  formation: string; // formation name for this interface id (best-effort)
-  isovalue: number;
-  /** Fault block this surface belongs to (undefined when not faulted). Each block's
-   *  copy of a contact is a SEPARATE, unconnected surface (Leapfrog-style). */
-  block?: number;
-  /** Lithology unit index, for the faulted CLOSED-domain view (a watertight slab per
-   *  block per unit). Undefined for contact-surface meshes. */
-  unit?: number;
+  /** Series this surface belongs to (0 = youngest). */
+  series: number;
+  /** The owning series' relation (0=Erode 1=Onlap 2=Conformable 3=Basement). */
+  relation: number;
+  /** Interface index within the series (contact) or the unit's lower-contact index (solid);
+   *  -1 for a unit with no lower contact (the bottom slab). */
+  interfaceIndex: number;
+  /** Human label for this surface (the formation name within its series). */
+  formation: string;
+  /** Fault block this surface belongs to. Each block's copy of a contact is a SEPARATE,
+   *  unconnected surface (cut flush at the fault). */
+  block: number;
+  /** Lithology unit index, for the closed-solid view (a watertight slab). -1 for a contact
+   *  sheet. */
+  unit: number;
   positions: Float32Array; // 3 * V
   normals: Float32Array; // 3 * V — exact per-vertex normals (field gradient)
   indices: Uint32Array; // 3 * T
@@ -64,69 +57,38 @@ export interface SurfaceMesh {
 }
 
 export interface MeshData {
-  /** One mesh per interface, at that interface's recovered isovalue. */
+  /** Every meshed surface across the stack (per series, block, and interface/unit). */
   surfaces: SurfaceMesh[];
   triangleCount: number; // total across surfaces
-  residual: number;
-  isovalueSpread: number;
-  /** Number of fault-bounded blocks the field was solved over (1 if not faulted). */
+  /** Fault blocks summed across series (a coarse "how faulted is this" readout). */
   blockCount: number;
 }
 
-/** A stable id for one surface object, used to toggle its visibility from the object
- *  tree. Encodes block + (unit | interface) so it survives re-solves. */
+/** A stable id for one surface object, used to toggle its visibility from the object tree.
+ *  Encodes series + block + (unit | interface) so it survives re-solves and never collides
+ *  across series. */
 export function surfaceKey(s: SurfaceMesh): string {
-  const blk = s.block === undefined ? "_" : `b${s.block}`;
-  const part = s.unit !== undefined ? `u${s.unit}` : `i${s.interfaceId}`;
-  return `${blk}:${part}`;
+  const part = s.unit >= 0 ? `u${s.unit}` : `i${s.interfaceIndex}`;
+  return `s${s.series}:b${s.block}:${part}`;
 }
 
 /** Human label for a surface in the object tree. */
 export function surfaceLabel(s: SurfaceMesh): string {
-  if (s.unit !== undefined) return `unit ${s.unit}`;
-  return s.formation; // a contact: the formation name
+  if (s.unit >= 0) return `${s.formation} (unit ${s.unit})`;
+  return s.formation;
 }
 
-const FORMATION_COLORS: Record<string, number> = {
-  rock1: 0xe07b39,
-  rock2: 0x3d9be9,
-};
-
-/** Render color for one surface, shared by the 3-D view and the object-tree swatch.
- *  Contacts use the formation palette (rock1/rock2). Closed lithology-unit solids use
- *  an evenly-spaced HSL hue per unit (so adjacent layers are maximally distinct, unlike
- *  a string hash where "unit 1"/"unit 2" collide), shifted in lightness per fault block
- *  so block A's and block B's layers also differ. */
+/** Render color for one surface: the series' relation family, separated per interface so
+ *  contacts within a series stay individually legible. Closed-unit solids reuse their lower
+ *  contact's color. */
 export function pickColor(surf: SurfaceMesh): number {
-  if (surf.unit === undefined) {
-    return FORMATION_COLORS[surf.formation] ?? colorFor(surf.formation);
-  }
-  const hue = (surf.unit * 0.61803398875) % 1; // golden-angle hue spacing
-  const block = surf.block ?? 0;
-  const light = 0.45 + 0.12 * (block % 3); // per-block lightness shift
-  return hslToHex(hue, 0.6, light);
+  const idx = surf.interfaceIndex >= 0 ? surf.interfaceIndex : 0;
+  return interfaceColor(surf.relation, idx);
 }
 
 /** "#rrggbb" CSS string for a surface color (object-tree swatch). */
 export function pickColorCss(surf: SurfaceMesh): string {
-  return "#" + pickColor(surf).toString(16).padStart(6, "0");
-}
-
-function hslToHex(h: number, s: number, l: number): number {
-  const f = (n: number) => {
-    const k = (n + h * 12) % 12;
-    const a = s * Math.min(l, 1 - l);
-    const c = l - a * Math.max(-1, Math.min(k - 3, 9 - k, 1));
-    return Math.round(c * 255);
-  };
-  return (f(0) << 16) | (f(8) << 8) | f(4);
-}
-
-/** Stable fallback color for any formation not in the palette. */
-function colorFor(name: string): number {
-  let h = 0;
-  for (let i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) >>> 0;
-  return h & 0xffffff;
+  return cssHex(pickColor(surf));
 }
 
 export interface SolveResult {
@@ -135,245 +97,191 @@ export interface SolveResult {
   error: string | null;
   /** A non-fatal note (e.g. a fault stranded a block) — a mesh may still exist. */
   warning: string | null;
+  /** Fit time reported by the worker (ms). */
+  fitMs: number;
 }
 
-/** A single planar fault: a point on the plane + an outward normal. When
- *  `enabled`, the field solves independently on each side so contacts are offset
- *  laterally across the plane (a finite fault). */
-export interface FaultConfig {
-  enabled: boolean;
-  point: [number, number, number];
-  normal: [number, number, number];
-}
+// ---------------------------------------------------------------------------
+// Building the worker `run` command from the editable state.
+// ---------------------------------------------------------------------------
 
-/** Fit the model from the current rows and adaptively (octree) dual-contour ONE
- *  surface per interface, each at its recovered isovalue (so the meshes pass
- *  through the input surface points, as gempy renders contacts — not an arbitrary
- *  level set). `maxDepth` caps octree refinement (finest cell = extent / 2^depth);
- *  coarse where the surface is flat, fine where it curves. Returns meshes or an
- *  error string without throwing. */
-export function solveAndMesh(
+/** Turn the flat editable rows + series list into the per-series JSON the worker fits.
+ *  Interface ids are assigned per series, in ascending first-seen order of formation
+ *  (`seriesFormations`), so each series' contacts are 0,1,2,… in deposition order. */
+export function buildSeriesJson(
+  series: SeriesDef[],
   surfacePoints: SurfacePointRow[],
   orientations: OrientationRow[],
+): SeriesJson[] {
+  return series.map((def, si) => {
+    const formations = seriesFormations(surfacePoints, si);
+    const idOf = (formation: string) => Math.max(0, formations.indexOf(formation));
+
+    const sp = surfacePoints.filter((r) => r.series === si);
+    const sp_xyz: number[] = [];
+    const sp_if: number[] = [];
+    for (const r of sp) {
+      sp_xyz.push(r.x, r.y, r.z);
+      sp_if.push(idOf(r.formation));
+    }
+
+    const ori = orientations.filter((r) => r.series === si);
+    const ori_xyz: number[] = [];
+    const ori_pole: number[] = [];
+    for (const r of ori) {
+      ori_xyz.push(r.x, r.y, r.z);
+      const [gx, gy, gz] = azimuthDipToPole(r.azimuth, r.dip, r.polarity);
+      ori_pole.push(gx, gy, gz);
+    }
+
+    const fault = def.fault;
+    return {
+      name: def.name,
+      relation: def.relation,
+      sp_xyz,
+      sp_if,
+      ori_xyz,
+      ori_pole,
+      fault_point: fault ? [...fault.point] : [0, 0, 0],
+      fault_normal: fault ? [...fault.normal] : [0, 0, 0],
+    };
+  });
+}
+
+// ---------------------------------------------------------------------------
+// The solver-worker driver. One persistent worker; a new solve hard-cancels the prior run
+// by terminating + respawning (also the "supersede an in-flight edit" mechanism), matching
+// web2's cancellation model. Editor fits are tiny (ms) so the ~1s cold re-init is rare and
+// only happens after an actual cancel.
+// ---------------------------------------------------------------------------
+
+let worker: Worker | null = null;
+/** Generation counter: a stale run's events (after a respawn) are ignored. */
+let generation = 0;
+
+function spawnWorker(): Worker {
+  return new Worker(new URL("./worker.ts", import.meta.url), { type: "module" });
+}
+
+/** True once a stack has been fitted in the current worker (so a remesh is possible). */
+let haveFit = false;
+
+/** Fit + mesh the stack in the worker and resolve the assembled MeshData. Supersedes any
+ *  in-flight solve: terminates the previous worker (instant hard cancel) and starts fresh.
+ *  `onSurface` is called for each streamed surface (for progressive rendering); the resolved
+ *  result also contains the full list. */
+export function solveAndMesh(
+  series: SeriesDef[],
+  surfacePoints: SurfacePointRow[],
+  orientations: OrientationRow[],
+  extent: [number, number, number, number, number, number],
   maxDepth: number,
-  cap: boolean = false,
-  fault: FaultConfig | null = null,
-): SolveResult {
-  const idOf = (formation: string): number => {
-    const i = SERIES_ORDER.indexOf(formation);
-    return i < 0 ? 0 : i;
+  renderMode: RenderMode,
+  onSurface?: (s: SurfaceMesh) => void,
+): Promise<SolveResult> {
+  // Hard-cancel the previous run: terminate + respawn. This is the supersede mechanism.
+  worker?.terminate();
+  worker = spawnWorker();
+  haveFit = false;
+  const gen = ++generation;
+  const w = worker;
+
+  const cmd: Command = {
+    type: "run",
+    series: buildSeriesJson(series, surfacePoints, orientations),
+    extent,
+    maxDepth,
+    renderMode,
   };
+  return drive(w, gen, cmd, onSurface);
+}
 
-  const sp_xyz = new Float64Array(surfacePoints.length * 3);
-  const sp_if = new Float64Array(surfacePoints.length);
-  surfacePoints.forEach((r, i) => {
-    sp_xyz[3 * i] = r.x;
-    sp_xyz[3 * i + 1] = r.y;
-    sp_xyz[3 * i + 2] = r.z;
-    sp_if[i] = idOf(r.formation);
-  });
-
-  const ori_xyz = new Float64Array(orientations.length * 3);
-  const ori_pole = new Float64Array(orientations.length * 3);
-  orientations.forEach((r, i) => {
-    ori_xyz[3 * i] = r.x;
-    ori_xyz[3 * i + 1] = r.y;
-    ori_xyz[3 * i + 2] = r.z;
-    const [gx, gy, gz] = azimuthDipToPole(r.azimuth, r.dip, r.polarity);
-    ori_pole[3 * i] = gx;
-    ori_pole[3 * i + 1] = gy;
-    ori_pole[3 * i + 2] = gz;
-  });
-
-  const NAN = Number.NaN;
-  let model: WasmModel;
-  try {
-    // NaN options → crate defaults (range 1.7, c_o 10, i_res 4, gi_res 2,
-    // uni_degree 1, nugget 1e-5). uni_degree = 1.
-    if (fault && fault.enabled) {
-      // Faulted fit: the field solves independently on each side of the plane, so
-      // contacts are offset across it. A degenerate normal means "no fault".
-      model = WasmModel.new_faulted(
-        sp_xyz,
-        sp_if,
-        ori_xyz,
-        ori_pole,
-        NAN,
-        NAN,
-        NAN,
-        NAN,
-        1,
-        NAN,
-        NAN, // decimate_frac: off (this harness fits modest point counts)
-        new Float64Array(fault.point),
-        new Float64Array(fault.normal),
-      );
-    } else {
-      model = new WasmModel(
-        sp_xyz,
-        sp_if,
-        ori_xyz,
-        ori_pole,
-        NAN,
-        NAN,
-        NAN,
-        NAN,
-        1,
-        NAN,
-        NAN, // decimate_frac: off
-      );
-    }
-  } catch (e) {
-    return { mesh: emptyMesh(), error: String(e), warning: null };
+/** Re-mesh the already-fitted stack in a new render mode, WITHOUT refitting. Falls back to a
+ *  full solve if no fit is live yet. */
+export function remesh(
+  series: SeriesDef[],
+  surfacePoints: SurfacePointRow[],
+  orientations: OrientationRow[],
+  extent: [number, number, number, number, number, number],
+  maxDepth: number,
+  renderMode: RenderMode,
+  onSurface?: (s: SurfaceMesh) => void,
+): Promise<SolveResult> {
+  if (!worker || !haveFit) {
+    return solveAndMesh(series, surfacePoints, orientations, extent, maxDepth, renderMode, onSurface);
   }
+  const gen = ++generation;
+  const cmd: Command = { type: "remesh", renderMode, maxDepth };
+  return drive(worker, gen, cmd, onSurface);
+}
 
-  const [minX, maxX, minY, maxY, minZ, maxZ] = EXTENT;
-  // Octree needs a cube; use the largest extent span and anchor at the min corner.
-  const size = Math.max(maxX - minX, maxY - minY, maxZ - minZ);
+/** Wire up the worker's streamed events into a single resolved SolveResult. */
+function drive(
+  w: Worker,
+  gen: number,
+  cmd: Command,
+  onSurface?: (s: SurfaceMesh) => void,
+): Promise<SolveResult> {
+  return new Promise<SolveResult>((resolve) => {
+    const surfaces: SurfaceMesh[] = [];
+    let totalTris = 0;
 
-  const nameOf = (id: number): string => SERIES_ORDER[id] ?? `interface ${id}`;
-  const minDepth = Math.min(2, maxDepth);
-  const QEF_EPS = 1e-6;
-
-  const surfaces: SurfaceMesh[] = [];
-  let totalTris = 0;
-
-  // CLOSED (cap on): one watertight solid per (block, lithology UNIT) — the disjoint
-  //   slabs between consecutive contacts. This is the geological closed model and the
-  //   slabs do NOT overlap. (The old per-INTERFACE closed path built nested
-  //   "everything below contact X" solids, so the upper one fully enclosed/occluded the
-  //   lower — the bug this replaces.) Works for 1 block (block 0 = whole model) or N.
-  // OPEN (cap off): a FAULTED model renders one clean clipped contact per (block,
-  //   interface) to avoid the cross-fault discontinuity crumpling the contour;
-  //   a non-faulted model renders one contact surface per interface over the whole box.
-  const blockCount = model.block_count;
-  const closed = cap;
-  const faultedOpen = blockCount > 1 && !cap;
-
-  const pushSurface = (
-    wm: ReturnType<WasmModel["mesh_isosurface_octree"]>,
-    interfaceId: number,
-    isovalue: number,
-    block: number | undefined,
-    unit?: number,
-  ) => {
-    // Closed-solid units color by unit (a distinct stable color per lithology layer);
-    // contact surfaces color by their interface's formation.
-    const formation = unit !== undefined ? `unit ${unit}` : nameOf(interfaceId);
-    surfaces.push({
-      interfaceId,
-      formation,
-      isovalue,
-      block,
-      unit,
-      positions: wm.positions(),
-      normals: wm.normals(),
-      indices: wm.indices(),
-      triangleCount: wm.triangle_count,
-    });
-    totalTris += wm.triangle_count;
-    wm.free();
-  };
-
-  if (closed) {
-    // One watertight solid per (block, lithology UNIT) — disjoint slabs (capped by the
-    // box, and by the fault plane when faulted). Block 0 is the whole model when not
-    // faulted. Per-block keeps the field smooth on each side of any fault.
-    for (let b = 0; b < blockCount; b++) {
-      const units = model.block_unit_count(b);
-      const bIds = Array.from(model.block_interface_ids(b));
-      const blockLabel = blockCount > 1 ? b : undefined;
-      for (let u = 0; u < units; u++) {
-        const wm = model.mesh_block_unit_solid_octree(
-          b,
-          u,
-          minX,
-          minY,
-          minZ,
-          size,
-          maxDepth,
-          minDepth,
-          QEF_EPS,
-        );
-        if (wm.triangle_count > 0) {
-          // Unit u sits above interface u-1; tag with that interface id when present.
-          const lowerId = u > 0 ? bIds[u - 1] : -1;
-          pushSurface(wm, lowerId, 0, blockLabel, u);
-        } else {
-          wm.free();
+    w.onmessage = (e: MessageEvent<WorkerEvent>) => {
+      if (gen !== generation) return; // superseded by a newer run — ignore
+      const ev = e.data;
+      switch (ev.type) {
+        case "surfaces-cleared":
+          surfaces.length = 0;
+          totalTris = 0;
+          break;
+        case "surface": {
+          const s: SurfaceMesh = {
+            series: ev.seriesIndex,
+            relation: ev.relation,
+            interfaceIndex: ev.interfaceIndex,
+            formation: ev.formation,
+            block: ev.block,
+            unit: ev.unit,
+            positions: ev.positions,
+            normals: ev.normals,
+            indices: ev.indices,
+            triangleCount: ev.triangleCount,
+          };
+          surfaces.push(s);
+          totalTris += s.triangleCount;
+          onSurface?.(s);
+          break;
         }
-      }
-    }
-  } else if (faultedOpen) {
-    // One contact surface per (block, interface), each clipped to its block's region.
-    for (let b = 0; b < blockCount; b++) {
-      const bIds = Array.from(model.block_interface_ids(b));
-      const bIsos = Array.from(model.interface_isovalues()); // per-block uses own iso internally
-      for (let s = 0; s < bIds.length; s++) {
-        const wm = model.mesh_block_interface_octree(
-          b,
-          s,
-          minX,
-          minY,
-          minZ,
-          size,
-          maxDepth,
-          minDepth,
-          QEF_EPS,
-        );
-        if (wm.triangle_count > 0) {
-          pushSurface(wm, bIds[s], bIsos[s] ?? 0, b);
-        } else {
-          wm.free();
+        case "done": {
+          haveFit = true;
+          resolve({
+            mesh: { surfaces, triangleCount: totalTris, blockCount: ev.totalBlocks },
+            error: null,
+            warning: ev.warning,
+            fitMs: ev.fitMs,
+          });
+          break;
         }
+        case "error":
+          resolve({ mesh: emptyMesh(), error: ev.message, warning: null, fitMs: 0 });
+          break;
+        // "phase" events are status-only; the App could surface ev.label if desired.
       }
-    }
-  } else {
-    // Non-faulted OPEN sheet: one contact surface per interface over the whole domain.
-    const isovalues = Array.from(model.interface_isovalues());
-    const ids = Array.from(model.interface_ids());
-    for (let s = 0; s < isovalues.length; s++) {
-      const wm = model.mesh_isosurface_octree(
-        minX,
-        minY,
-        minZ,
-        size,
-        isovalues[s],
-        maxDepth,
-        minDepth,
-        QEF_EPS,
-        false, // open sheet (closed solids go through the per-unit path above)
-      );
-      pushSurface(wm, ids[s], isovalues[s], undefined);
-    }
-  }
+    };
 
-  const mesh: MeshData = {
-    surfaces,
-    triangleCount: totalTris,
-    residual: model.residual(),
-    isovalueSpread: model.isovalue_spread(),
-    blockCount,
-  };
-  model.free();
+    w.onerror = (e) => {
+      if (gen !== generation) return;
+      resolve({ mesh: emptyMesh(), error: e.message || "worker error", warning: null, fitMs: 0 });
+    };
 
-  // A faulted fit where the plane stranded a block (no orientation on one side)
-  // meshes only part of the domain — flag it so an empty half doesn't look broken.
-  let warning: string | null = null;
-  if (fault && fault.enabled && totalTris === 0) {
-    warning =
-      "fault left no meshable surface — the plane may strand all data on one side " +
-      "(each side needs at least one orientation). Adjust strike/offset.";
-  }
-  return { mesh, error: null, warning };
+    w.postMessage(cmd);
+  });
 }
 
 function emptyMesh(): MeshData {
-  return {
-    surfaces: [],
-    triangleCount: 0,
-    residual: NaN,
-    isovalueSpread: NaN,
-    blockCount: 0,
-  };
+  return { surfaces: [], triangleCount: 0, blockCount: 0 };
 }
+
+// Re-export so callers (App) can render relation glosses without a second import.
+export { relationInfo };
+export type { FaultConfig, SeriesDef };
