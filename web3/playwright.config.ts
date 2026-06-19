@@ -9,6 +9,12 @@ export default defineConfig({
   forbidOnly: !!process.env.CI,
   retries: 0,
   reporter: "list",
+  // Each test drives a real WASM stack fit (the heaviest scenarios re-fit a 3-bed floor).
+  // With unbounded workers, concurrent fits starve each other on CPU and slow tests can
+  // blow their timeouts. Cap at 2 so the gate is reliable on a developer machine; the suite
+  // still finishes in well under a minute. (Per-test timeout left at the 30s default, which
+  // is ample once fits aren't competing 3-4 at a time.)
+  workers: 2,
   use: {
     baseURL: "http://localhost:4173",
     trace: "on-first-retry",

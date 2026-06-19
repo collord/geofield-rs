@@ -8,6 +8,7 @@ import { test, expect } from "@playwright/test";
 
 test("container vs within-group drop affordances are visually distinct", async ({ page }) => {
   await page.goto("/");
+  await page.getByTestId("seed-template").selectOption("conformal-column");
   await expect(page.getByText("status: done")).toBeVisible({ timeout: 30_000 });
 
   // The hierarchy.css classes are loaded; render one of each affordance and read back the

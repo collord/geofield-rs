@@ -5,7 +5,7 @@ import { test, expect } from "@playwright/test";
 
 test("toggling the seam updates the derived display via the core", async ({ page }) => {
   await page.goto("/");
-  await page.locator("select").selectOption({ label: "Erosional unconformity" });
+  await page.getByTestId("seed-template").selectOption("erosional-unconformity");
 
   // Wait for the initial fit+mesh.
   await expect(page.getByText("status: done")).toBeVisible({ timeout: 30_000 });

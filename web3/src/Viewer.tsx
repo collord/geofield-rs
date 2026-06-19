@@ -64,7 +64,7 @@ function buildAxes(extent: Extent): THREE.Group {
   return g;
 }
 
-export function Viewer(props: { surfaces: SurfacePayload[]; extent: Extent }) {
+export function Viewer(props: { surfaces: SurfacePayload[]; extent: Extent; stale?: boolean }) {
   const mountRef = useRef<HTMLDivElement | null>(null);
   const stateRef = useRef<{
     renderer: THREE.WebGLRenderer;
@@ -154,5 +154,24 @@ export function Viewer(props: { surfaces: SurfacePayload[]; extent: Extent }) {
     }
   }, [props.surfaces]);
 
-  return <div ref={mountRef} style={{ width: "100%", height: "100%", minHeight: 400 }} />;
+  // Positioned container so the stale scrim can sit as a sibling overlay over the canvas.
+  return (
+    <div style={{ position: "relative", width: "100%", height: "100%", minHeight: 400 }}>
+      <div ref={mountRef} style={{ width: "100%", height: "100%", minHeight: 400 }} />
+      {props.stale && (
+        // ~40% grey, pointer-events:none so orbiting still works — the view reads as STALE
+        // until the next successful Apply. Tests assert on the element, not pixels.
+        <div
+          className="stale-scrim"
+          data-testid="stale-scrim"
+          style={{
+            position: "absolute",
+            inset: 0,
+            background: "rgba(120,120,120,0.4)",
+            pointerEvents: "none",
+          }}
+        />
+      )}
+    </div>
+  );
 }

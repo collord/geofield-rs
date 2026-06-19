@@ -17,6 +17,7 @@ async function canvasShot(page: import("@playwright/test").Page) {
 
 test("the view does not auto-rotate (static without input)", async ({ page }) => {
   await page.goto("/");
+  await page.getByTestId("seed-template").selectOption("conformal-column");
   await expect(page.getByText("status: done")).toBeVisible({ timeout: 30_000 });
 
   // Two captures ~1s apart with NO user input. A self-rotating scene would differ; a
@@ -29,6 +30,7 @@ test("the view does not auto-rotate (static without input)", async ({ page }) =>
 
 test("standard orbit controls respond to drag", async ({ page }) => {
   await page.goto("/");
+  await page.getByTestId("seed-template").selectOption("conformal-column");
   await expect(page.getByText("status: done")).toBeVisible({ timeout: 30_000 });
 
   const before = await canvasShot(page);
@@ -48,6 +50,7 @@ test("standard orbit controls respond to drag", async ({ page }) => {
 
 test("the scene renders content (meshes + axes) for a loaded scenario", async ({ page }) => {
   await page.goto("/");
+  await page.getByTestId("seed-template").selectOption("conformal-column");
   await expect(page.getByText("status: done")).toBeVisible({ timeout: 30_000 });
 
   // A blank background would be a single flat color; a rendered scene (axes lines + labels

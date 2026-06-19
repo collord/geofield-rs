@@ -63,3 +63,114 @@
   background: #aac;
   opacity: 0.7;
 }
+
+/* === feature 002 (enhanced-authoring) ==================================== */
+
+/* --- project bar --------------------------------------------------------- */
+.project-bar { margin-bottom: 0.5rem; }
+.project-name { font-weight: 600; width: 100%; padding: 0.25rem; box-sizing: border-box; }
+.project-bar-actions {
+  display: flex; flex-wrap: wrap; gap: 0.25rem; margin-top: 0.25rem; align-items: center;
+}
+.project-bar-actions button,
+.project-bar-actions select,
+.import-btn {
+  font-size: 0.75em; padding: 0.15rem 0.4rem; border: 1px solid #bcd; border-radius: 4px;
+  background: #f4f6fb; cursor: pointer;
+}
+.project-bar-actions button:disabled { opacity: 0.5; cursor: not-allowed; }
+.import-btn { display: inline-block; }
+
+/* --- apply / cancel bar -------------------------------------------------- */
+.apply-bar {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 0.4rem;
+  padding: 0.4rem; margin: 0.4rem 0; border: 1px solid #e0b85a; border-radius: 6px;
+  background: #fdf6e3; font-size: 0.8em;
+}
+.dirty-dot { width: 8px; height: 8px; border-radius: 50%; background: #e0922f; }
+.apply-btn {
+  font-size: 1em; padding: 0.15rem 0.6rem; border: 1px solid #2a7; border-radius: 4px;
+  background: #2a7; color: #fff; cursor: pointer; margin-left: auto;
+}
+.apply-btn:disabled { background: #bcd; border-color: #bcd; cursor: not-allowed; }
+.apply-reason { flex-basis: 100%; color: #b23; font-size: 0.95em; }
+
+/* --- add-surface --------------------------------------------------------- */
+.add-surface-btn {
+  margin-top: 0.5rem; width: 100%; padding: 0.3rem; border: 1px dashed #9ab;
+  border-radius: 6px; background: #f4f6fb; cursor: pointer;
+}
+.empty-hint { font-size: 0.85em; color: #789; padding: 0.5rem 0; }
+.add-surface-menu {
+  position: absolute; z-index: 20; margin-top: 0.25rem; background: #fff;
+  border: 1px solid #ccd; border-radius: 8px; box-shadow: 0 4px 16px rgba(0,0,0,0.15);
+  padding: 0.4rem; min-width: 280px;
+}
+.add-surface-menu-head { display: flex; justify-content: space-between; margin-bottom: 0.25rem; }
+.add-surface-choice {
+  display: block; width: 100%; text-align: left; border: none; background: none;
+  padding: 0.35rem 0.4rem; border-radius: 4px; cursor: pointer;
+}
+.add-surface-choice:hover { background: #eef2fb; }
+.choice-label { display: block; font-weight: 600; font-size: 0.9em; }
+.choice-gloss { display: block; font-size: 0.75em; color: #678; }
+.popover-close { border: none; background: none; cursor: pointer; }
+
+/* --- top-level reorder (up/down chronology controls) -------------------- */
+.surface-row-flat { display: flex; align-items: center; gap: 0.4rem; }
+.surface-row-flat .surface-row { flex: 1; min-width: 0; }
+.reorder-controls { display: inline-flex; flex-direction: column; line-height: 0.6; }
+.reorder-btn {
+  border: none; background: none; cursor: pointer; color: #89a; padding: 0 0.15rem;
+  font-size: 0.6em; line-height: 1;
+}
+.reorder-btn:hover:not(:disabled) { color: #3a6; }
+.reorder-btn:disabled { color: #ccd; cursor: default; }
+
+/* --- surface rows + "…" menus ------------------------------------------- */
+.surface-row { display: flex; align-items: center; gap: 0.4rem; }
+.surface-row.inline { font-size: 0.9em; }
+.surface-name { font-weight: 500; }
+.point-count { font-size: 0.75em; color: #789; }
+.row-menu { position: relative; margin-left: auto; }
+.row-menu-trigger {
+  border: none; background: none; cursor: pointer; font-weight: 700; color: #678;
+  padding: 0 0.3rem; line-height: 1;
+}
+.row-menu-popover {
+  position: absolute; right: 0; z-index: 20; background: #fff; border: 1px solid #ccd;
+  border-radius: 6px; box-shadow: 0 4px 16px rgba(0,0,0,0.15); padding: 0.25rem; min-width: 140px;
+}
+.row-menu-popover button {
+  display: block; width: 100%; text-align: left; border: none; background: none;
+  padding: 0.25rem 0.4rem; border-radius: 4px; cursor: pointer; font-size: 0.85em;
+}
+.row-menu-popover button:hover { background: #eef2fb; }
+.row-menu-popover button.danger { color: #b23; }
+.row-del { border: none; background: none; cursor: pointer; color: #b23; }
+
+/* --- data modal ---------------------------------------------------------- */
+.modal-backdrop {
+  position: fixed; inset: 0; z-index: 100; background: rgba(0,0,0,0.35);
+  display: flex; align-items: center; justify-content: center;
+}
+.modal {
+  background: #fff; border-radius: 10px; padding: 1rem; max-width: 760px; width: 90vw;
+  max-height: 85vh; overflow: auto; box-shadow: 0 8px 32px rgba(0,0,0,0.3);
+}
+.modal-head { display: flex; align-items: baseline; gap: 0.5rem; }
+.modal-parent { font-size: 0.8em; color: #789; }
+.modal-hint { font-size: 0.75em; color: #678; background: #f4f6fb; padding: 0.4rem; border-radius: 6px; }
+.modal-tables { display: flex; gap: 1rem; flex-wrap: wrap; }
+.data-table { flex: 1; min-width: 240px; }
+.data-table-head { display: flex; justify-content: space-between; align-items: baseline; }
+.data-table table { border-collapse: collapse; width: 100%; }
+.data-table th, .data-table td { border: 1px solid #e0e4ee; padding: 1px; }
+.data-table input { width: 5.5em; border: none; padding: 0.15rem; font-size: 0.8em; }
+.row-count { font-size: 0.75em; color: #789; }
+.paste-note { font-size: 0.72em; color: #b23; margin-left: 0.5rem; }
+.data-table-foot { margin-top: 0.25rem; }
+.modal-foot { display: flex; align-items: center; gap: 0.5rem; margin-top: 0.75rem; }
+.modal-summary { font-size: 0.8em; margin-right: auto; }
+.modal-summary.ok { color: #2a7; }
+.modal-summary.warn { color: #c83; }

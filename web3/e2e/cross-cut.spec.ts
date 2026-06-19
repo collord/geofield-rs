@@ -6,7 +6,7 @@ import { test, expect } from "@playwright/test";
 
 test("a cross-cutting vein shows the derived cross-cuts chip", async ({ page }) => {
   await page.goto("/");
-  await page.locator("select").selectOption({ label: "Cross-cutting vein" });
+  await page.getByTestId("seed-template").selectOption("cross-cutting-vein");
   await expect(page.getByText("status: done")).toBeVisible({ timeout: 30_000 });
 
   // The vein container's seam shows the read-only cross-cuts chip (not the 3-state control).
