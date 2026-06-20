@@ -101,6 +101,16 @@ pub trait Boundary {
     /// `None` if the implementor cannot give a normal there (then the seam vertex is
     /// left where the QEF placed it).
     fn surface_normal(&self, p: [f64; 3]) -> Option<[f64; 3]>;
+
+    /// How many DISTINCT surfaces of this boundary cross the edge `a → b` (for the
+    /// double-crossed-edge refinement). Defaults to `edge_crossing().is_some()` (0 or
+    /// 1) — correct for a single level set. A multi-contact boundary (a
+    /// [`SlabComplement`], whose two contacts can both cross one coarse edge) overrides
+    /// this so such a cell is subdivided until each edge crosses at most one contact,
+    /// preserving the watertight single-crossing-per-edge contour.
+    fn edge_crossing_count(&self, a: [f64; 3], b: [f64; 3]) -> usize {
+        self.edge_crossing(a, b).is_some() as usize
+    }
 }
 
 /// A geologic contact (a `Model` field thresholded at an isovalue) expressed as a
@@ -198,6 +208,83 @@ impl Boundary for ContactHalfSpace<'_> {
 
     fn surface_normal(&self, p: [f64; 3]) -> Option<[f64; 3]> {
         Some(normalize(self.model.scalar_field_gradient(p)))
+    }
+}
+
+/// The region OUTSIDE a field's slab `lo <= field <= hi`, as a [`Boundary`] — i.e.
+/// `inside(p)` is `field(p) < lo OR field(p) > hi` (the complement of the slab).
+///
+/// This is the correct clip a cross-cutting **vein** (or shell intrusion) contributes
+/// to an OLDER element it cross-cuts: the older surface survives OUTSIDE the body's
+/// band and is removed INSIDE it. "Outside a slab" is a UNION of two half-spaces, which
+/// ANDed [`ContactHalfSpace`] contributors cannot express (ANDing `above-lo` with
+/// `below-hi` gives the band INTERIOR — the inverted clip). A single `SlabComplement`
+/// contributor expresses the union directly, ANDed with the rest of the Scene as usual.
+///
+/// `edge_crossing` reports whichever of the two contacts (`lo`/`hi`) the edge crosses;
+/// the [`Scene`]'s double-crossed-edge refinement guarantees each minimal edge crosses
+/// at most one contact, so a single crossing per edge is sufficient for the contour.
+/// The outward normal points INTO the slab (out of the kept region): `+∇field` at the
+/// `lo` contact (kept side `field < lo`), `−∇field` at the `hi` contact (kept side
+/// `field > hi`).
+pub struct SlabComplement<'a> {
+    field: &'a dyn ScalarField,
+    lo: f64,
+    hi: f64,
+}
+
+impl<'a> SlabComplement<'a> {
+    /// Outside the slab `[lo, hi]` of `field`. `lo`/`hi` are normalized so `lo <= hi`.
+    pub fn new(field: &'a dyn ScalarField, lo: f64, hi: f64) -> Self {
+        let (lo, hi) = if lo <= hi { (lo, hi) } else { (hi, lo) };
+        Self { field, lo, hi }
+    }
+}
+
+impl Boundary for SlabComplement<'_> {
+    fn inside(&self, p: [f64; 3]) -> bool {
+        let f = self.field.scalar_field(p);
+        f < self.lo || f > self.hi
+    }
+
+    fn edge_crossing(&self, a: [f64; 3], b: [f64; 3]) -> Option<([f64; 3], [f64; 3])> {
+        let fa = self.field.scalar_field(a);
+        let fb = self.field.scalar_field(b);
+        // The kept-region membership flips when the edge crosses either contact. Find the
+        // contact this edge crosses (at most one, after double-crossed-edge refinement); the
+        // outward normal points into the slab (out of the kept region).
+        for (iso, sign) in [(self.lo, 1.0_f64), (self.hi, -1.0_f64)] {
+            let (ga, gb) = (fa - iso, fb - iso);
+            if (ga < 0.0) != (gb < 0.0) {
+                let t = ga / (ga - gb);
+                let p = [
+                    a[0] + (b[0] - a[0]) * t,
+                    a[1] + (b[1] - a[1]) * t,
+                    a[2] + (b[2] - a[2]) * t,
+                ];
+                let g = normalize(self.field.scalar_field_gradient(p));
+                return Some((p, [sign * g[0], sign * g[1], sign * g[2]]));
+            }
+        }
+        None
+    }
+
+    fn surface_normal(&self, p: [f64; 3]) -> Option<[f64; 3]> {
+        // The nearer contact determines the local wall orientation.
+        let f = self.field.scalar_field(p);
+        let sign = if (f - self.lo).abs() <= (f - self.hi).abs() { 1.0 } else { -1.0 };
+        let g = normalize(self.field.scalar_field_gradient(p));
+        Some([sign * g[0], sign * g[1], sign * g[2]])
+    }
+
+    fn edge_crossing_count(&self, a: [f64; 3], b: [f64; 3]) -> usize {
+        let fa = self.field.scalar_field(a);
+        let fb = self.field.scalar_field(b);
+        // Count each of the two band contacts the edge crosses — a thin band relative to
+        // the cell can cross both on one edge, which must force a subdivision.
+        let lo_cross = (fa < self.lo) != (fb < self.lo);
+        let hi_cross = (fa < self.hi) != (fb < self.hi);
+        lo_cross as usize + hi_cross as usize
     }
 }
 
@@ -385,11 +472,9 @@ impl<'a> Scene<'a> {
             count += 1;
         }
         for c in &self.contributors {
-            if c.edge_crossing(pa, pb).is_some() {
-                count += 1;
-                if count >= 2 {
-                    return true;
-                }
+            count += c.edge_crossing_count(pa, pb);
+            if count >= 2 {
+                return true;
             }
         }
         count >= 2

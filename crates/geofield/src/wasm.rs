@@ -696,6 +696,35 @@ impl WasmStack {
             .unwrap_or_else(EMPTY_MESH)
     }
 
+    /// Mesh ONE wall of a CROSS-CUTTING body (vein/intrusion) at element `series` as an open
+    /// contact sheet — the body's own surface, clipped to the extent box and any younger body
+    /// above it. EMPTY mesh if `series` is a stratigraphic series or any index is out of range.
+    /// (Veins have two walls: foot wall = interface 0, hanging wall = 1.)
+    #[allow(clippy::too_many_arguments)]
+    pub fn mesh_cross_cut_surface_octree(
+        &self,
+        series: usize,
+        interface_idx: usize,
+        min_x: f64,
+        min_y: f64,
+        min_z: f64,
+        size: f64,
+        ext_x: f64,
+        ext_y: f64,
+        ext_z: f64,
+        max_depth: u32,
+        min_depth: u32,
+        qef_threshold: f64,
+    ) -> WasmMesh {
+        let cfg = octree_cfg(max_depth, min_depth, qef_threshold, false);
+        self.inner
+            .mesh_cross_cut_surface(
+                series, interface_idx, [min_x, min_y, min_z], size, [ext_x, ext_y, ext_z], cfg,
+            )
+            .map(Into::into)
+            .unwrap_or_else(EMPTY_MESH)
+    }
+
     /// Number of lithology UNIT solids in `block` of `series` (`interfaces + 1`; 0 if out
     /// of range or field-less). This includes the topmost VOID unit above the series'
     /// bounding contact — for the renderable rock units use

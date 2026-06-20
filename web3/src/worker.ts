@@ -79,8 +79,24 @@ function collectSurfaces(
   const out: SurfacePayload[] = [];
 
   for (let si = 0; si < stack.series_count; si++) {
-    const blocks = Math.max(1, stack.series_block_count(si));
     const n = stack.interface_count(si);
+    // A cross-cutting body (vein/intrusion) meshes its OWN walls as open sheets (one mesh per
+    // interface, no fault blocks); a stratigraphic series meshes per fault block. The kind is
+    // known from the compiled SeriesJson (crossCut present ⇒ cross-cutting body).
+    const isCrossCut = series[si]?.crossCut != null;
+    if (isCrossCut) {
+      for (let k = 0; k < n; k++) {
+        const m = stack.mesh_cross_cut_surface_octree(
+          si, k, x0, y0, z0, size, x1, y1, z1, depth, minDepth, QEF_EPS,
+        );
+        if (m.triangle_count > 0) {
+          out.push({ series: si, block: 0, interface: k, positions: m.positions(), normals: m.normals(), indices: m.indices() });
+        }
+        m.free();
+      }
+      continue;
+    }
+    const blocks = Math.max(1, stack.series_block_count(si));
     for (let b = 0; b < blocks; b++) {
       for (let k = 0; k < n; k++) {
         const m = stack.mesh_series_block_interface(
@@ -99,7 +115,6 @@ function collectSurfaces(
         m.free();
       }
     }
-    void series; // series metadata (names) used by the panel, not the mesh payload
   }
   return out;
 }

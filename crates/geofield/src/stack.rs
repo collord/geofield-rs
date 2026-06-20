@@ -77,9 +77,9 @@
 use crate::mesh::Mesh;
 use crate::octree::{
     octree_dual_contour_scene, AxisBox, Boundary, ContactHalfSpace, OctreeConfig, PlaneHalfSpace,
-    Scene,
+    Scene, SlabComplement,
 };
-use crate::{clip_mesh_to_half_spaces, max_abs_field_in_box, BlockModel, SeriesModel};
+use crate::{clip_mesh_to_half_spaces, max_abs_field_in_box, BlockModel, ScalarField, SeriesModel};
 
 /// How a series relates to the (older) series beneath it. `Erode`/`Onlap` are the
 /// Lajaunie–Calcagno binary; GemPy's `StackRelationType` and LoopStructural's
@@ -314,6 +314,34 @@ pub struct SeriesMeshes {
     pub interfaces: Vec<(u32, Mesh)>,
 }
 
+/// How a younger element clips an OLDER element's surface: the region of the older
+/// surface that SURVIVES (is kept), expressed against the younger body's own field.
+///
+/// The older surface survives OUTSIDE the younger body. An erode/intrusion-single body
+/// is one side of a single contact (`Halfspace`); a vein or shell intrusion is the
+/// COMPLEMENT of a band (`SlabExterior`) — "outside the slab", a union the older
+/// [`SlabComplement`] boundary expresses directly (ANDing two half-spaces would instead
+/// keep the older surface INSIDE the band — the inverted-clip bug this type replaces).
+enum Masker<F> {
+    /// Keep the older surface on one side of a contact: `field < iso` if `below`, else
+    /// `field > iso`. (Erode top = `below=false`; intrusion-single exterior = `below=false`.)
+    Halfspace { field: F, iso: f64, below: bool },
+    /// Keep the older surface OUTSIDE the band `[lo, hi]` (`field < lo || field > hi`).
+    /// (Vein / shell intrusion.)
+    SlabExterior { field: F, lo: f64, hi: f64 },
+}
+
+impl<F: ScalarField> Masker<F> {
+    /// Borrow this masker as a [`Boundary`] contributor (ANDed into the older element's
+    /// Scene). `Box<dyn>` so both half-space and slab-complement kinds unify.
+    fn boundary(&self) -> Box<dyn Boundary + '_> {
+        match self {
+            Masker::Halfspace { field, iso, below } => Box::new(ContactHalfSpace::new(field, *iso, *below)),
+            Masker::SlabExterior { field, lo, hi } => Box::new(SlabComplement::new(field, *lo, *hi)),
+        }
+    }
+}
+
 /// An ordered stack of series, **youngest (index 0) → oldest (last)**. The oldest
 /// series is conventionally the floor ([`StackedSeries::floor`]: `relation = None`,
 /// `unbounded_above = true`). Generic over the fitted model `M` ([`SeriesModel`]) so
@@ -365,48 +393,42 @@ impl<M: SeriesModel> Stack<M> {
     }
 
     /// The younger CROSS-CUTTING contributions (indices `< i`) that CLIP element `i`'s
-    /// surfaces, as owned-field + half-space-descriptor pairs. A younger `Erode` series
-    /// contributes its top contact's ABOVE side (one half-space); a younger vein/intrusion
-    /// contributes its band/interior (the body's own clip). Onlap/Conformable series (and
-    /// the floor) contribute nothing. Returned as owned fields so the caller can keep them
-    /// alive while the borrowed `ContactHalfSpace`s reference them.
-    ///
-    /// Each entry is `(field, isovalue, below)`: a `ContactHalfSpace::new(field, isovalue,
-    /// below)`. An erode masker is the single `(iso_top, below=false)`; a vein is TWO entries
-    /// (above FW, below HW); an intrusion the envelope interior.
-    fn erode_masker_fields(&self, i: usize) -> Vec<(M::Field<'_>, f64, bool)> {
+    /// surfaces — each a [`Masker`] describing where element `i`'s surface SURVIVES
+    /// (OUTSIDE the younger body). A younger `Erode` series contributes the ABOVE side of
+    /// its top contact; a younger vein or shell intrusion the EXTERIOR of its band; an
+    /// intrusion-single the exterior of its envelope. Onlap/Conformable series (and the
+    /// floor) contribute nothing. The owned fields live in the returned [`Masker`]s so the
+    /// borrowed boundaries (built via [`Masker::boundary`]) outlive them.
+    fn clip_maskers(&self, i: usize) -> Vec<Masker<M::Field<'_>>> {
         let mut out = Vec::new();
         for ej in &self.series[..i] {
             match ej {
-                // A younger erode series: its top contact's ABOVE side clips older surfaces.
+                // A younger erode series: older survives ABOVE its top contact (`field > iso`).
                 StackElement::Series(sj) if sj.relation == Some(Relation::Erode) => {
                     if let Some(iso_top) = sj.iso_top() {
-                        out.push((sj.model.field(), iso_top, false));
+                        out.push(Masker::Halfspace { field: sj.model.field(), iso: iso_top, below: false });
                     }
                 }
-                // A younger vein: present BETWEEN fw/hw — clips older surfaces inside that
-                // band = two ANDed half-spaces (above the lower iso, below the upper iso).
+                // A younger vein: present BETWEEN fw/hw — older survives OUTSIDE that band.
                 StackElement::Vein(v) => {
                     if let Some((lo, hi)) = v.band() {
-                        out.push((v.model.field(), lo, false)); // above the foot wall
-                        out.push((v.model.field(), hi, true)); // below the hanging wall
+                        out.push(Masker::SlabExterior { field: v.model.field(), lo, hi });
                     }
                 }
-                // A younger intrusion: present inside its envelope — clips older surfaces
-                // there. Single(i): interior is `field < iso` (below=true). Shell: between.
+                // A younger intrusion: older survives OUTSIDE its envelope. Single(i): exterior
+                // is `field > iso` (below=false). Shell: exterior of the [lo,hi] band.
                 StackElement::Intrusion(it) => {
                     let isos = it.model.interface_isovalues();
                     match it.envelope {
                         Envelope::Single(k) => {
                             if let Some(&iso) = isos.get(k) {
-                                out.push((it.model.field(), iso, true));
+                                out.push(Masker::Halfspace { field: it.model.field(), iso, below: false });
                             }
                         }
                         Envelope::Shell { inner, outer } => {
                             if let (Some(&a), Some(&b)) = (isos.get(inner), isos.get(outer)) {
                                 let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
-                                out.push((it.model.field(), lo, false));
-                                out.push((it.model.field(), hi, true));
+                                out.push(Masker::SlabExterior { field: it.model.field(), lo, hi });
                             }
                         }
                     }
@@ -452,20 +474,16 @@ impl<M: SeriesModel> Stack<M> {
         let s = self.series_at(i)?;
         let isovalue = *s.model.interface_isovalues().get(interface_idx)?;
         let box_b = AxisBox::from_bounds(min, ext_max);
-        // Hold the masker fields in a local so the half-spaces (which borrow them) and the
-        // field reference below all outlive the `Scene`.
-        let masker_fields = self.erode_masker_fields(i);
-        let maskers: Vec<ContactHalfSpace<'_>> = masker_fields
-            .iter()
-            // Each younger cross-cutting contribution is clipped on the side that leaves
-            // element `i` visible OUTSIDE the younger body (erode: above its top; vein:
-            // outside its band; intrusion: outside its envelope).
-            .map(|(field, iso, below)| ContactHalfSpace::new(field, *iso, *below))
-            .collect();
+        // Hold the maskers + their boundaries in locals so the borrowed `&dyn Boundary`s all
+        // outlive the `Scene`. Each younger cross-cutting contribution keeps element `i`
+        // visible OUTSIDE the younger body (erode: above its top; vein/shell: outside its
+        // band; intrusion-single: outside its envelope).
+        let masker_fields = self.clip_maskers(i);
+        let maskers: Vec<Box<dyn Boundary + '_>> = masker_fields.iter().map(|m| m.boundary()).collect();
         let mut contributors: Vec<&dyn Boundary> = Vec::with_capacity(maskers.len() + 1);
         contributors.push(&box_b);
         for m in &maskers {
-            contributors.push(m);
+            contributors.push(m.as_ref());
         }
         let field = s.model.field();
         let scene = Scene::new(&field, isovalue, contributors);
@@ -573,17 +591,14 @@ impl<M: SeriesModel + BlockModel> Stack<M> {
         let block_field = s.model.block_field(b)?;
         // Clip to the TRUE extent box, not the (possibly ballooned) octree cube.
         let box_b = AxisBox::from_bounds(min, ext_max);
-        // Younger-erosion clip half-spaces, exactly as `mesh_one` (whole-model fields —
-        // erosion is geological and dispatches per-block correctly).
-        let masker_fields = self.erode_masker_fields(i);
-        let maskers: Vec<ContactHalfSpace<'_>> = masker_fields
-            .iter()
-            .map(|(field, iso, below)| ContactHalfSpace::new(field, *iso, *below))
-            .collect();
+        // Younger cross-cutting clip maskers, exactly as `mesh_one` (whole-model fields —
+        // cross-cutting is geological and dispatches per-block correctly).
+        let masker_fields = self.clip_maskers(i);
+        let maskers: Vec<Box<dyn Boundary + '_>> = masker_fields.iter().map(|m| m.boundary()).collect();
         let mut contributors: Vec<&dyn Boundary> = Vec::with_capacity(maskers.len() + 1);
         contributors.push(&box_b);
         for m in &maskers {
-            contributors.push(m);
+            contributors.push(m.as_ref());
         }
         let scene = Scene::new(&block_field, isovalue, contributors);
         let mut mesh = octree_dual_contour_scene(&scene, min, size, cfg);
@@ -593,6 +608,45 @@ impl<M: SeriesModel + BlockModel> Stack<M> {
             clip_mesh_to_half_spaces(&mut mesh, &half_spaces);
         }
         Some(mesh)
+    }
+
+    /// Mesh ONE wall of a CROSS-CUTTING body (vein or intrusion) at element `i` as an open
+    /// contact sheet — the body's OWN surface, clipped to the extent box and to any YOUNGER
+    /// cross-cutting body above it (the same `clip_maskers(i)` an older series gets). Returns
+    /// `None` if `i` is not a cross-cutting body, or `interface_idx`/the field is out of range.
+    ///
+    /// This lifts the feature-001 logged punt ("the cross-cutting body's OWN 3D surface mesh
+    /// is a follow-up — `mesh_one_block` is series-only"): the body's lithology/cut-set/masker
+    /// clip already existed; only the wall geometry for the viewer was missing. A vein has two
+    /// walls (foot wall = interface 0, hanging wall = 1); an intrusion has its envelope
+    /// surface(s). Rendered as open sheets to match the stratigraphic contact view.
+    pub fn mesh_cross_cut_surface(
+        &self,
+        i: usize,
+        interface_idx: usize,
+        min: [f64; 3],
+        size: f64,
+        ext_max: [f64; 3],
+        cfg: OctreeConfig,
+    ) -> Option<Mesh> {
+        // Cross-cutting bodies only; a stratigraphic series is meshed by `mesh_one*`.
+        let e = self.series.get(i)?;
+        if e.is_series() {
+            return None;
+        }
+        let isovalue = *e.model().interface_isovalues().get(interface_idx)?;
+        let field = e.model().field();
+        let box_b = AxisBox::from_bounds(min, ext_max);
+        // Younger cross-cutting bodies above this one clip its walls too (same masker rule).
+        let masker_fields = self.clip_maskers(i);
+        let maskers: Vec<Box<dyn Boundary + '_>> = masker_fields.iter().map(|m| m.boundary()).collect();
+        let mut contributors: Vec<&dyn Boundary> = Vec::with_capacity(maskers.len() + 1);
+        contributors.push(&box_b);
+        for m in &maskers {
+            contributors.push(m.as_ref());
+        }
+        let scene = Scene::new(&field, isovalue, contributors);
+        Some(octree_dual_contour_scene(&scene, min, size, cfg))
     }
 
     /// Number of lithology UNIT solids in block `b` of series `i` (`interfaces + 1`, 0 if
@@ -693,13 +747,10 @@ impl<M: SeriesModel + BlockModel> Stack<M> {
             .into_iter()
             .map(|hs| PlaneHalfSpace::new(hs.point, hs.normal, hs.keep_positive))
             .collect();
-        // Younger-erosion clips (whole-model fields), so the closed slab respects erosion
+        // Younger cross-cutting clips (whole-model fields), so the closed slab respects them
         // exactly like the open sheet — but here the cut is a kept cap face.
-        let masker_fields = self.erode_masker_fields(i);
-        let maskers: Vec<ContactHalfSpace<'_>> = masker_fields
-            .iter()
-            .map(|(field, iso, below)| ContactHalfSpace::new(field, *iso, *below))
-            .collect();
+        let masker_fields = self.clip_maskers(i);
+        let maskers: Vec<Box<dyn Boundary + '_>> = masker_fields.iter().map(|m| m.boundary()).collect();
 
         let mut contributors: Vec<&dyn Boundary> =
             Vec::with_capacity(planes.len() + maskers.len() + 2);
@@ -711,7 +762,7 @@ impl<M: SeriesModel + BlockModel> Stack<M> {
             contributors.push(lo);
         }
         for m in &maskers {
-            contributors.push(m);
+            contributors.push(m.as_ref());
         }
 
         let cfg = OctreeConfig { cap: true, ..cfg };
@@ -821,6 +872,23 @@ mod tests {
     #[test]
     fn stack_onlap_surfaces_are_watertight() {
         assert_stack_watertight(|| two_series_stack(Relation::Onlap), "onlap");
+    }
+
+    /// The `SlabComplement` clip (a vein cross-cutting an older bed) must stay watertight —
+    /// the non-convex "outside the band" contributor is the risk the slab-complement approach
+    /// takes on. A vein band 350..650 over a flat bed at z=500: the bed's closed-solid mesh,
+    /// clipped to OUTSIDE the band, must have every edge incidence exactly 2 at several depths
+    /// (the double-crossed-edge refinement counts BOTH band contacts via `edge_crossing_count`).
+    #[test]
+    fn vein_clipped_bed_is_watertight() {
+        assert_stack_watertight(
+            || {
+                let vein = Vein::new(two_contact_model(350.0, 650.0), 0, 1);
+                let bed = StackedSeries::floor(dipping_plane(500.0, 0.0, 0.0));
+                Stack::new(vec![StackElement::Vein(vein), StackElement::Series(bed)])
+            },
+            "vein-clipped-bed",
+        );
     }
 
     /// THE discriminating test: erode and onlap must produce DIFFERENT older-series
@@ -1352,6 +1420,56 @@ mod tests {
         // Above the band ⇒ also the floor (it is unbounded-above / present everywhere not
         // claimed), confirming the vein does NOT clip as an unbounded half-space.
         assert_eq!(stack.global_unit([500.0, 500.0, 800.0]).0, 1, "floor shows above the vein band");
+    }
+
+    /// Part B — a vein's OWN walls now mesh (the feature-001 logged punt is lifted). Each of
+    /// the two walls (foot wall id 0, hanging wall id 1) produces a non-empty open sheet near
+    /// its isosurface; a stratigraphic series returns None from the cross-cut mesher.
+    #[test]
+    fn vein_walls_mesh_as_open_sheets() {
+        let vein = Vein::new(two_contact_model(300.0, 700.0), 0, 1);
+        let floor = StackedSeries::floor(dipping_plane(500.0, 0.0, 0.0));
+        let stack = Stack::new(vec![StackElement::Vein(vein), StackElement::Series(floor)]);
+        let cfg = OctreeConfig { max_depth: 6, min_depth: 2, qef_threshold: 1e-6, cap: false };
+        let ext = [1000.0, 1000.0, 1000.0];
+        for k in 0..2 {
+            let mesh = stack
+                .mesh_cross_cut_surface(0, k, [0.0, 0.0, 0.0], 1000.0, ext, cfg)
+                .expect("vein wall should mesh");
+            assert!(mesh.triangle_count() > 0, "vein wall {k} produced an empty mesh");
+        }
+        // A stratigraphic series is not a cross-cutting body → None.
+        assert!(
+            stack.mesh_cross_cut_surface(1, 0, [0.0, 0.0, 0.0], 1000.0, ext, cfg).is_none(),
+            "a series has no cross-cut wall mesh"
+        );
+    }
+
+    /// REGRESSION — a younger vein clips an older bed's MESH to OUTSIDE its band (not inside).
+    /// `vein_cross_cuts_only_within_band` checks `global_unit` (lithology, driven by
+    /// `present_at`); this checks the SEPARATE meshing path (`clip_maskers` → the Scene), which
+    /// before the SlabComplement fix ANDed two half-spaces and kept the bed INSIDE the band —
+    /// the inverted clip the user saw (sediments preserved between the walls, erased outside).
+    ///
+    /// A flat bed at z=500 runs through the whole column; a vein band 300..700 (foot wall id 0,
+    /// hanging wall id 1) cross-cuts it. The meshed bed must SURVIVE where the vein is absent
+    /// (|y| far from the band in the vein's field) and be REMOVED inside the band. We assert via
+    /// the masker boolean (the exact predicate the Scene ANDs) at bed points in/out of the band.
+    #[test]
+    fn vein_clips_older_bed_mesh_outside_its_band() {
+        // Vein over a bed; the vein's band is 300..700 in ITS field (two_contact_model fw/hw).
+        let vein = Vein::new(two_contact_model(300.0, 700.0), 0, 1);
+        let bed = StackedSeries::floor(dipping_plane(500.0, 0.0, 0.0));
+        let stack = Stack::new(vec![StackElement::Vein(vein), StackElement::Series(bed)]);
+
+        // The masker the bed (element 1) sees from the younger vein (element 0): exactly ONE
+        // contributor (a SlabComplement), and its `inside` keeps the bed OUTSIDE the band.
+        let maskers = stack.clip_maskers(1);
+        assert_eq!(maskers.len(), 1, "a vein contributes ONE slab-exterior masker, not two ANDed half-spaces");
+        let kept = |z: f64| maskers[0].boundary().inside([500.0, 500.0, z]);
+        assert!(kept(150.0), "bed survives BELOW the vein band");
+        assert!(!kept(500.0), "bed is REMOVED INSIDE the vein band (was inverted before the fix)");
+        assert!(kept(850.0), "bed survives ABOVE the vein band");
     }
 
     /// T030 [US2] — an intrusion is present only INSIDE its envelope, and lithology needs no

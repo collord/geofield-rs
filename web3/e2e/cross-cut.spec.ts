@@ -22,4 +22,12 @@ test("a cross-cutting vein shows the derived cross-cuts chip", async ({ page }) 
 
   // The vein's derived display reads crossCut (sourced from CoreUpdate.derived).
   await expect(page.locator(".derived-summary").first()).toContainText("crossCut");
+
+  // The vein's OWN walls now render (the feature-001 punt is lifted): the cross-cutting body
+  // (series 0) contributes at least one wall surface, not just the clipped older beds.
+  const veinSurfaces = await page.evaluate(() => {
+    const surfaces = (window as any).__surfaces as { series: number; indices: Uint32Array }[];
+    return surfaces.filter((s) => s.series === 0 && s.indices.length > 0).length;
+  });
+  expect(veinSurfaces, "the vein contributes rendered wall surfaces").toBeGreaterThan(0);
 });
