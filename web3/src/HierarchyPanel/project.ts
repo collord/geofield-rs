@@ -19,7 +19,35 @@ import type { SeriesJson } from "../protocol";
 /** Authoring-facing surface type. Maps to (container kind + Axis-A relation). The user
  *  picks one of these on "Add Surface"; container membership is then DERIVED (R4), never
  *  declared. */
-export type SurfaceType = "conformable" | "erosional" | "onlap" | "vein" | "intrusion";
+export type SurfaceType = "conformable" | "erosional" | "onlap" | "vein" | "intrusion" | "topography";
+
+// ============================================================================
+// Lithology catalog (feature 003 §4) — UI-side identity metadata. NEVER crosses the wasm
+// boundary; the core supplies only unit COORDINATES (DerivedView.units). Behaviour in US3.
+// ============================================================================
+
+export type LithologyId = string;
+
+/** A named, coloured rock type. `kind` is provenance → editability (data-model §3):
+ *  air/unknown are fixed singletons; inferred is synced from a vein/intrusion body; user
+ *  is fully CRUD. */
+export interface Lithology {
+  id: LithologyId;
+  name: string;
+  color: string; // hex (e.g. "#a8794f"); "air" is rendered transparent
+  kind: "air" | "unknown" | "inferred" | "user";
+}
+
+/** The catalog + the many-to-one `(element, unit) → lithology` assignment. Assignment keys
+ *  are `${elementId}:${unitIndex}` (the core's volume coordinate). */
+export interface LithologyCatalog {
+  lithologies: Lithology[]; // includes the fixed Air + Unknown members
+  assignment: Record<string, LithologyId>; // key = `${elementId}:${unitIndex}`
+}
+
+/** The two fixed catalog members, present in every catalog (non-deletable). */
+export const AIR_ID: LithologyId = "air";
+export const UNKNOWN_ID: LithologyId = "unknown";
 
 /** One XYZ contact point on a surface. */
 export interface PointRow {
@@ -60,7 +88,7 @@ export type ProjectElement =
       id: string;
       name: string;
       relation: "erode" | "onlap" | "conformable";
-      unboundedAbove: boolean; // Axis B; true => the floor
+      unboundedAbove: boolean; // Axis B (DEPRECATED/inert — fill-upward is universal, feature 003 §3)
       interfaces: InterfaceData[]; // 1..n, one co-kriged field
     }
   | { kind: "vein"; id: string; name: string; footWall: InterfaceData; hangingWall: InterfaceData }
@@ -70,6 +98,15 @@ export type ProjectElement =
       name: string;
       envelopeInner: InterfaceData;
       envelopeOuter: InterfaceData; // equal to inner => a single envelope
+    }
+  | {
+      // The singleton topography surface (feature 003 §2). One interface — the ground; Air
+      // above it. Pinned youngest; the compile seam emits it first and the worker pins it
+      // via add_topography (insert-at-0), so its array position is robust.
+      kind: "topography";
+      id: string;
+      name: string;
+      ground: InterfaceData;
     };
 
 export interface Project {
@@ -77,6 +114,13 @@ export interface Project {
   name: string;
   extent: [number, number, number, number, number, number]; // [x0,x1,y0,y1,z0,z1]
   elements: ProjectElement[]; // YOUNGEST FIRST (matches add_* call order / SeriesJson order)
+  /** Optional per-UNIT display names (feature 003 §1), keyed `${elementId}:${unitIndex}`.
+   *  Units are DERIVED (not authored) — only their NAME is UI metadata. Absent ⇒ a default
+   *  "Unit N" label. Serialized so names round-trip with the project. */
+  unitNames?: Record<string, string>;
+  /** The lithology catalog + per-unit assignment (feature 003 §4). Optional so older saved
+   *  projects load; a fresh/loaded project without one gets the default catalog (US3). */
+  catalog?: LithologyCatalog;
 }
 
 /** Author-time validation (computed, never stored). DISTINCT from `CoreUpdate.derived.
@@ -150,7 +194,24 @@ function flattenInterfaces(interfaces: InterfaceData[]): Pick<
  *  project => identical SeriesJson[]. Precondition: validate(project).canApply (Apply is
  *  disabled otherwise) — a zero-point surface can't produce a meaningful SeriesJson. */
 export function toSeriesJson(project: Project): SeriesJson[] {
-  return project.elements.map((el) => {
+  // Topography is youngest regardless of its slot in `elements`: emit it first so the
+  // worker's add_topography (pinned index 0) and add_series (appended after) agree on order.
+  const ordered = [...project.elements].sort((a, b) => {
+    const at = a.kind === "topography" ? 0 : 1;
+    const bt = b.kind === "topography" ? 0 : 1;
+    return at - bt;
+  });
+  return ordered.map((el) => {
+    if (el.kind === "topography") {
+      return {
+        name: el.name,
+        relation: RELATION_CODE.erode, // ignored for topography
+        unboundedAbove: false, // ignored
+        ...flattenInterfaces([el.ground]),
+        ...NO_FAULT,
+        topography: true,
+      };
+    }
     if (el.kind === "series") {
       return {
         name: el.name,
@@ -218,9 +279,12 @@ export function validate(project: Project): ProjectValidation {
     } else if (el.kind === "vein") {
       checkInterface(el.id, el.footWall);
       checkInterface(el.id, el.hangingWall);
-    } else {
+    } else if (el.kind === "intrusion") {
       checkInterface(el.id, el.envelopeInner);
       checkInterface(el.id, el.envelopeOuter);
+    } else {
+      // topography — one ground surface
+      checkInterface(el.id, el.ground);
     }
   }
 

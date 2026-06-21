@@ -9,7 +9,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { HierarchyPanel, applyCoreUpdate, emptyState, type HierarchyState } from "./HierarchyPanel";
+import { HierarchyPanel, LithologyCatalog, VolumeVisibility, applyCoreUpdate, emptyState, type HierarchyState } from "./HierarchyPanel";
 import type { RelationDto } from "./HierarchyPanel/dto";
 import "./HierarchyPanel/hierarchy.css";
 import { Viewer } from "./Viewer";
@@ -38,10 +38,21 @@ import {
   reorderContainers,
   reorderWithin,
   findInterface,
+  hasTopography,
+  unitNameOf,
+  renameUnit,
+  catalogOf,
+  lithologyOf,
+  assignLithology,
+  addLithology,
+  updateLithology,
+  deleteLithology,
+  syncInferredLithologies,
+  indexedAssignment,
 } from "./HierarchyPanel/projectOps";
 import { AddSurfaceMenu } from "./HierarchyPanel/AddSurfaceMenu";
 import { SurfaceDataModal } from "./HierarchyPanel/SurfaceDataModal";
-import type { RunCommand, SurfacePayload, WorkerMessage } from "./protocol";
+import type { RenderMode, RunCommand, SurfacePayload, WorkerMessage } from "./protocol";
 
 function App() {
   const [project, setProject] = useState<Project>(() => loadProject() ?? blankProject());
@@ -49,6 +60,10 @@ function App() {
   const [applying, setApplying] = useState(false);
   const [state, setState] = useState<HierarchyState>(emptyState());
   const [surfaces, setSurfaces] = useState<SurfacePayload[]>([]);
+  const [renderMode, setRenderMode] = useState<RenderMode>("contact");
+  // Debug view controls (visual diagnosis).
+  const [wireframe, setWireframe] = useState(false);
+  const [hiddenKeys, setHiddenKeys] = useState<Set<string>>(new Set());
   const [status, setStatus] = useState<string>("idle");
   const [addMenuOpen, setAddMenuOpen] = useState(false);
   // Which interface the data modal is editing: { elementId, interfaceId } | null.
@@ -61,7 +76,7 @@ function App() {
 
   // (Re)spawn the worker and post a run for a given compiled stack. Hard-terminate
   // supersedes any in-flight fit (unchanged from feature 001).
-  function runStack(p: Project, onDone?: () => void) {
+  function runStack(p: Project, onDone?: () => void, mode: RenderMode = renderMode) {
     workerRef.current?.terminate();
     const worker = new Worker(new URL("./worker.ts", import.meta.url), { type: "module" });
     workerRef.current = worker;
@@ -85,9 +100,22 @@ function App() {
       series: toSeriesJson(p),
       extent: p.extent,
       maxDepth: 6,
-      renderMode: "contact",
+      renderMode: mode,
+      // Solid-mode lithology tags, keyed by (seriesIndex, unitIndex). The compile seam emits
+      // topography youngest, so series index == position in toSeriesJson output.
+      assignment: mode === "solid" ? indexedAssignment(p) : undefined,
     };
     worker.postMessage(cmd);
+  }
+
+  // The Surfaces⇄Solids toggle. NOTE (Principle IV coverage bound): the worker is
+  // terminate-and-refit per run (the existing hard-cancel design), so toggling re-FITS rather
+  // than re-meshing the held stack. The spec prefers re-mesh-without-refit; keeping a fitted
+  // WasmStack alive across messages is a larger worker change deferred here. The fit is
+  // deterministic so the result is identical — only the (one-time) cost differs.
+  function setRenderModeAndRerun(mode: RenderMode) {
+    setRenderMode(mode);
+    if (project.elements.length > 0 && validate(project).canApply) runStack(project, undefined, mode);
   }
 
   // Initial fit (if the loaded/seeded project has anything to fit).
@@ -103,9 +131,23 @@ function App() {
 
   // --- committed-edit helper: mutate the project, mark dirty, autosave ------------------
   function commit(next: Project) {
-    setProject(next);
+    // Reconcile inferred lithologies with the current bodies on every edit (idempotent):
+    // a vein/intrusion add/rename/delete syncs its inferred catalog entry (feature 003 §4.3).
+    const reconciled = syncInferredLithologies(next);
+    setProject(reconciled);
     setDirty(true);
+    saveProject(reconciled);
+  }
+
+  // A lithology/metadata edit is NOT a geometry change — it never needs a re-fit and must not
+  // gate behind Apply (no `dirty`). It saves immediately; in SOLID mode it re-meshes so the
+  // new colour/assignment shows (the tags are applied at mesh-collect time). (feature 003 §6.)
+  function commitLithology(next: Project) {
+    setProject(next);
     saveProject(next);
+    if (renderMode === "solid" && next.elements.length > 0 && validate(next).canApply) {
+      runStack(next, undefined, "solid");
+    }
   }
 
   // --- panel-level Apply / Cancel (the re-fit gate) -------------------------------------
@@ -136,24 +178,15 @@ function App() {
     saveProject(updated);
     runStack(updated); // immediate — never stale (dirty stays false)
   }
-  function setUnboundedAbove(elementId: string, v: boolean) {
-    const updated: Project = {
-      ...project,
-      elements: project.elements.map((el) =>
-        el.id === elementId && el.kind === "series" ? { ...el, unboundedAbove: v } : el,
-      ),
-    };
-    setProject(updated);
-    saveProject(updated);
-    runStack(updated);
-  }
 
   // --- Add surface (US1) ----------------------------------------------------------------
   function onPickType(type: SurfaceType) {
     setAddMenuOpen(false);
     const { project: next, openInterface } = addSurface(project, type);
     commit(next);
-    setEditing(openInterface); // immediately open the data modal for the new surface
+    // Open the data modal for the new surface (unless the add was a no-op, e.g. a guarded
+    // second topography returns an empty target).
+    if (openInterface.interfaceId) setEditing(openInterface);
   }
 
   // --- surface/series menu actions (US2) ------------------------------------------------
@@ -211,7 +244,10 @@ function App() {
     if (dirty && !window.confirm("Discard unapplied changes?")) return;
     action();
   }
-  function loadFreshProject(p: Project) {
+  function loadFreshProject(raw: Project) {
+    // Reconcile inferred lithologies with the loaded bodies (seed/import path): a vein/
+    // intrusion contributes its inferred catalog entry even on first load (feature 003 §4.3).
+    const p = syncInferredLithologies(raw);
     setProject(p);
     setDirty(false);
     saveProject(p);
@@ -245,7 +281,12 @@ function App() {
   const canExportObj = surfaces.length > 0 && !dirty;
   const onExportObj = () => {
     if (!canExportObj) return;
-    const obj = exportObj(surfaces);
+    // In solid mode, group by lithology (Air is never in `surfaces`, so no Air group).
+    const lithoNames =
+      renderMode === "solid"
+        ? Object.fromEntries(catalogOf(project).lithologies.map((l) => [l.id, l.name]))
+        : undefined;
+    const obj = exportObj(surfaces, lithoNames);
     const blob = new Blob([obj], { type: "text/plain" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
@@ -305,6 +346,23 @@ function App() {
             <button type="button" onClick={onExportObj} disabled={!canExportObj} data-testid="export-obj">
               Export OBJ
             </button>
+            <button
+              type="button"
+              data-testid="render-toggle"
+              title="Toggle between open contact surfaces and closed lithology solids"
+              onClick={() => setRenderModeAndRerun(renderMode === "contact" ? "solid" : "contact")}
+            >
+              {renderMode === "contact" ? "Surfaces ⇄ Solids" : "Solids ⇄ Surfaces"}
+            </button>
+            <label className="debug-toggle" title="Show triangle edges (mesh wireframe)">
+              <input
+                type="checkbox"
+                data-testid="wireframe-toggle"
+                checked={wireframe}
+                onChange={(e) => setWireframe(e.target.checked)}
+              />
+              edges
+            </label>
           </div>
         </div>
 
@@ -341,7 +399,6 @@ function App() {
           onMoveElement={onMoveElement}
           onMoveSurface={onMoveSurface}
           onSetRelation={setRelation}
-          onSetUnboundedAbove={setUnboundedAbove}
           onAddSurfaceClick={() => setAddMenuOpen(true)}
           onEditSurface={onEditSurface}
           onRenameSurface={onRenameSurface}
@@ -351,15 +408,60 @@ function App() {
           onAddInterface={onAddInterface}
           onRenameElement={onRenameElement}
           onDeleteElement={onDeleteElement}
+          unitName={(elementId, unitIndex, displayPos) => unitNameOf(project, elementId, unitIndex, displayPos)}
+          onRenameUnit={(elementId, unitIndex, name) => commitLithology(renameUnit(project, elementId, unitIndex, name))}
+          catalog={catalogOf(project).lithologies}
+          lithologyOf={(elementId, unitIndex) => lithologyOf(project, elementId, unitIndex)}
+          onAssignLithology={(elementId, unitIndex, id) => commitLithology(assignLithology(project, elementId, unitIndex, id))}
         />
 
         {addMenuOpen && (
-          <AddSurfaceMenu onPick={onPickType} onClose={() => setAddMenuOpen(false)} />
+          <AddSurfaceMenu
+            onPick={onPickType}
+            onClose={() => setAddMenuOpen(false)}
+            hasTopography={hasTopography(project)}
+          />
         )}
+
+        <LithologyCatalog
+          lithologies={catalogOf(project).lithologies}
+          onAdd={(name, color) => commitLithology(addLithology(project, name, color))}
+          onUpdate={(id, patch) => commitLithology(updateLithology(project, id, patch))}
+          onDelete={(id) => commitLithology(deleteLithology(project, id))}
+        />
+
+        <VolumeVisibility
+          surfaces={surfaces}
+          hiddenKeys={hiddenKeys}
+          onToggle={(key, visible) =>
+            setHiddenKeys((prev) => {
+              const next = new Set(prev);
+              if (visible) next.delete(key);
+              else next.add(key);
+              return next;
+            })
+          }
+          onShowAll={() => setHiddenKeys(new Set())}
+          catalog={Object.fromEntries(catalogOf(project).lithologies.map((l) => [l.id, l]))}
+          label={(s) =>
+            renderMode === "solid"
+              ? `${s.series}·${catalogOf(project).lithologies.find((l) => l.id === s.lithologyId)?.name ?? "Unknown"}` +
+                (s.unit !== undefined ? ` (unit ${s.unit})` : "")
+              : `series ${s.series} · iface ${s.interface}${s.block ? ` · blk ${s.block}` : ""}`
+          }
+        />
       </aside>
 
       <main>
-        <Viewer surfaces={surfaces} extent={project.extent} stale={dirty} />
+        <Viewer
+          surfaces={surfaces}
+          extent={project.extent}
+          stale={dirty}
+          colorBy={renderMode === "solid" ? "lithology" : "series"}
+          lithoColors={Object.fromEntries(catalogOf(project).lithologies.map((l) => [l.id, l.color]))}
+          wireframe={wireframe}
+          hiddenKeys={hiddenKeys}
+        />
       </main>
 
       {editing && editingIface && (

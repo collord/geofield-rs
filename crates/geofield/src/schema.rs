@@ -80,6 +80,13 @@ pub enum StackElementDto {
         name: String,
         surfaces: Vec<u32>,
     },
+    /// The singleton topography surface (`docs/topography_lithology_solids_spec.md` §2).
+    /// One interface (the ground); above it is Air. Carries no relation / `unbounded_above`.
+    Topography {
+        id: String,
+        name: String,
+        surfaces: Vec<u32>,
+    },
 }
 
 /// The **effective relationship** the core derives for display (design doc §6.6).
@@ -105,6 +112,19 @@ pub struct ContainerValidation {
     pub detail: String,
 }
 
+/// One derived volume's coordinate within an element — the `(elementId, index)` pair the
+/// UI keys lithology assignment on (`docs/topography_lithology_solids_spec.md` §5.1). The
+/// core supplies the coordinate only; lithology names/colours live UI-side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UnitInfo {
+    /// The mesher's stable unit coordinate within the element: index 0 is the BOTTOM slab
+    /// (below the lowest contact), index n the top. The `units` LIST is emitted top-first
+    /// (descending index) for the UI ladder, but this VALUE is the bottom-0 mesher index —
+    /// the stable `(elementId, index)` key for lithology assignment.
+    pub index: usize,
+}
+
 /// The read-only derived view the core returns each round-trip. The UI treats this
 /// as a cache; it NEVER recomputes any of it (FR-017, core-api.md invariant 1).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -117,6 +137,10 @@ pub struct DerivedView {
     /// Older elements each cross-cutting body cuts. Empty for every element in the
     /// MVP (series have no cut-set); present so the shape is stable for US2.
     pub cuts_below: Vec<(String, Vec<String>)>,
+    /// Per-element ordered unit list (`docs/topography_lithology_solids_spec.md` §5.1). The
+    /// volume coordinate the UI renders as the unit/contact ladder and keys lithology
+    /// assignment on. Derived (post-clip) count; the Air unit above topography is NOT listed.
+    pub units: Vec<(String, Vec<UnitInfo>)>,
 }
 
 /// The full core→UI update: canonical declared state + the derived view. (Meshes
@@ -155,6 +179,11 @@ impl<M: SeriesModel> Stack<M> {
                         name: format!("intrusion {i}"),
                         surfaces: it.model.interface_ids(),
                     },
+                    StackElement::Topography(t) => StackElementDto::Topography {
+                        id,
+                        name: format!("topography {i}"),
+                        surfaces: t.model.interface_ids(),
+                    },
                 }
             })
             .collect()
@@ -166,6 +195,7 @@ impl<M: SeriesModel> Stack<M> {
         use crate::stack::StackElement;
         let mut effective_relation = Vec::with_capacity(self.series.len());
         let mut validation = Vec::with_capacity(self.series.len());
+        let mut units = Vec::with_capacity(self.series.len());
         for (i, e) in self.series.iter().enumerate() {
             let id = i.to_string();
             let eff = match e {
@@ -186,6 +216,9 @@ impl<M: SeriesModel> Stack<M> {
                 }
                 // Cross-cutting bodies are derived cross-cuts (read-only chip in the UI).
                 StackElement::Vein(_) | StackElement::Intrusion(_) => EffectiveRelation::CrossCut,
+                // Topography reuses the erode clip mechanism and reads as Erode in the UI's
+                // effective-relation chip (it is the youngest erosional surface, §2.1).
+                StackElement::Topography(_) => EffectiveRelation::Erode,
             };
             effective_relation.push((id.clone(), eff));
 
@@ -201,11 +234,33 @@ impl<M: SeriesModel> Stack<M> {
                     },
                 },
             ));
+
+            // Per-element ordered unit list (§5.1). A series exposes its present units — now
+            // ALL of them, since fill-upward is universal (§3): a whole-model series with K
+            // interfaces has K+1 units. A cross-cutting body has one interior rock unit;
+            // topography NONE (its only unit is Air, which is never listed/meshed). This is
+            // the whole-model representative count (parallel to `interface_isovalues`); the
+            // per-block `present_unit_count` agrees by construction (it is now keep-all).
+            let n_ifaces = e.model().interface_isovalues().len();
+            let unit_count = match e {
+                StackElement::Series(_) if n_ifaces > 0 => n_ifaces + 1,
+                StackElement::Vein(_) | StackElement::Intrusion(_) if has_iface => 1,
+                _ => 0, // topography (Air only), or a field-less element
+            };
+            // Emit TOP-of-stack first (descending index): the mesher's unit index 0 is the
+            // BOTTOM slab (`isovalues` ascending → unit 0 below the lowest contact, unit n the
+            // top), so the UI ladder — youngest/top at the top — lists indices n..0. The
+            // `index` VALUE stays the core's stable mesher coordinate (the assignment key).
+            units.push((
+                id.clone(),
+                (0..unit_count).rev().map(|index| UnitInfo { index }).collect(),
+            ));
         }
         DerivedView {
             effective_relation,
             validation,
             cuts_below: Vec::new(), // populated by the ABI layer which has the domain box
+            units,
         }
     }
 
@@ -319,5 +374,46 @@ mod tests {
         };
         assert!(*unbounded_above && relation.is_none(), "the floor scenario element");
         assert_eq!(surfaces.len(), 3, "3-contact floor");
+    }
+
+    // ===== Feature 003: topography DTO + DerivedView.units =====
+
+    /// A legacy scenario carrying the now-DEPRECATED `unbounded_above` slot still parses,
+    /// either value, without error (§3.2, T014). The flag is accepted-but-ignored — its
+    /// presence in JSON must never be a parse failure for an existing serialized project.
+    #[test]
+    fn legacy_unbounded_above_slot_still_parses() {
+        for v in ["true", "false"] {
+            let json = format!(
+                r#"[{{"kind":"series","id":"0","name":"s","surfaces":[0],"relation":null,"unbounded_above":{v}}}]"#
+            );
+            let dtos: Vec<StackElementDto> =
+                serde_json::from_str(&json).expect("legacy unbounded_above must still parse");
+            assert!(matches!(dtos[0], StackElementDto::Series { .. }));
+        }
+    }
+
+    /// The topography DTO serializes/deserializes by its `kind` tag and the derived view
+    /// lists its (empty) unit set (§5.1, T009/T010). Topography carries no relation /
+    /// unbounded slot and contributes NO rock unit (its only unit is Air).
+    #[test]
+    fn topography_dto_and_units_shape() {
+        use crate::stack::{Stack, StackElement, StackedSeries, Topography};
+        let topo = StackElement::Topography(Topography { model: dipping_plane(900.0, 0.0, 0.0) });
+        let floor = StackedSeries::floor(dipping_plane(500.0, 0.0, 0.0));
+        let stack = Stack::new(vec![topo, floor.into()]);
+
+        let dtos = stack.to_dtos();
+        assert!(matches!(dtos[0], StackElementDto::Topography { .. }), "element 0 is topography");
+        // Round-trips by its kind tag.
+        let s = serde_json::to_string(&dtos[0]).unwrap();
+        assert!(s.contains("\"kind\":\"topography\""), "tagged 'topography': {s}");
+        let back: StackElementDto = serde_json::from_str(&s).unwrap();
+        assert!(matches!(back, StackElementDto::Topography { .. }));
+
+        // DerivedView.units: topography lists none; the floor lists its units.
+        let dv = stack.derived_view();
+        assert_eq!(dv.units[0].1.len(), 0, "topography contributes no rock unit (Air only)");
+        assert_eq!(dv.units[1].1.len(), 2, "1-contact floor exposes 2 units (universal fill-up)");
     }
 }

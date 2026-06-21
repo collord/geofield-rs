@@ -381,7 +381,7 @@ impl<M: BlockModel> MeshModel for M {
 
 /// The interfaces bounding lithology unit `u` (of `n` interfaces): the lower
 /// (`u-1`) and upper (`u`) contacts, each `None` at the bottom/top of the stack.
-fn bounding_contacts(u: usize, n: usize) -> [Option<usize>; 2] {
+pub(crate) fn bounding_contacts(u: usize, n: usize) -> [Option<usize>; 2] {
     [u.checked_sub(1), (u < n).then_some(u)]
 }
 
@@ -515,7 +515,7 @@ fn clip_mesh_to_plane(mesh: &mut Mesh, hs: &HalfSpace) {
 /// canonical vertex (full 3-D, so steep/raised-corner contacts weld correctly, not
 /// just height fields). Both adjacent units snap to the same canonical vertices, so the
 /// shared cap is identical.
-struct ContactHeightField {
+pub(crate) struct ContactHeightField {
     /// Canonical contact vertices (the surface-contoured contact), in a coarse spatial
     /// hash for nearest-vertex lookup.
     verts: Vec<[f64; 3]>,
@@ -526,7 +526,7 @@ struct ContactHeightField {
 }
 
 impl ContactHeightField {
-    fn build<M: MeshModel + ?Sized>(
+    pub(crate) fn build<M: MeshModel + ?Sized>(
         model: &M,
         b: usize,
         k: usize,
@@ -566,7 +566,7 @@ impl ContactHeightField {
 
     /// Snap each vertex of `mesh` within ~one cell of a canonical contact vertex onto
     /// that nearest canonical vertex (so both adjacent units land on the same surface).
-    fn weld(&self, mesh: &mut Mesh) {
+    pub(crate) fn weld(&self, mesh: &mut Mesh) {
         if self.verts.is_empty() {
             return;
         }

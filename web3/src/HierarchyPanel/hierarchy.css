@@ -30,10 +30,24 @@
 .validation-badge.warn { color: #c83; font-weight: 700; }
 .floor-chip { margin-left: auto; font-size: 0.8em; color: #769; }
 .derived-summary { font-size: 0.8em; color: #678; margin-top: 0.25rem; }
-.unbounded-toggle { display: block; font-size: 0.8em; margin-top: 0.25rem; }
-
 .surface-list { margin: 0.25rem 0 0; padding-left: 1rem; }
 .surface-node { font-size: 0.85em; color: #445; cursor: grab; }
+
+/* --- unit/contact ladder (feature 003 §1) ------------------------------- */
+.ladder { list-style: none; margin: 0.25rem 0 0; padding: 0; }
+.ladder .surface-node { padding-left: 1rem; } /* contacts indent under their units */
+.unit-node { font-size: 0.9em; }
+.unit-row { display: flex; align-items: center; gap: 0.4rem; padding: 0.1rem 0; }
+.unit-marker {
+  width: 0.7rem; height: 0.7rem; border-radius: 2px; flex: none;
+  border: 1px solid #bbc; background: #d8d8dd; /* default (unassigned/unknown) swatch */
+}
+.unit-name {
+  flex: 1; min-width: 0; font: inherit; padding: 0.1rem 0.3rem;
+  border: 1px solid transparent; border-radius: 3px; background: transparent;
+}
+.unit-name:hover, .unit-name:focus { border-color: #ccd; background: #fff; }
+.unit-litho { font-size: 0.85em; max-width: 9rem; }
 
 /* --- seam controls (Axis A) --------------------------------------------- */
 .seam { text-align: center; padding: 0.15rem 0; }
@@ -174,3 +188,28 @@
 .modal-summary { font-size: 0.8em; margin-right: auto; }
 .modal-summary.ok { color: #2a7; }
 .modal-summary.warn { color: #c83; }
+
+/* --- lithology catalog (feature 003 §4) --------------------------------- */
+.litho-catalog { margin-top: 0.75rem; border-top: 1px solid #dde; padding-top: 0.5rem; }
+.litho-catalog-head { font-size: 0.9em; margin-bottom: 0.3rem; }
+.litho-list { list-style: none; margin: 0; padding: 0; }
+.litho-item { display: flex; align-items: center; gap: 0.4rem; padding: 0.12rem 0; font-size: 0.85em; }
+.litho-swatch { width: 1.2rem; height: 1.2rem; padding: 0; border: 1px solid #bbc; border-radius: 3px; flex: none; cursor: pointer; }
+.litho-swatch:disabled { cursor: default; opacity: 0.7; }
+.litho-name { flex: 1; min-width: 0; font: inherit; padding: 0.1rem 0.3rem; border: 1px solid transparent; border-radius: 3px; background: transparent; }
+input.litho-name:hover, input.litho-name:focus { border-color: #ccd; background: #fff; }
+.litho-name.fixed { color: #556; }
+.litho-tag { color: #889; font-style: italic; }
+.litho-delete { border: none; background: transparent; cursor: pointer; color: #c0392b; padding: 0 0.2rem; }
+.litho-add { display: flex; align-items: center; gap: 0.4rem; margin-top: 0.4rem; }
+
+/* --- debug view controls (feature 003) ---------------------------------- */
+.debug-toggle { display: inline-flex; align-items: center; gap: 0.2rem; font-size: 0.75em; color: #556; }
+.volume-visibility { margin-top: 0.75rem; border-top: 1px solid #dde; padding-top: 0.5rem; }
+.volume-visibility-head { display: flex; justify-content: space-between; align-items: center; font-size: 0.9em; margin-bottom: 0.3rem; }
+.volume-visibility-head .show-all { font-size: 0.75em; padding: 0.1rem 0.4rem; border: 1px solid #bcd; border-radius: 4px; background: #f4f6fb; cursor: pointer; }
+.volume-list { list-style: none; margin: 0; padding: 0; }
+.volume-item { font-size: 0.8em; padding: 0.08rem 0; }
+.volume-item label { display: flex; align-items: center; gap: 0.4rem; cursor: pointer; }
+.volume-swatch { width: 0.9rem; height: 0.9rem; border-radius: 2px; border: 1px solid #bbc; flex: none; }
+.volume-label { color: #445; }

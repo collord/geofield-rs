@@ -33,6 +33,6 @@ export function applyCoreUpdate(update: CoreUpdate): HierarchyState {
 export function emptyState(): HierarchyState {
   return {
     model: [],
-    derived: { effectiveRelation: [], validation: [], cutsBelow: [] },
+    derived: { effectiveRelation: [], validation: [], cutsBelow: [], units: [] },
   };
 }

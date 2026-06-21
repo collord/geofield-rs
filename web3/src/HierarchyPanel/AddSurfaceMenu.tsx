@@ -12,9 +12,15 @@ const CHOICES: { type: SurfaceType; label: string; gloss: string }[] = [
   { type: "onlap", label: "Onlap", gloss: "laps onto and pinches out against older topography" },
   { type: "vein", label: "Vein", gloss: "tabular body that cross-cuts what it passes through" },
   { type: "intrusion", label: "Intrusion", gloss: "volumetric body that cross-cuts; fills its interior" },
+  { type: "topography", label: "Topography", gloss: "the ground surface; caps the model — Air above it" },
 ];
 
-export function AddSurfaceMenu(props: { onPick: (type: SurfaceType) => void; onClose: () => void }) {
+/** `hasTopography` disables the Topography choice (at most one per model, feature 003 §2.3). */
+export function AddSurfaceMenu(props: {
+  onPick: (type: SurfaceType) => void;
+  onClose: () => void;
+  hasTopography?: boolean;
+}) {
   return (
     <div className="add-surface-menu" data-testid="add-surface-menu" role="menu">
       <div className="add-surface-menu-head">
@@ -23,19 +29,27 @@ export function AddSurfaceMenu(props: { onPick: (type: SurfaceType) => void; onC
           ✕
         </button>
       </div>
-      {CHOICES.map((c) => (
-        <button
-          key={c.type}
-          type="button"
-          className="add-surface-choice"
-          data-type={c.type}
-          role="menuitem"
-          onClick={() => props.onPick(c.type)}
-        >
-          <span className="choice-label">{c.label}</span>
-          <span className="choice-gloss">{c.gloss}</span>
-        </button>
-      ))}
+      {CHOICES.map((c) => {
+        const disabled = c.type === "topography" && props.hasTopography === true;
+        return (
+          <button
+            key={c.type}
+            type="button"
+            className="add-surface-choice"
+            data-type={c.type}
+            role="menuitem"
+            disabled={disabled}
+            aria-disabled={disabled}
+            title={disabled ? "a model may have only one topography surface" : undefined}
+            onClick={() => !disabled && props.onPick(c.type)}
+          >
+            <span className="choice-label">{c.label}</span>
+            <span className="choice-gloss">
+              {disabled ? "already added — only one topography per model" : c.gloss}
+            </span>
+          </button>
+        );
+      })}
     </div>
   );
 }

@@ -242,40 +242,85 @@ impl<M: SeriesModel> Intrusion<M> {
     }
 }
 
-/// One element of a [`Stack`]'s chronology: a stratigraphic [`StackedSeries`], or a
-/// cross-cutting [`Vein`] / [`Intrusion`] (`docs/stack_hierarchy_spec.md` §3.1, Option A).
+/// One element of a [`Stack`]'s chronology: a stratigraphic [`StackedSeries`], a
+/// cross-cutting [`Vein`] / [`Intrusion`] (`docs/stack_hierarchy_spec.md` §3.1, Option A),
+/// or the singleton [`Topography`] surface that caps the model against Air
+/// (`docs/topography_lithology_solids_spec.md` §2).
 /// Lithology ([`Stack::global_unit`]) is uniform across kinds — youngest-present-wins —
-/// so the only kind-specific behaviour is `present_at` (band/interior vs. below-top) and
-/// the masker geometry a cross-cutting body contributes to older elements' Scenes.
+/// so the only kind-specific behaviour is `present_at` (band/interior vs. below-top vs.
+/// below-ground) and the masker geometry a cross-cutting / capping body contributes to
+/// older elements' Scenes.
 pub enum StackElement<M> {
     Series(StackedSeries<M>),
     Vein(Vein<M>),
     Intrusion(Intrusion<M>),
+    /// The ground surface. Pinned youngest (index 0), at most one per stack. Its single
+    /// interface is the ground; ABOVE it is Air (no rock), BELOW it everything older is
+    /// present. Mechanically the youngest erosional surface — it contributes the ABOVE-side
+    /// half-space ([`Masker::Halfspace`] `below=false`) to every older element, so each is
+    /// clipped to below the ground (`docs/topography_lithology_solids_spec.md` §2.1).
+    Topography(Topography<M>),
+}
+
+/// The ground surface that caps a [`Stack`] against Air (`docs/topography_lithology_solids_spec.md`
+/// §2). Owns one co-kriged field with a single interface; its upper unit is Air (never meshed
+/// as a solid), its lower side is "everything below, present". Reuses the erode clip mechanism.
+pub struct Topography<M> {
+    /// The fitted ground field. Its top interface isovalue is the ground contact.
+    pub model: M,
+}
+
+impl<M: SeriesModel> Topography<M> {
+    /// The ground contact isovalue (the single interface's isovalue), if fitted.
+    fn iso_ground(&self) -> Option<f64> {
+        self.model.interface_isovalues().last().copied()
+    }
+
+    /// Is rock present at `p`? Topography is present (rock below) where the ground field is
+    /// at-or-below the ground contact; ABOVE the ground (`field > iso`) is Air. Mirrors
+    /// [`StackedSeries::present_at`] (below its top contact), the erode convention.
+    fn present_at(&self, p: [f64; 3]) -> bool {
+        match self.iso_ground() {
+            Some(iso) => self.model.scalar_field(p) < iso,
+            None => false,
+        }
+    }
 }
 
 impl<M: SeriesModel> StackElement<M> {
-    /// Is this element's rock present at `p`? Dispatches to the kind's own test.
+    /// Is this element's rock present at `p`? Dispatches to the kind's own test. Topography
+    /// is "present" (caps the column) BELOW the ground — but it carries no rock of its own;
+    /// [`Stack::global_unit`] turns that presence into Air, never a topography lithology.
     pub fn present_at(&self, p: [f64; 3]) -> bool {
         match self {
             StackElement::Series(s) => s.present_at(p),
             StackElement::Vein(v) => v.present_at(p),
             StackElement::Intrusion(it) => it.present_at(p),
+            StackElement::Topography(t) => t.present_at(p),
         }
     }
 
-    /// The fitted model, for lithology lookup (uniform across kinds).
+    /// The fitted model, for lithology lookup (uniform across kinds). For topography this is
+    /// the ground field; it is used for its contact geometry, not for a rock lithology.
     pub fn model(&self) -> &M {
         match self {
             StackElement::Series(s) => &s.model,
             StackElement::Vein(v) => &v.model,
             StackElement::Intrusion(it) => &it.model,
+            StackElement::Topography(t) => &t.model,
         }
     }
 
-    /// `true` if this is a stratigraphic series (vs. a cross-cutting body). Cross-cutting
-    /// bodies are never the `unbounded_above` floor and carry no Axis-A relation.
+    /// `true` if this is a stratigraphic series (vs. a cross-cutting body or topography).
+    /// Cross-cutting bodies and topography are never the `unbounded_above` floor and carry
+    /// no Axis-A relation.
     pub fn is_series(&self) -> bool {
         matches!(self, StackElement::Series(_))
+    }
+
+    /// `true` if this is the singleton topography surface.
+    pub fn is_topography(&self) -> bool {
+        matches!(self, StackElement::Topography(_))
     }
 
     /// Borrow as a stratigraphic series, if it is one.
@@ -286,14 +331,15 @@ impl<M: SeriesModel> StackElement<M> {
         }
     }
 
-    /// Axis B — `true` only for an unbounded-above series; always `false` for a
-    /// cross-cutting body (which is bounded by its band/envelope).
+    /// Axis B (DEPRECATED, inert) — was `true` only for an unbounded-above series. Fill-upward
+    /// is now universal (`docs/topography_lithology_solids_spec.md` §3); nothing in the engine
+    /// branches on this any more. Retained for the legacy `floor()` constructor / tests only.
     pub fn unbounded_above(&self) -> bool {
         matches!(self, StackElement::Series(s) if s.unbounded_above)
     }
 
-    /// Axis A — the seam-below relation of a series (`None` for the floor or a
-    /// cross-cutting body, which has no seam-below).
+    /// Axis A — the seam-below relation of a series (`None` for the floor, a cross-cutting
+    /// body, or topography, which have no seam-below).
     pub fn relation(&self) -> Option<Relation> {
         match self {
             StackElement::Series(s) => s.relation,
@@ -379,17 +425,39 @@ impl<M: SeriesModel> Stack<M> {
 
     /// The lithology at `p`: `(element_index, unit_within_element)`.
     ///
-    /// Youngest-present-wins — the youngest element present at `p` claims it, and the
-    /// unit within it is its own single-field assignment ([`Model::lithology_unit`]).
-    /// An `unbounded_above` series is present everywhere (it fills upward until claimed);
-    /// a cross-cutting body is present in its band/interior. This rule is uniform across
-    /// element kinds (`docs/stack_hierarchy_spec.md` §3.4 — cross-cutting needs no special
-    /// lithology case). Returns `(len, 0)` only if no element is present.
+    /// Youngest-present-wins — the youngest element present at `p` claims it, and the unit
+    /// within it is its own single-field assignment ([`Model::lithology_unit`]). A series that
+    /// fills upward (the floor, and — once topography caps the model — any exposed series) is
+    /// present everywhere not claimed by a younger element; a bounded series is present below
+    /// its top contact; a cross-cutting body in its band/interior.
+    ///
+    /// Topography is the special cap and is evaluated FIRST regardless of its slot: ABOVE the
+    /// ground there is no rock — the result is the Air/void sentinel `(len, 0)`; BELOW the
+    /// ground topography is transparent (claims no lithology of its own), so evaluation
+    /// proceeds to the older elements. This is what makes "open sky vs. rock" a property of
+    /// the topographic surface, not a per-series flag (`docs/topography_lithology_solids_spec.md`
+    /// §2.2, §3). The `unbounded_above` short-circuit is retained ONLY for the floor's
+    /// fill-upward in topography-less (legacy) stacks; with topography present, the cap is
+    /// what bounds fill-upward. Returns `(len, 0)` for Air / no element present.
     pub fn global_unit(&self, p: [f64; 3]) -> (usize, usize) {
         for (i, e) in self.series.iter().enumerate() {
-            let unbounded = matches!(e, StackElement::Series(s) if s.unbounded_above);
-            if unbounded || e.present_at(p) {
-                return (i, e.model().lithology_unit(p));
+            match e {
+                // Topography never claims a lithology: above the ground → Air (stop, void);
+                // below the ground → transparent, defer to older elements (continue).
+                StackElement::Topography(t) => {
+                    if !t.present_at(p) {
+                        return (self.series.len(), 0); // Air, above the ground
+                    }
+                    // below ground: fall through to older elements
+                }
+                // A fill-upward series (the floor) is present everywhere not yet claimed; a
+                // bounded series / cross-cutting body claims only where it is present.
+                _ => {
+                    let fills_upward = matches!(e, StackElement::Series(s) if s.unbounded_above);
+                    if fills_upward || e.present_at(p) {
+                        return (i, e.model().lithology_unit(p));
+                    }
+                }
             }
         }
         (self.series.len(), 0)
@@ -414,9 +482,19 @@ impl<M: SeriesModel> Stack<M> {
     /// [`Masker::boundary`]) outlive them.
     fn clip_maskers(&self, i: usize) -> Vec<Masker<M::Field<'_>>> {
         let mut out = Vec::new();
-        // (1) Younger bodies clipping element `i` (erode / vein / intrusion).
+        // (1) Younger bodies clipping element `i` (topography / erode / vein / intrusion).
         for ej in &self.series[..i] {
             match ej {
+                // Topography is the youngest erosional surface: every older element survives
+                // only BELOW the ground. It caps the whole model against Air
+                // (`docs/topography_lithology_solids_spec.md` §2.1, §5.2). `below=true` keeps the
+                // older surface where the ground field is below the ground contact (`field < iso`),
+                // mirroring `Topography::present_at` (rock below ground).
+                StackElement::Topography(t) => {
+                    if let Some(iso) = t.iso_ground() {
+                        out.push(Masker::Halfspace { field: t.model.field(), iso, below: true });
+                    }
+                }
                 // A younger erode series: older survives ABOVE its top contact (`field > iso`).
                 StackElement::Series(sj) if sj.relation == Some(Relation::Erode) => {
                     if let Some(iso_top) = sj.iso_top() {
@@ -637,10 +715,11 @@ impl<M: SeriesModel + BlockModel> Stack<M> {
         Some(mesh)
     }
 
-    /// Mesh ONE wall of a CROSS-CUTTING body (vein or intrusion) at element `i` as an open
-    /// contact sheet — the body's OWN surface, clipped to the extent box and to any YOUNGER
-    /// cross-cutting body above it (the same `clip_maskers(i)` an older series gets). Returns
-    /// `None` if `i` is not a cross-cutting body, or `interface_idx`/the field is out of range.
+    /// Mesh ONE surface of a NON-SERIES element (a cross-cutting vein/intrusion wall, or the
+    /// topography ground contact, feature 003) at element `i` as an open contact sheet — the
+    /// element's OWN surface, clipped to the extent box and to any YOUNGER element above it
+    /// (the same `clip_maskers(i)` an older series gets). Returns `None` if `i` IS a
+    /// stratigraphic series (use `mesh_one*`), or `interface_idx`/the field is out of range.
     ///
     /// This lifts the feature-001 logged punt ("the cross-cutting body's OWN 3D surface mesh
     /// is a follow-up — `mesh_one_block` is series-only"): the body's lithology/cut-set/masker
@@ -676,6 +755,65 @@ impl<M: SeriesModel + BlockModel> Stack<M> {
         Some(octree_dual_contour_scene(&scene, min, size, cfg))
     }
 
+    /// Mesh the closed, watertight INTERIOR SOLID of a cross-cutting body (vein/intrusion) at
+    /// element `i` (`docs/topography_lithology_solids_spec.md` §4.3/§5 — the body's namesake
+    /// lithology volume). The interior is the band `lo < field < hi` (vein / shell intrusion)
+    /// or `field < iso` (single-envelope intrusion); the closed solid is the primary isosurface
+    /// at the upper bound, capped below by the lower bound (if any), the box, and every YOUNGER
+    /// element's clip (so the body is itself truncated by topography / a younger cross-cut).
+    /// Returns `None` for a stratigraphic series (use `mesh_one_block_unit_solid`) or topography.
+    pub fn mesh_cross_cut_solid(
+        &self,
+        i: usize,
+        min: [f64; 3],
+        size: f64,
+        ext_max: [f64; 3],
+        cfg: OctreeConfig,
+    ) -> Option<Mesh> {
+        // The interior bounds (upper iso, optional lower iso) for each cross-cutting kind.
+        let (upper_iso, lower_iso): (f64, Option<f64>) = match self.series.get(i)? {
+            StackElement::Vein(v) => {
+                let (lo, hi) = v.band()?;
+                (hi, Some(lo))
+            }
+            StackElement::Intrusion(it) => {
+                let isos = it.model.interface_isovalues();
+                match it.envelope {
+                    Envelope::Single(k) => (*isos.get(k)?, None), // interior = field < iso
+                    Envelope::Shell { inner, outer } => {
+                        let (a, b) = (*isos.get(inner)?, *isos.get(outer)?);
+                        let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+                        (hi, Some(lo))
+                    }
+                }
+            }
+            _ => return None, // series / topography
+        };
+
+        let e = self.series.get(i)?;
+        let field = e.model().field();
+        let box_b = AxisBox::from_bounds(min, ext_max);
+        // The lower cap: keep the interior ABOVE the lower contact (`field > lo`).
+        let lower: Option<ContactHalfSpace> =
+            lower_iso.map(|lo| ContactHalfSpace::new(&field, lo, false));
+        // Younger elements (incl. topography) clip this body too.
+        let masker_fields = self.clip_maskers(i);
+        let maskers: Vec<Box<dyn Boundary + '_>> = masker_fields.iter().map(|m| m.boundary()).collect();
+
+        let mut contributors: Vec<&dyn Boundary> = Vec::with_capacity(maskers.len() + 2);
+        contributors.push(&box_b);
+        if let Some(lo) = &lower {
+            contributors.push(lo);
+        }
+        for m in &maskers {
+            contributors.push(m.as_ref());
+        }
+
+        let cfg = OctreeConfig { cap: true, ..cfg };
+        let scene = Scene::new(&field, upper_iso, contributors);
+        Some(octree_dual_contour_scene(&scene, min, size, cfg))
+    }
+
     /// Number of lithology UNIT solids in block `b` of series `i` (`interfaces + 1`, 0 if
     /// field-less or out of range). This counts EVERY unit including the topmost — for the
     /// renderable (rock-present) units use [`Stack::present_unit_count`].
@@ -702,24 +840,25 @@ impl<M: SeriesModel + BlockModel> Stack<M> {
     ///     and with it the volume that daylights against that erosion. So an unbounded-above
     ///     series keeps ALL its units → `block_unit_count`.
     ///
-    /// This branches on `unbounded_above` — the one honest property — not on a relation
-    /// variant. The old code keyed on `Relation::Basement`, which coincided with
-    /// `unbounded_above` only at the bottom of the stack; keying on it directly removes
-    /// the latent bug where a floor mislabelled `Conformable` dropped its top unit.
+    /// **Fill-upward is now universal** (`docs/topography_lithology_solids_spec.md` §3):
+    /// every series keeps ALL its units, and clipping — younger erosions, cross-cutting
+    /// bodies, and topography (all already applied by [`Stack::clip_maskers`] when the unit
+    /// solid is meshed) — removes the parts that are not rock. The old `unbounded_above`
+    /// branch (drop the top "void" unit for a bounded series) is GONE: that void is no longer
+    /// a per-series property but is supplied by the cap above (topography → Air, or a younger
+    /// element). The floor's long-standing keep-all behaviour is now every series' behaviour;
+    /// the top unit daylights against whatever caps it, exactly as the floor's already did.
+    ///
+    /// `unbounded_above` is therefore **inert here** — this function no longer reads it
+    /// (staged deprecation: the slot is retained-but-ignored, §3.2). In a topography-less
+    /// stack a formerly-bounded series' top unit fills to the box ceiling, which is the
+    /// honest "no ground surface defined yet" state.
     ///
     /// Returns 0 for a field-less block.
     pub fn present_unit_count(&self, i: usize, b: usize) -> usize {
-        let n = self.block_unit_count(i, b);
-        if n == 0 {
-            return 0;
-        }
-        match self.series_at(i) {
-            // An unbounded-above series owns the column above its top contact, so its
-            // topmost unit is rock — keep every unit.
-            Some(s) if s.unbounded_above => n,
-            // A bounded series' topmost unit is the void above its bounding contact.
-            _ => n - 1,
-        }
+        // Keep every unit, every series. Clipping (incl. topography) decides where each has
+        // volume; the cap above supplies the void, so no unit is dropped at the count level.
+        self.block_unit_count(i, b)
     }
 
     /// Mesh ONE lithology UNIT of block `b` of series `i` as a watertight CLOSED solid —
@@ -794,7 +933,18 @@ impl<M: SeriesModel + BlockModel> Stack<M> {
 
         let cfg = OctreeConfig { cap: true, ..cfg };
         let scene = Scene::new(&block_field, upper_iso, contributors);
-        Some(octree_dual_contour_scene(&scene, min, size, cfg))
+        let mut mesh = octree_dual_contour_scene(&scene, min, size, cfg);
+
+        // WELD the unit's shared contact caps onto the canonical contact surfaces, so adjacent
+        // units land on the SAME surface and don't leave a sub-cell gap at their shared contact
+        // (the dual-contour quantization that read as a horizontal seam in the web3 solid view).
+        // Mirrors `Model::mesh_block_unit_solids`' weld, but here on the stack-CLIPPED unit so
+        // topography/cross-cut clips are preserved. Welds only the bounding contacts of this
+        // unit (`u-1` lower, `u` upper); the box/erosion cap faces are untouched.
+        for &k in crate::bounding_contacts(unit, n).iter().flatten() {
+            crate::ContactHeightField::build(&s.model, b, k, min, size, cfg).weld(&mut mesh);
+        }
+        Some(mesh)
     }
 }
 
@@ -1107,7 +1257,7 @@ mod tests {
     /// contact (pole pointing down), so the older floor survives BELOW the unconformity and
     /// is truncated at it — NOT erased down the whole column. This pins the geology the web3
     /// `erosional-unconformity` scenario relies on (the deposit-above fix). Contrast
-    /// `floor_keeps_topmost_unit_which_daylights`, which uses the deposit-BELOW basalt.
+    /// `every_series_keeps_all_units_and_floor_top_daylights`, which uses the deposit-BELOW basalt.
     #[test]
     fn erode_deposit_above_truncates_floor_at_unconformity() {
         // Basalt contact z = 650 + 0.4(x-500); pole DOWN so basalt is present ABOVE it.
@@ -1388,38 +1538,40 @@ mod tests {
         ])
     }
 
-    /// THE missing-volume regression, re-keyed onto `unbounded_above` (the two-axis
-    /// migration). An `unbounded_above` floor's topmost lithology unit is real rock (the
-    /// slab between its highest internal contact and the eroding surface), so
-    /// [`Stack::present_unit_count`] must KEEP it — for a BOUNDED series the topmost unit is
-    /// a void and is dropped, but applying that drop to the floor deletes the very slab
-    /// that daylights against the erosion, which read as "missing volumes" in the web2
-    /// solid view. This test pins the keep on `unbounded_above` directly — NOT on the old
-    /// `Relation::Basement` proxy — and guards the latent bug the migration closes: a floor
-    /// mislabelled as bounded would silently drop its top unit.
+    /// THE missing-volume regression, now under **universal fill-upward**
+    /// (`docs/topography_lithology_solids_spec.md` §3). Every series keeps ALL its units —
+    /// the floor always did (its topmost unit is the rock slab that daylights against the
+    /// eroding surface), and that keep-all is now every series' behaviour. The old "a bounded
+    /// series drops its topmost void unit" rule is GONE: that void is no longer a per-series
+    /// property but is supplied by the cap above (a younger erosion here; topography in the
+    /// full model). [`Stack::present_unit_count`] therefore equals [`Stack::block_unit_count`]
+    /// for every series, and `unbounded_above` is inert in that decision. The geometric
+    /// guarantee that actually mattered — the floor's top slab meshes with volume and
+    /// daylights ON the erosion contact — is unchanged and still pinned below.
     #[test]
-    fn floor_keeps_topmost_unit_which_daylights() {
+    fn every_series_keeps_all_units_and_floor_top_daylights() {
         let stack = basement_under_erosion();
         let cfg = OctreeConfig { max_depth: 6, min_depth: 2, qef_threshold: 1e-6, cap: true };
         let ext = [1000.0, 1000.0, 1000.0];
 
-        // Series 1 is the floor: it is the honest property under test.
-        assert!(stack.series[1].unbounded_above(), "series 1 must be the unbounded-above floor");
+        // Series 1 is the floor (its `unbounded_above` slot is now inert for the unit count,
+        // but still marks the fill-upward series in `global_unit` for a topography-less stack).
+        assert!(stack.series[1].unbounded_above(), "series 1 is the (legacy) fill-upward floor");
         assert_eq!(stack.series[1].relation(), None, "the floor has no Axis-A relation");
 
-        // 3 interfaces ⇒ 4 units, and ALL are present (none is a void). A bounded series
-        // drops its top unit; an unbounded-above floor must not.
+        // 3 interfaces ⇒ 4 units; under universal fill-upward EVERY series keeps all units.
         assert_eq!(stack.block_unit_count(1, 0), 4, "3-contact floor has 4 units");
         assert_eq!(
             stack.present_unit_count(1, 0),
             4,
-            "an unbounded-above floor keeps ALL units (its top unit is rock, not a void)"
+            "universal fill-upward: the floor keeps ALL units (top unit is rock, not a void)"
         );
-        // The younger Erode series (index 0) DOES drop its top void unit.
+        // The younger Erode series now ALSO keeps all its units (clipping, not the count,
+        // removes the part above the erosion); the flag no longer drops its top unit.
         assert_eq!(
             stack.present_unit_count(0, 0),
-            stack.block_unit_count(0, 0) - 1,
-            "a younger-bounded series still drops its topmost (void) unit"
+            stack.block_unit_count(0, 0),
+            "universal fill-upward: a younger series keeps its topmost unit too (clip-driven)"
         );
 
         // The basement's topmost unit (index 3) is the slab that daylights against the
@@ -1800,5 +1952,189 @@ mod tests {
             (a - b).abs() < 40.0,
             "termination should be depth-stable (at the crease), got x={a:.0} (d6) vs x={b:.0} (d7)"
         );
+    }
+
+    // ===== Topography, universal fill-upward, and unit derivation (feature 003) =====
+
+    /// Build a `Topography` element from a flat ground plane at `z = z_ground`.
+    fn topography_at(z_ground: f64) -> StackElement<Model> {
+        StackElement::Topography(Topography { model: dipping_plane(z_ground, 0.0, 0.0) })
+    }
+
+    /// **Inert-flag ORACLE** (`docs/topography_lithology_solids_spec.md` §3.2, SC-009): a
+    /// series with `unbounded_above = false` AND nothing younger capping it still fills
+    /// upward. This pins the NEW universal default (not a self-consistency guard): the flag
+    /// is dead in the keep/drop decision — every series keeps all its units regardless of it.
+    #[test]
+    fn bounded_series_with_no_cap_still_fills_upward() {
+        // A single "bounded" series (unbounded_above=false), no younger element above it.
+        let bounded = StackedSeries::new(dipping_plane(500.0, 0.0, 0.0), Relation::Conformable);
+        assert!(!bounded.unbounded_above, "fixture: the series is flagged bounded");
+        let stack = Stack::new(vec![bounded.into()]);
+
+        // Universal fill-upward: it keeps ALL its units (1 interface ⇒ 2 units), exactly as a
+        // floor would — the flag no longer drops the top unit.
+        assert_eq!(stack.block_unit_count(0, 0), 2, "1-contact series has 2 units");
+        assert_eq!(
+            stack.present_unit_count(0, 0),
+            2,
+            "a bounded series with no younger cap keeps ALL units (the flag is inert)"
+        );
+    }
+
+    /// Topography caps the model: ABOVE the ground `global_unit` is the Air/void sentinel
+    /// `(len, 0)`; BELOW the ground the older series claims the point. (§2.2, SC-001.)
+    #[test]
+    fn topography_caps_to_air_above_and_rock_below() {
+        // Floor with contacts ~300/500/700; ground plane at z=600 cuts through it.
+        let basement = {
+            let mut sps = Vec::new();
+            for (id, z0) in [(0u32, 300.0), (1, 500.0), (2, 700.0)] {
+                for i in 0..4 {
+                    for j in 0..4 {
+                        sps.push(SurfacePoint::new([i as f64 * 300.0 + 50.0, j as f64 * 300.0 + 50.0, z0], id));
+                    }
+                }
+            }
+            let oris = vec![Orientation::new([500.0, 500.0, 500.0], [0.0, 0.0, 1.0])];
+            Model::fit(&Series::new(sps, oris), KernelOptions::default())
+        };
+        let stack = Stack::new(vec![topography_at(600.0), StackedSeries::floor(basement).into()]);
+
+        // Topography is youngest (index 0) and the floor index 1.
+        assert!(stack.series[0].is_topography(), "topography pinned youngest");
+
+        // Well above the ground → Air (void sentinel = stack length).
+        let (air_elem, _) = stack.global_unit([500.0, 500.0, 950.0]);
+        assert_eq!(air_elem, stack.len(), "above the ground surface is Air (no rock)");
+
+        // Well below the ground → the floor (index 1) claims it (some rock unit).
+        let (rock_elem, _) = stack.global_unit([500.0, 500.0, 100.0]);
+        assert_eq!(rock_elem, 1, "below the ground surface the floor's rock is present");
+    }
+
+    /// `DerivedView.units` exposes the per-element ordered unit coordinates (§5.1, SC-002):
+    /// a K-contact series → K+1 units; topography → none (Air only); coordinates are stable
+    /// `(elementId, index)`. Pins the contract the UI ladder + lithology assignment read.
+    #[test]
+    fn derived_units_lists_per_element_coordinates() {
+        let basement = {
+            let mut sps = Vec::new();
+            for (id, z0) in [(0u32, 300.0), (1, 500.0), (2, 700.0)] {
+                for i in 0..4 {
+                    for j in 0..4 {
+                        sps.push(SurfacePoint::new([i as f64 * 300.0 + 50.0, j as f64 * 300.0 + 50.0, z0], id));
+                    }
+                }
+            }
+            let oris = vec![Orientation::new([500.0, 500.0, 500.0], [0.0, 0.0, 1.0])];
+            Model::fit(&Series::new(sps, oris), KernelOptions::default())
+        };
+        let stack = Stack::new(vec![topography_at(900.0), StackedSeries::floor(basement).into()]);
+        let dv = stack.derived_view();
+
+        // Two elements present as keys; order parallels the model (topography id "0", floor "1").
+        assert_eq!(dv.units.len(), 2, "every element appears in units");
+        assert_eq!(dv.units[0].0, "0");
+        assert_eq!(dv.units[0].1.len(), 0, "topography lists NO unit (its only unit is Air)");
+        assert_eq!(dv.units[1].0, "1");
+        assert_eq!(dv.units[1].1.len(), 4, "a 3-contact floor exposes 4 units (universal fill-up)");
+        // The list is emitted TOP-first (descending mesher index) for the UI ladder: the
+        // top slab (index n) leads, the bottom slab (index 0) trails. The `index` VALUE is the
+        // stable bottom-0 mesher coordinate (the assignment key), just listed top→bottom.
+        let idxs: Vec<usize> = dv.units[1].1.iter().map(|u| u.index).collect();
+        assert_eq!(idxs, vec![3, 2, 1, 0], "units listed top-first; index 0 is the bottom slab");
+    }
+
+    /// **The multi-clip watertightness case** (`docs/topography_lithology_solids_spec.md` §5.2,
+    /// SC-005, T039): a floor unit capped by TOPOGRAPHY above, bounded by its floor contact
+    /// below, AND punched through by an INTRUSION must mesh as a closed, watertight solid — no
+    /// holes (open edges == 0), manifold edges (incidence > 2 count == 0). The masker stack
+    /// (topography Halfspace + intrusion exterior + the lower contact) all apply at once; this
+    /// pins that the combined CSG stays crack-free. The brief said "don't pre-solve — add the
+    /// test and let it tell us"; this is that test.
+    #[test]
+    fn topography_capped_intrusion_punched_unit_is_watertight() {
+        let basement = {
+            let mut sps = Vec::new();
+            for (id, z0) in [(0u32, 300.0), (1, 500.0), (2, 700.0)] {
+                for i in 0..4 {
+                    for j in 0..4 {
+                        sps.push(SurfacePoint::new([i as f64 * 300.0 + 50.0, j as f64 * 300.0 + 50.0, z0], id));
+                    }
+                }
+            }
+            let oris = vec![Orientation::new([500.0, 500.0, 500.0], [0.0, 0.0, 1.0])];
+            Model::fit(&Series::new(sps, oris), KernelOptions::default())
+        };
+        // An intrusion (single envelope) cutting vertically through the centre of the domain.
+        let intrusion = Intrusion::new(dipping_plane(500.0, 0.0, 0.0), Envelope::Single(0));
+        // Stack youngest→oldest: topography (caps at z=650), intrusion, floor.
+        let stack = Stack::new(vec![
+            topography_at(650.0),
+            StackElement::Intrusion(intrusion),
+            StackedSeries::floor(basement).into(),
+        ]);
+
+        let cfg = OctreeConfig { max_depth: 6, min_depth: 2, qef_threshold: 1e-6, cap: true };
+        let ext = [1000.0, 1000.0, 1000.0];
+        // The floor is element 2 (topography 0, intrusion 1). Mesh ALL its unit solids — each
+        // is simultaneously topography-capped, intrusion-punched, and floor-bounded.
+        let units = stack.block_unit_count(2, 0);
+        assert!(units >= 2, "the floor should expose ≥2 unit slabs");
+
+        let mut total_tris = 0usize;
+        for u in 0..units {
+            let mesh = stack
+                .mesh_one_block_unit_solid(2, 0, u, [0.0, 0.0, 0.0], 1000.0, ext, cfg)
+                .expect("floor unit in range");
+            if mesh.triangle_count() == 0 {
+                continue; // a unit fully clipped away in the visible region
+            }
+            total_tris += mesh.triangle_count();
+            let (nm, open, total) = edge_stats(&mesh);
+            assert_eq!(nm, 0, "unit {u}: non-manifold {nm}/{total} (multi-clip CSG cracked)");
+            assert_eq!(open, 0, "unit {u}: not watertight, open {open}/{total} (a hole)");
+        }
+        assert!(total_tris > 0, "the multi-clip floor units produced no geometry");
+    }
+
+    /// A cross-cutting body's INTERIOR SOLID (`mesh_cross_cut_solid`, feature 003 §4.3/§5)
+    /// meshes as a closed, watertight body — the namesake-lithology volume that renders in the
+    /// web3 solid view. A vein's interior is its band `lo < field < hi`; the closed solid must
+    /// be manifold (no holes), and clipped by the box (and any younger element).
+    #[test]
+    fn cross_cut_interior_solid_is_watertight() {
+        // A vertical vein band (foot wall x=400, hanging wall x=600) cutting the domain.
+        let wall = |x0: f64| {
+            let sps = vec![
+                SurfacePoint::new([x0, 500.0, 200.0], 0),
+                SurfacePoint::new([x0, 500.0, 800.0], 0),
+            ];
+            let oris = vec![Orientation::new([x0, 500.0, 500.0], [1.0, 0.0, 0.0])];
+            Model::fit(&Series::new(sps, oris), KernelOptions::default())
+        };
+        // One co-kriged field from both walls (ids 0 = foot, 1 = hanging): build a 2-interface model.
+        let mut sps = Vec::new();
+        for (id, x0) in [(0u32, 400.0), (1u32, 600.0)] {
+            sps.push(SurfacePoint::new([x0, 200.0, 500.0], id));
+            sps.push(SurfacePoint::new([x0, 800.0, 500.0], id));
+        }
+        let oris = vec![Orientation::new([500.0, 500.0, 500.0], [1.0, 0.0, 0.0])];
+        let vein_model = Model::fit(&Series::new(sps, oris), KernelOptions::default());
+        let _ = wall; // (single-wall helper kept for clarity; the 2-interface model is used)
+
+        let stack = Stack::new(vec![
+            StackElement::Vein(Vein::new(vein_model, 0, 1)),
+            StackedSeries::floor(dipping_plane(500.0, 0.0, 0.0)).into(),
+        ]);
+        let cfg = OctreeConfig { max_depth: 6, min_depth: 2, qef_threshold: 1e-6, cap: true };
+        let solid = stack
+            .mesh_cross_cut_solid(0, [0.0, 0.0, 0.0], 1000.0, [1000.0, 1000.0, 1000.0], cfg)
+            .expect("vein interior solid");
+        assert!(solid.triangle_count() > 0, "the vein interior produced no geometry");
+        let (nm, open, total) = edge_stats(&solid);
+        assert_eq!(nm, 0, "vein interior non-manifold {nm}/{total}");
+        assert_eq!(open, 0, "vein interior not watertight, open {open}/{total}");
     }
 }

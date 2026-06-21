@@ -10,13 +10,14 @@ test("reordering two containers changes the panel order and re-fits on Apply", a
   await page.getByTestId("seed-template").selectOption("erosional-unconformity");
   await expect(page.getByText("status: done")).toBeVisible({ timeout: 30_000 });
 
-  // Two containers, youngest first: the "basalt" erosion series (a SINGLETON, rendered flat
-  // as its interface "erosion surface") then the "sediments" floor series (nested beds).
+  // Two containers, youngest first: the "basalt" erosion series (its contact "erosion
+  // surface") then the "sediments" floor series. Both now render as unit/contact ladders
+  // (feature 003 §1), so the first CONTAINER header is the youngest element.
   const namesBefore = await page.locator(".container-name, .surface-name").allTextContents();
   expect(namesBefore.join(" ")).toContain("erosion surface");
   expect(namesBefore.join(" ")).toContain("sediments");
-  // Youngest (top) is the erosion surface.
-  expect(namesBefore[0]).toContain("erosion surface");
+  // Youngest (top) container is the erosion series ("basalt"), above "sediments".
+  expect(namesBefore.indexOf("basalt")).toBeLessThan(namesBefore.indexOf("sediments"));
 
   // Read the element ids in render order, then swap the two via the wired callback.
   const ids = await page.locator("[data-element-id]").evaluateAll((els) =>
@@ -45,14 +46,14 @@ test("reordering two containers changes the panel order and re-fits on Apply", a
 
 test("the up/down reorder buttons change top-level chronology and re-fit on Apply", async ({ page }) => {
   // The CLICK affordance for reorder (drag-and-drop is unbuilt). Unlike the test-hook reorder
-  // above, this drives the real UI buttons. Two elements youngest-first: "erosion surface"
-  // (singleton, flat) then "sediments" (floor).
+  // above, this drives the real UI buttons. Two elements youngest-first: the "basalt" erosion
+  // series then "sediments" (floor) — both rendered as unit/contact ladders (feature 003 §1).
   await page.goto("/");
   await page.getByTestId("seed-template").selectOption("erosional-unconformity");
   await expect(page.getByText("status: done")).toBeVisible({ timeout: 30_000 });
 
   const before = await page.locator(".container-name, .surface-name").allTextContents();
-  expect(before[0]).toContain("erosion surface");
+  expect(before.indexOf("basalt")).toBeLessThan(before.indexOf("sediments"));
 
   // The youngest element's ▲ is disabled (already at the top); its ▼ moves it down.
   await expect(page.getByTestId("reorder-up").first()).toBeDisabled();

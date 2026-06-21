@@ -1,6 +1,7 @@
 // Minimal three.js viewer for the testbed: renders the streamed surfaces (one mesh per
 // SurfacePayload), with user-driven orbit controls and labeled X/Y/Z axes spanning the
-// data's bounding box. Adapted/simplified from web/src/Viewer.tsx. Color is by series index.
+// data's bounding box. Adapted/simplified from web/src/Viewer.tsx. Colour is by series index
+// in contact mode, or by lithology (from the catalog) in solid mode — see `colorBy` (feature 003).
 
 import { useEffect, useRef } from "react";
 import * as THREE from "three";
@@ -64,7 +65,30 @@ function buildAxes(extent: Extent): THREE.Group {
   return g;
 }
 
-export function Viewer(props: { surfaces: SurfacePayload[]; extent: Extent; stale?: boolean }) {
+/** Convert a "#rrggbb" hex string to a three.js numeric colour. */
+function hexToNum(hex: string): number {
+  return parseInt(hex.replace("#", ""), 16) || 0x888888;
+}
+
+/** A stable key for one rendered payload, for per-volume visibility (debug). Solid mode keys
+ *  by `(series, unit)`; contact mode by `(series, block, interface)`. */
+export function surfaceKey(s: SurfacePayload): string {
+  return s.unit !== undefined ? `${s.series}:${s.unit}` : `${s.series}:${s.block}:${s.interface}`;
+}
+
+export function Viewer(props: {
+  surfaces: SurfacePayload[];
+  extent: Extent;
+  stale?: boolean;
+  /** "series" (contact mode, default) or "lithology" (solid mode). */
+  colorBy?: "series" | "lithology";
+  /** lithology id → hex colour (for colorBy="lithology"). */
+  lithoColors?: Record<string, string>;
+  /** Debug: draw triangle edges over each mesh. */
+  wireframe?: boolean;
+  /** Debug: surface keys (see `surfaceKey`) to HIDE. Absent/empty ⇒ show all. */
+  hiddenKeys?: Set<string>;
+}) {
   const mountRef = useRef<HTMLDivElement | null>(null);
   const stateRef = useRef<{
     renderer: THREE.WebGLRenderer;
@@ -140,19 +164,34 @@ export function Viewer(props: { surfaces: SurfacePayload[]; extent: Extent; stal
     const st = stateRef.current;
     if (!st) return;
     st.group.clear();
+    const byLithology = props.colorBy === "lithology";
+    const hidden = props.hiddenKeys;
     for (const s of props.surfaces) {
+      if (hidden && hidden.has(surfaceKey(s))) continue; // per-volume visibility (debug)
       const geom = new THREE.BufferGeometry();
       geom.setAttribute("position", new THREE.BufferAttribute(s.positions, 3));
       geom.setAttribute("normal", new THREE.BufferAttribute(s.normals, 3));
       geom.setIndex(new THREE.BufferAttribute(s.indices, 1));
-      const mat = new THREE.MeshStandardMaterial({
-        color: SERIES_COLORS[s.series % SERIES_COLORS.length],
-        side: THREE.DoubleSide,
-        flatShading: true,
-      });
+      // Solid mode: colour each unit solid by its assigned lithology (Air is never emitted,
+      // so there is nothing transparent to draw). Contact mode: colour by series index.
+      const color =
+        byLithology && s.lithologyId && props.lithoColors?.[s.lithologyId] !== undefined
+          ? hexToNum(props.lithoColors[s.lithologyId])
+          : byLithology
+            ? 0xc8c8cd // Unknown / unassigned solid (neutral grey)
+            : SERIES_COLORS[s.series % SERIES_COLORS.length];
+      const mat = new THREE.MeshStandardMaterial({ color, side: THREE.DoubleSide, flatShading: true });
       st.group.add(new THREE.Mesh(geom, mat));
+      // Debug: overlay triangle edges so the mesh tessellation is visible.
+      if (props.wireframe) {
+        const edges = new THREE.LineSegments(
+          new THREE.WireframeGeometry(geom),
+          new THREE.LineBasicMaterial({ color: 0x111111, transparent: true, opacity: 0.4 }),
+        );
+        st.group.add(edges);
+      }
     }
-  }, [props.surfaces]);
+  }, [props.surfaces, props.colorBy, props.lithoColors, props.wireframe, props.hiddenKeys]);
 
   // Positioned container so the stale scrim can sit as a sibling overlay over the canvas.
   return (

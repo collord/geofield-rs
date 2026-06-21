@@ -54,7 +54,11 @@ function buildStack(series: SeriesJson[]): WasmStack {
     const fit = [f64(s.sp_xyz), f64(s.sp_if), f64(s.ori_xyz), f64(s.ori_pole)] as const;
     const opts = [NAN, NAN, NAN, NAN, 1, NAN] as const; // range, c_o, i_res, gi_res, uni_degree, nugget
     const faults = [f64(s.fault_point), f64(s.fault_normal)] as const;
-    if (s.crossCut?.kind === "vein") {
+    if (s.topography) {
+      // Singleton ground surface (feature 003): pinned youngest by add_topography (insert-0),
+      // caps the model to Air above. No relation/unbounded/crossCut. Emitted first by toSeriesJson.
+      stack.add_topography(...fit, ...opts, NAN, ...faults);
+    } else if (s.crossCut?.kind === "vein") {
       stack.add_vein(...fit, ...opts, s.crossCut.footWall, s.crossCut.hangingWall, NAN, ...faults);
     } else if (s.crossCut?.kind === "intrusion") {
       stack.add_intrusion(...fit, ...opts, s.crossCut.envelopeInner, s.crossCut.envelopeOuter, NAN, ...faults);
@@ -80,11 +84,13 @@ function collectSurfaces(
 
   for (let si = 0; si < stack.series_count; si++) {
     const n = stack.interface_count(si);
-    // A cross-cutting body (vein/intrusion) meshes its OWN walls as open sheets (one mesh per
-    // interface, no fault blocks); a stratigraphic series meshes per fault block. The kind is
-    // known from the compiled SeriesJson (crossCut present ⇒ cross-cutting body).
-    const isCrossCut = series[si]?.crossCut != null;
-    if (isCrossCut) {
+    // A cross-cutting body (vein/intrusion) OR topography meshes its OWN surface(s) as open
+    // sheets (one mesh per interface, no fault blocks); a stratigraphic series meshes per
+    // fault block. The kind is known from the compiled SeriesJson (crossCut/topography marker).
+    // The Rust `mesh_cross_cut_surface` path is generic over any non-series element, so
+    // topography's single ground contact meshes through it (clipped to the box).
+    const isSheetElement = series[si]?.crossCut != null || series[si]?.topography === true;
+    if (isSheetElement) {
       for (let k = 0; k < n; k++) {
         const m = stack.mesh_cross_cut_surface_octree(
           si, k, x0, y0, z0, size, x1, y1, z1, depth, minDepth, QEF_EPS,
@@ -119,6 +125,73 @@ function collectSurfaces(
   return out;
 }
 
+/** Mesh + collect closed watertight UNIT SOLIDS (solid mode, feature 003 §5). One solid per
+ *  present `(series, block, unit)` cell; topography participates as the universal top masker
+ *  (already in the fitted stack) so each solid daylights against the ground. AIR IS SKIPPED:
+ *  topography contributes no rock unit, and the per-series solid path is series-only, so a
+ *  topography element simply yields no solids. Each solid is tagged with its lithology id from
+ *  the forwarded assignment (keyed `${series}:${unit}`) for colour-by-lithology + OBJ grouping. */
+function collectSolids(
+  stack: WasmStack,
+  series: SeriesJson[],
+  extent: [number, number, number, number, number, number],
+  depth: number,
+  assignment: Record<string, string>,
+): SurfacePayload[] {
+  const [x0, x1, y0, y1, z0, z1] = extent;
+  const size = Math.max(x1 - x0, y1 - y0, z1 - z0);
+  const minDepth = Math.min(2, depth);
+  const out: SurfacePayload[] = [];
+
+  for (let si = 0; si < stack.series_count; si++) {
+    // Topography contributes no rock unit (Air above) — skip it (§5.2).
+    if (series[si]?.topography) continue;
+    // A cross-cutting body (vein/intrusion) meshes its closed INTERIOR solid (its namesake
+    // lithology), tagged at unit index 0 (the body's interior — matches the inferred-litho
+    // auto-assignment in projectOps::syncInferredLithologies).
+    if (series[si]?.crossCut) {
+      const m = stack.mesh_cross_cut_solid_octree(si, x0, y0, z0, size, x1, y1, z1, depth, minDepth, QEF_EPS);
+      if (m.triangle_count > 0) {
+        out.push({
+          series: si,
+          block: 0,
+          interface: 0,
+          unit: 0,
+          lithologyId: assignment[`${si}:0`],
+          positions: m.positions(),
+          normals: m.normals(),
+          indices: m.indices(),
+        });
+      }
+      m.free();
+      continue;
+    }
+    const blocks = Math.max(1, stack.series_block_count(si));
+    for (let b = 0; b < blocks; b++) {
+      const units = stack.present_unit_count(si, b);
+      for (let u = 0; u < units; u++) {
+        const m = stack.mesh_series_block_unit_solid(
+          si, b, u, x0, y0, z0, size, x1, y1, z1, depth, minDepth, QEF_EPS,
+        );
+        if (m.triangle_count > 0) {
+          out.push({
+            series: si,
+            block: b,
+            interface: u,
+            unit: u,
+            lithologyId: assignment[`${si}:${u}`],
+            positions: m.positions(),
+            normals: m.normals(),
+            indices: m.indices(),
+          });
+        }
+        m.free();
+      }
+    }
+  }
+  return out;
+}
+
 async function run(cmd: RunCommand) {
   emit({ type: "status", phase: "loading kernel + engine wasm…" });
   await initWasm();
@@ -126,8 +199,11 @@ async function run(cmd: RunCommand) {
   emit({ type: "status", phase: "fitting stack…" });
   const stack = buildStack(cmd.series);
 
-  emit({ type: "status", phase: "meshing surfaces…" });
-  const surfaces = collectSurfaces(stack, cmd.series, cmd.extent, cmd.maxDepth);
+  const solid = cmd.renderMode === "solid";
+  emit({ type: "status", phase: solid ? "meshing solids…" : "meshing surfaces…" });
+  const surfaces = solid
+    ? collectSolids(stack, cmd.series, cmd.extent, cmd.maxDepth, cmd.assignment ?? {})
+    : collectSurfaces(stack, cmd.series, cmd.extent, cmd.maxDepth);
 
   // The hierarchy round-trip payload (declared state + derived view) — parsed from the
   // core's single JSON getter (contract D3+D5). The UI treats `derived` as a read-only cache.

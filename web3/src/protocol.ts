@@ -27,6 +27,10 @@ export interface SeriesJson {
   crossCut?:
     | { kind: "vein"; footWall: number; hangingWall: number }
     | { kind: "intrusion"; envelopeInner: number; envelopeOuter: number };
+  /** The singleton topography surface (feature 003 §2). When `true` the worker calls
+   *  `add_topography` (pinned youngest, caps to Air); `relation`/`unboundedAbove`/`crossCut`
+   *  are ignored. Its single interface is the ground. */
+  topography?: boolean;
 }
 
 /** Open contact sheets vs. closed lithology-unit solids (the web/ render modes). */
@@ -40,6 +44,11 @@ export interface RunCommand {
   extent: [number, number, number, number, number, number];
   maxDepth: number;
   renderMode: RenderMode;
+  /** Solid-mode lithology assignment, keyed by `${seriesIndex}:${unitIndex}` (the worker
+   *  works in indices, not element ids). The UI compiles its `(elementId, unitIndex)`
+   *  assignment to this index form alongside `toSeriesJson`. Absent ⇒ solids untagged
+   *  (default Unknown colour applied UI-side). (feature 003 §5.3) */
+  assignment?: Record<string, string>;
 }
 
 export type Command = RunCommand;
@@ -51,7 +60,7 @@ export interface StatusMessage {
   phase: string;
 }
 
-/** One meshed surface for the viewer. */
+/** One meshed surface (contact mode) or unit solid (solid mode) for the viewer. */
 export interface SurfacePayload {
   series: number;
   block: number;
@@ -59,6 +68,12 @@ export interface SurfacePayload {
   positions: Float32Array;
   normals: Float32Array;
   indices: Uint32Array;
+  /** Solid mode only (feature 003): the lithology id this unit solid is assigned, for the
+   *  viewer's colour-by-lithology + OBJ-by-lithology grouping. Absent in contact mode (and
+   *  for Air, which is never emitted as a solid). */
+  lithologyId?: string;
+  /** Solid mode only: the unit index within the series, for diagnostics/grouping. */
+  unit?: number;
 }
 
 /** The fit/mesh completed: the meshes for the viewer + the core's hierarchy round-trip

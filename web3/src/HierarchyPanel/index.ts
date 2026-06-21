@@ -38,6 +38,8 @@ export * from "./projectOps";
 
 // authoring components
 export { AddSurfaceMenu } from "./AddSurfaceMenu";
+export { LithologyCatalog } from "./LithologyCatalog";
+export { VolumeVisibility } from "./VolumeVisibility";
 export { SurfaceDataModal } from "./SurfaceDataModal";
 export { SurfaceMenu, SeriesMenu } from "./SurfaceMenu";
 export { PointsTable, OrientationsTable } from "./tables";

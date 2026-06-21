@@ -23,7 +23,7 @@ use wasm_bindgen::prelude::*;
 
 use crate::octree::{octree_dual_contour, OctreeConfig};
 use crate::remote::{self, RemoteModel};
-use crate::stack::{Envelope, Intrusion, Relation, Stack, StackElement, StackedSeries, Vein};
+use crate::stack::{Envelope, Intrusion, Relation, Stack, StackElement, StackedSeries, Topography, Vein};
 use crate::{BlockModel, MeshModel};
 
 #[wasm_bindgen]
@@ -506,6 +506,43 @@ impl WasmStack {
         Ok(())
     }
 
+    /// Fit and insert the singleton **topography** surface as the youngest element
+    /// (`docs/topography_lithology_solids_spec.md` §2). Fit inputs match
+    /// [`WasmStack::add_series`] (one interface — the ground); it carries no relation or
+    /// `unbounded_above`. Pinned at index 0 (youngest) regardless of call order, and **at
+    /// most one** per stack — a second call is rejected (the singleton invariant is enforced
+    /// here, structurally, not left to the UI). Above the ground is Air; every older element
+    /// is clipped to below the ground via the erode masker.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_topography(
+        &mut self,
+        sp_xyz: &[f64],
+        sp_interface: &[f64],
+        ori_xyz: &[f64],
+        ori_pole: &[f64],
+        range: f64,
+        c_o: f64,
+        i_res: f64,
+        gi_res: f64,
+        uni_degree: u32,
+        nugget: f64,
+        decimate_frac: f64,
+        fault_point: &[f64],
+        fault_normal: &[f64],
+    ) -> Result<(), JsError> {
+        install_panic_hook();
+        if self.inner.series.iter().any(|e| e.is_topography()) {
+            return Err(JsError::new("a stack may have at most one topography surface"));
+        }
+        let model = self.fit_model(
+            sp_xyz, sp_interface, ori_xyz, ori_pole, range, c_o, i_res, gi_res, uni_degree,
+            nugget, decimate_frac, fault_point, fault_normal,
+        )?;
+        // Pinned youngest (index 0) regardless of when it was added.
+        self.inner.series.insert(0, StackElement::Topography(Topography { model }));
+        Ok(())
+    }
+
     /// Fit and append a cross-cutting **vein** (contract D2). Fit inputs match
     /// [`WasmStack::add_series`]; the vein is the tabular body BETWEEN interfaces
     /// `foot_wall` and `hanging_wall` (indices into the fitted interfaces). It cross-cuts
@@ -721,6 +758,31 @@ impl WasmStack {
             .mesh_cross_cut_surface(
                 series, interface_idx, [min_x, min_y, min_z], size, [ext_x, ext_y, ext_z], cfg,
             )
+            .map(Into::into)
+            .unwrap_or_else(EMPTY_MESH)
+    }
+
+    /// Closed watertight INTERIOR SOLID of a cross-cutting body (vein/intrusion) — its
+    /// namesake-lithology volume, clipped to the box and every younger element (feature 003).
+    /// EMPTY mesh for a stratigraphic series / topography / out-of-range index.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mesh_cross_cut_solid_octree(
+        &self,
+        series: usize,
+        min_x: f64,
+        min_y: f64,
+        min_z: f64,
+        size: f64,
+        ext_x: f64,
+        ext_y: f64,
+        ext_z: f64,
+        max_depth: u32,
+        min_depth: u32,
+        qef_threshold: f64,
+    ) -> WasmMesh {
+        let cfg = octree_cfg(max_depth, min_depth, qef_threshold, true);
+        self.inner
+            .mesh_cross_cut_solid(series, [min_x, min_y, min_z], size, [ext_x, ext_y, ext_z], cfg)
             .map(Into::into)
             .unwrap_or_else(EMPTY_MESH)
     }

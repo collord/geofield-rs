@@ -35,28 +35,44 @@ function dippingInterface(
   sy: number,
   flipped = false,
 ): InterfaceData {
-  const points = [];
-  for (let i = 0; i < 4; i++) {
-    for (let j = 0; j < 4; j++) {
-      const x = i * 300 + 50;
-      const y = j * 300 + 50;
-      points.push({ x, y, z: z0 + sx * (x - 500) + sy * (y - 500) });
-    }
-  }
-  // up-pole = (−sx,−sy,1)/n  ⇒  dip = acos(nz), dipDir = atan2(nx, ny) (clockwise from +Y).
+  // A plane `z = z0 + sx·(x−500) + sy·(y−500)` — TWO points + ONE orientation. Two points, not
+  // one: a single surface point leaves the dual-kriging system ill-conditioned (the field's
+  // SCALE is undetermined — |grad| blows up to ~2e10 while keeping the right direction, and the
+  // octree then can't extract a coherent isosurface, collapsing the sheet to a vertical sliver).
+  // A second point pins the scale (|grad| → ~1e-3, healthy). The orientation is kept so `flipped`
+  // still controls the field's "up" sense (it negates the pole at compile time, project.ts).
+  // (Diagnosed 2026-06-20: 1pt → |grad| 2e10; 2pt → 3e-3.)
+  const z = (x: number, y: number) => z0 + sx * (x - 500) + sy * (y - 500);
   const n = Math.hypot(sx, sy, 1);
-  const nx = -sx / n,
-    ny = -sy / n,
-    nz = 1 / n;
-  const dip = (Math.acos(nz) * 180) / Math.PI;
-  let dipDir = (Math.atan2(nx, ny) * 180) / Math.PI;
+  const dip = (Math.acos(1 / n) * 180) / Math.PI;
+  let dipDir = (Math.atan2(-sx / n, -sy / n) * 180) / Math.PI;
   if (dipDir < 0) dipDir += 360;
   return {
     id: newId("iface"),
     name,
-    points,
+    points: [
+      { x: 200, y: 500, z: z(200, 500) },
+      { x: 800, y: 500, z: z(800, 500) },
+    ],
     orientations: [{ x: 500, y: 500, z: z0, dip, dipDir }],
     flipped,
+  };
+}
+
+/** A VERTICAL planar wall at constant x = `x0` (the plane `x = x0`), for a vein's
+ *  foot-wall/hanging-wall pair so the tabular body is vertical, not flat-lying. TWO points
+ *  (both on the plane, at different z) + ONE orientation (pole `(1,0,0)`, dip 90°, dipDir 90°
+ *  = facing +X). Two points, not one: a single point leaves the kriging ill-conditioned
+ *  (|grad| ~2e10, the sheet collapses) — see `dippingInterface`. */
+function verticalWall(name: string, x0: number): InterfaceData {
+  return {
+    id: newId("iface"),
+    name,
+    points: [
+      { x: x0, y: 500, z: 200 },
+      { x: x0, y: 500, z: 800 },
+    ],
+    orientations: [{ x: x0, y: 500, z: 500, dip: 90, dipDir: 90 }],
   };
 }
 
@@ -122,21 +138,21 @@ export const TEMPLATES: Template[] = [
     id: "cross-cutting-vein",
     name: "Cross-cutting vein",
     description:
-      "A tabular vein (foot-wall/hanging-wall pair at z≈400/600) cross-cuts the floor it passes through.",
+      "A tabular vein (vertical foot-wall/hanging-wall pair at x≈400/600) cross-cuts the floor it passes through.",
     build: () => ({
       version: 1,
       name: "cross-cutting-vein",
-      extent: EXTENT,
       elements: [
         {
           kind: "vein",
           id: newId("el"),
           name: "quartz vein",
-          footWall: dippingInterface("foot wall", 400, 0, 0),
-          hangingWall: dippingInterface("hanging wall", 600, 0, 0),
+          footWall: verticalWall("foot wall", 400),
+          hangingWall: verticalWall("hanging wall", 600),
         },
         threeContactFloor(),
       ],
+      extent: EXTENT,
     }),
   },
 ];

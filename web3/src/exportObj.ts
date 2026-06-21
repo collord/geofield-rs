@@ -12,13 +12,26 @@
 
 import type { SurfacePayload } from "./protocol";
 
-export function exportObj(surfaces: SurfacePayload[]): string {
-  const lines: string[] = ["# geofield enhanced-authoring OBJ export", "# geometry + groups (materials deferred — v1)"];
+/** Serialize the rendered meshes to one OBJ string. In SOLID mode (feature 003), pass
+ *  `lithoNames` (lithology id → name) so each unit solid is grouped by its LITHOLOGY
+ *  (`g litho_<name>`); Air is never emitted, so no Air group appears. In contact mode (no
+ *  `lithoNames`), surfaces group by `series{si}_block{b}_iface{k}` as before. */
+export function exportObj(surfaces: SurfacePayload[], lithoNames?: Record<string, string>): string {
+  const byLithology = lithoNames !== undefined;
+  const lines: string[] = [
+    "# geofield enhanced-authoring OBJ export",
+    byLithology ? "# solids grouped by lithology (materials deferred — v1)" : "# geometry + groups (materials deferred — v1)",
+  ];
   let vertexOffset = 0; // OBJ indices are 1-based and accumulate across surfaces
 
   for (const s of surfaces) {
     const nVerts = s.positions.length / 3;
-    lines.push(`g series${s.series}_block${s.block}_iface${s.interface}`);
+    if (byLithology) {
+      const name = (s.lithologyId && lithoNames[s.lithologyId]) || "Unknown";
+      lines.push(`g litho_${name.replace(/\s+/g, "_")}`);
+    } else {
+      lines.push(`g series${s.series}_block${s.block}_iface${s.interface}`);
+    }
     for (let i = 0; i < nVerts; i++) {
       lines.push(`v ${s.positions[i * 3]} ${s.positions[i * 3 + 1]} ${s.positions[i * 3 + 2]}`);
     }

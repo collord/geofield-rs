@@ -12,10 +12,11 @@
 // (structural) validation comes from the `validation` prop (project.ts::validate) and is
 // distinct from the core's fitted-result validation.
 
+import { Fragment } from "react";
 import { DndContext, type DragEndEvent } from "@dnd-kit/core";
-import { CoreUpdate, RelationDto, effectiveRelationOf, validationOf } from "./dto";
+import { CoreUpdate, RelationDto, effectiveRelationOf, validationOf, unitsOf } from "./dto";
 import { resolveDrop, type DropAction, type NodeType } from "./dragResolver";
-import type { InterfaceData, Project, ProjectElement, ProjectValidation } from "./project";
+import type { InterfaceData, Lithology, Project, ProjectElement, ProjectValidation } from "./project";
 import { SurfaceMenu, SeriesMenu } from "./SurfaceMenu";
 
 export interface HierarchyPanelProps {
@@ -29,7 +30,6 @@ export interface HierarchyPanelProps {
   onMoveElement: (elementId: string, dir: -1 | 1) => void;
   onMoveSurface: (surfaceElementId: string, surfaceIndex: number, toElementId: string) => void;
   onSetRelation: (elementId: string, rel: RelationDto) => void;
-  onSetUnboundedAbove: (elementId: string, v: boolean) => void;
   // authoring entry points (US1/US2)
   onAddSurfaceClick: () => void;
   onEditSurface: (elementId: string, interfaceId: string) => void;
@@ -40,6 +40,16 @@ export interface HierarchyPanelProps {
   onAddInterface: (elementId: string) => void;
   onRenameElement: (elementId: string, name: string) => void;
   onDeleteElement: (elementId: string) => void;
+  // unit ladder (US2/US3)
+  /** Display name for a derived unit: the user's name if set, else "Unit {displayPos}" (the
+   *  visual ladder position, 1 = top). The stored name is keyed by the stable `unitIndex`. */
+  unitName: (elementId: string, unitIndex: number, displayPos: number) => string;
+  onRenameUnit: (elementId: string, unitIndex: number, name: string) => void;
+  /** Lithology assigned to a unit + the catalog to choose from (US3). When absent, the unit
+   *  row shows just its name (US2 standalone). */
+  lithologyOf?: (elementId: string, unitIndex: number) => Lithology | undefined;
+  catalog?: Lithology[];
+  onAssignLithology?: (elementId: string, unitIndex: number, lithologyId: string) => void;
 }
 
 const RELATION_CHOICES: RelationDto[] = ["erode", "onlap", "conformable"];
@@ -115,21 +125,28 @@ function ElementNode(props: {
   const coreId = String(index); // core ids are stack-index strings, youngest-first
   const validation = validationOf(p.update.derived, coreId);
   const eff = effectiveRelationOf(p.update.derived, coreId);
+  // Derived unit coordinates for THIS element (youngest→oldest), from the core (FR-009).
+  const units = unitsOf(p.update.derived, coreId);
 
-  const singletonSeries = el.kind === "series" && el.interfaces.length === 1;
+  // Topography renders FLAT (its single ground contact; no rock units — Air above).
+  const flatSurface = el.kind === "topography";
 
-  const subSurfaces: { iface: InterfaceData; surfaceIndex: number }[] =
+  // Contacts (interfaces) of the element, in render order. A series' interfaces are stored
+  // ascending-isovalue (oldest contact first); the ladder is youngest-at-top, so reverse.
+  const contacts: { iface: InterfaceData; surfaceIndex: number }[] =
     el.kind === "series"
-      ? el.interfaces.map((iface, si) => ({ iface, surfaceIndex: si }))
+      ? el.interfaces.map((iface, si) => ({ iface, surfaceIndex: si })).reverse()
       : el.kind === "vein"
         ? [
-            { iface: el.footWall, surfaceIndex: 0 },
             { iface: el.hangingWall, surfaceIndex: 1 },
+            { iface: el.footWall, surfaceIndex: 0 },
           ]
-        : [
-            { iface: el.envelopeInner, surfaceIndex: 0 },
-            { iface: el.envelopeOuter, surfaceIndex: 1 },
-          ];
+        : el.kind === "topography"
+          ? [{ iface: el.ground, surfaceIndex: 0 }]
+          : [
+              { iface: el.envelopeOuter, surfaceIndex: 1 },
+              { iface: el.envelopeInner, surfaceIndex: 0 },
+            ];
 
   const reorder = (
     <ReorderControls
@@ -143,13 +160,13 @@ function ElementNode(props: {
 
   return (
     <div className="container-node" role="treeitem" data-element-id={el.id} data-kind={el.kind}>
-      {singletonSeries ? (
-        // FLAT: a one-interface series is just "a surface". The reorder control leads the row.
+      {flatSurface ? (
+        // FLAT: topography is just "the ground surface". The reorder control leads the row.
         <div className="surface-row-flat">
           {reorder}
           <SurfaceRow
             el={el}
-            iface={subSurfaces[0].iface}
+            iface={contacts[0].iface}
             surfaceIndex={0}
             validation={validation?.ok}
             validationDetail={validation?.detail}
@@ -175,14 +192,31 @@ function ElementNode(props: {
               onAddInterface={() => p.onAddInterface(el.id)}
             />
           </div>
-          <ul className="surface-list">
-            {subSurfaces.map(({ iface, surfaceIndex }) => (
-              <li
-                key={iface.id}
-                className="surface-node"
-                data-element-id={el.id}
-                data-surface-index={surfaceIndex}
-              >
+          {/* The UNIT/CONTACT LADDER (feature 003 §1), youngest at top: a series with N
+              contacts shows N+1 unit rows interleaved with N contact rows. Units come from
+              the core's derived coordinates (never authored); contacts are the existing
+              authoring surfaces. A cross-cutting body shows its interior unit + its walls. */}
+          <ul className="ladder">
+            {units.map((u, ui) => (
+              <Fragment key={`u-${u.index}`}>
+                <li className="unit-node" data-element-id={el.id} data-unit-index={u.index}>
+                  <UnitRow el={el} unitIndex={u.index} displayPos={ui + 1} p={p} />
+                </li>
+                {contacts[ui] && (
+                  <li
+                    className="surface-node"
+                    data-element-id={el.id}
+                    data-surface-index={contacts[ui].surfaceIndex}
+                  >
+                    <SurfaceRow el={el} iface={contacts[ui].iface} surfaceIndex={contacts[ui].surfaceIndex} p={p} inline />
+                  </li>
+                )}
+              </Fragment>
+            ))}
+            {/* Any contacts without a paired unit above (e.g. a field-less element with no
+                derived units) still render so authoring is never lost. */}
+            {contacts.slice(units.length).map(({ iface, surfaceIndex }) => (
+              <li key={iface.id} className="surface-node" data-element-id={el.id} data-surface-index={surfaceIndex}>
                 <SurfaceRow el={el} iface={iface} surfaceIndex={surfaceIndex} p={p} inline />
               </li>
             ))}
@@ -191,17 +225,6 @@ function ElementNode(props: {
       )}
 
       <div className="derived-summary">effective: {eff ?? "—"}</div>
-
-      {el.kind === "series" && (
-        <label className="unbounded-toggle">
-          <input
-            type="checkbox"
-            checked={el.unboundedAbove}
-            onChange={(e) => p.onSetUnboundedAbove(el.id, e.target.checked)}
-          />
-          fills upward (floor)
-        </label>
-      )}
 
       {/* A cross-cutting body (vein/intrusion) shows the read-only "cross-cuts" chip the
           CORE derives (effectiveRelation = crossCut), not the 3-state seam control. The
@@ -229,6 +252,44 @@ function ElementNode(props: {
             </button>
           ))}
         </div>
+      )}
+    </div>
+  );
+}
+
+/** A derived UNIT row (feature 003 §1) — its name (inline-editable, unlike a contact) plus,
+ *  when a catalog is wired (US3), a lithology dropdown + colour swatch. The unit itself is
+ *  derived by the core; only its NAME and lithology ASSIGNMENT are UI metadata. */
+function UnitRow(props: { el: ProjectElement; unitIndex: number; displayPos: number; p: HierarchyPanelProps }) {
+  const { el, unitIndex, displayPos, p } = props;
+  // The stored name (if any) is keyed by the stable mesher index; the DEFAULT label uses the
+  // visual ladder position (1 = top) so "Unit 1" is the top slab, matching the 3D view.
+  const name = p.unitName(el.id, unitIndex, displayPos);
+  const litho = p.lithologyOf?.(el.id, unitIndex);
+  return (
+    <div className="unit-row" data-testid="unit-row">
+      <span className="unit-marker" aria-hidden style={litho ? { background: litho.color } : undefined} />
+      <input
+        className="unit-name"
+        data-testid="unit-name"
+        aria-label={`unit ${unitIndex + 1} name`}
+        value={name}
+        onChange={(e) => p.onRenameUnit(el.id, unitIndex, e.target.value)}
+      />
+      {p.catalog && p.onAssignLithology && (
+        <select
+          className="unit-litho"
+          data-testid="unit-litho"
+          aria-label={`lithology for ${name}`}
+          value={litho?.id ?? "unknown"}
+          onChange={(e) => p.onAssignLithology!(el.id, unitIndex, e.target.value)}
+        >
+          {p.catalog.map((l) => (
+            <option key={l.id} value={l.id}>
+              {l.name}
+            </option>
+          ))}
+        </select>
       )}
     </div>
   );
