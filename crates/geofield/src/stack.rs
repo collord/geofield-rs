@@ -875,19 +875,30 @@ impl<M: SeriesModel + BlockModel> Stack<M> {
             .zip(&cut_isos)
             .map(|(f, &iso)| ContactHalfSpace::new(f.as_ref(), iso, false))
             .collect();
+        // The body's OTHER walls (every wall isovalue beyond the primary `body_isos[0]`) AS build
+        // contributors. The build primary only refines on `body_isos[0]` (the foot wall); without
+        // this the hanging wall (`body_isos[1+]`) is NOT a refinement driver, so the tree stays
+        // coarse there and that wall contours as a sparse, spiky sheet. Adding them makes the build
+        // subdivide near EVERY wall, so all walls resolve at full detail on the shared tree.
+        let extra_wall_contrib: Vec<ContactHalfSpace> = body_isos
+            .iter()
+            .skip(1)
+            .map(|&iso| ContactHalfSpace::new(&body_field, iso, false))
+            .collect();
 
-        // --- Build scene: body field primary, refined for body walls + box + body maskers +
-        // every cut contact (so all surfaces are resolved on the shared tree). -----------------
+        // --- Build scene: body field primary (foot wall), refined for ALL body walls + box + body
+        // maskers + every cut contact (so all surfaces are resolved on the shared tree). ---------
         let mut build_contrib: Vec<&dyn Boundary> = Vec::new();
         build_contrib.push(&box_b);
         for m in &body_maskers {
             build_contrib.push(m.as_ref());
         }
+        for c in &extra_wall_contrib {
+            build_contrib.push(c);
+        }
         for c in &cut_as_contrib {
             build_contrib.push(c);
         }
-        // Use the FIRST wall isovalue as the build primary's isovalue; refinement also fires on the
-        // cut-contact contributors, so both walls and contacts get resolved.
         let build_scene = Scene::new(&body_field, body_isos[0], build_contrib);
 
         // --- Per-surface contour scenes ------------------------------------------------------
@@ -2750,6 +2761,33 @@ mod tests {
         assert!(
             welded < unwelded,
             "weld did not reduce see-through holes: unwelded={unwelded} welded={welded}"
+        );
+    }
+
+    /// REGRESSION — every vein wall resolves at full detail on the shared tree. The build scene's
+    /// primary is `body_isos[0]` (the foot wall); a prior version did NOT add the OTHER wall
+    /// isovalues as refinement contributors, so the hanging wall was contoured on a tree coarse
+    /// where it lives — emerging ~7× sparser and SPIKY (the ragged crest the user saw). We assert
+    /// the walls have COMPARABLE triangle density (within 3×), and that no wall is a near-empty
+    /// sparse sheet. (The foot wall's box-floor perimeter slivers are a SEPARATE, pre-existing
+    /// open-sheet artifact — identical in the independent path — and are not asserted here.)
+    #[test]
+    fn shared_vein_walls_are_both_fully_resolved() {
+        let (stack, _f) = vertical_vein_over_column();
+        let min = [0.0, 0.0, 0.0];
+        let size = 1000.0;
+        let cfg = OctreeConfig { max_depth: 6, min_depth: 2, qef_threshold: 1e-6, cap: false };
+        let (walls, _contacts) = stack
+            .mesh_cross_cut_shared(0, min, size, [size, size, size], cfg)
+            .unwrap();
+        assert_eq!(walls.len(), 2, "a vein has two walls");
+        let tris: Vec<usize> = walls.iter().map(|w| w.triangle_count()).collect();
+        let (lo, hi) = (tris.iter().copied().min().unwrap(), tris.iter().copied().max().unwrap());
+        eprintln!("vein wall triangle counts: {tris:?}");
+        assert!(lo > 500, "a vein wall is near-empty ({lo} tris) — under-refined on the shared tree");
+        assert!(
+            hi <= lo * 3,
+            "vein walls wildly asymmetric ({lo} vs {hi} tris) — one wall is under-refined (the spiky-crest bug)"
         );
     }
 
