@@ -104,6 +104,9 @@ function App() {
       // Solid-mode lithology tags, keyed by (seriesIndex, unitIndex). The compile seam emits
       // topography youngest, so series index == position in toSeriesJson output.
       assignment: mode === "solid" ? indexedAssignment(p) : undefined,
+      // T-junction weld is on by default; `window.__WELD_T_JUNCTIONS = false` (then re-Apply) A/Bs
+      // the old independent-mesh behavior — a dev escape hatch, not a user-facing control.
+      weldTJunctions: (window as { __WELD_T_JUNCTIONS?: boolean }).__WELD_T_JUNCTIONS ?? true,
     };
     worker.postMessage(cmd);
   }

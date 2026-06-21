@@ -76,24 +76,49 @@ function collectSurfaces(
   series: SeriesJson[],
   extent: [number, number, number, number, number, number],
   depth: number,
+  weld: boolean,
 ): SurfacePayload[] {
   const [x0, x1, y0, y1, z0, z1] = extent;
   const size = Math.max(x1 - x0, y1 - y0, z1 - z0);
   const minDepth = Math.min(2, depth);
   const out: SurfacePayload[] = [];
+  // (series,interface) contacts already emitted by a cross-cut body's SHARED-CREASE meshing — the
+  // series loop skips these so they aren't meshed twice (the shared mesh is the watertight one).
+  const sharedContacts = new Set<string>();
 
   for (let si = 0; si < stack.series_count; si++) {
     const n = stack.interface_count(si);
-    // A cross-cutting body (vein/intrusion) OR topography meshes its OWN surface(s) as open
-    // sheets (one mesh per interface, no fault blocks); a stratigraphic series meshes per
-    // fault block. The kind is known from the compiled SeriesJson (crossCut/topography marker).
-    // The Rust `mesh_cross_cut_surface` path is generic over any non-series element, so
-    // topography's single ground contact meshes through it (clipped to the box).
+    // A cross-cutting body (vein/intrusion) — with weld ON — co-contours its OWN walls AND the
+    // contacts it cuts on one octree, so the crease is shared and watertight (no see-through
+    // holes). It returns the walls plus the cut contacts, tagged; we emit all and record the
+    // contacts so the series loop below skips re-meshing them independently.
+    if (series[si]?.crossCut != null && weld) {
+      const tagged = stack.mesh_cross_cut_shared_octree(
+        si, x0, y0, z0, size, x1, y1, z1, depth, minDepth, QEF_EPS,
+      );
+      for (const tm of tagged) {
+        if (tm.triangle_count > 0) {
+          out.push({
+            series: tm.series,
+            block: 0,
+            interface: tm.interface,
+            positions: tm.positions(),
+            normals: tm.normals(),
+            indices: tm.indices(),
+          });
+        }
+        if (tm.is_contact) sharedContacts.add(`${tm.series}:${tm.interface}`);
+        tm.free();
+      }
+      continue;
+    }
+    // Topography, OR a cross-cut body with weld OFF (the escape hatch): mesh own surfaces as open
+    // sheets, one per interface, the original independent way.
     const isSheetElement = series[si]?.crossCut != null || series[si]?.topography === true;
     if (isSheetElement) {
       for (let k = 0; k < n; k++) {
         const m = stack.mesh_cross_cut_surface_octree(
-          si, k, x0, y0, z0, size, x1, y1, z1, depth, minDepth, QEF_EPS,
+          si, k, x0, y0, z0, size, x1, y1, z1, depth, minDepth, QEF_EPS, weld,
         );
         if (m.triangle_count > 0) {
           out.push({ series: si, block: 0, interface: k, positions: m.positions(), normals: m.normals(), indices: m.indices() });
@@ -105,6 +130,9 @@ function collectSurfaces(
     const blocks = Math.max(1, stack.series_block_count(si));
     for (let b = 0; b < blocks; b++) {
       for (let k = 0; k < n; k++) {
+        // Skip a contact already produced by a cross-cut body's shared-crease meshing (block 0
+        // only — the shared path doesn't fault-block; faulted series fall through to remesh).
+        if (b === 0 && sharedContacts.has(`${si}:${k}`)) continue;
         const m = stack.mesh_series_block_interface(
           si, b, k, x0, y0, z0, size, x1, y1, z1, depth, minDepth, QEF_EPS, false,
         );
@@ -203,7 +231,7 @@ async function run(cmd: RunCommand) {
   emit({ type: "status", phase: solid ? "meshing solids…" : "meshing surfaces…" });
   const surfaces = solid
     ? collectSolids(stack, cmd.series, cmd.extent, cmd.maxDepth, cmd.assignment ?? {})
-    : collectSurfaces(stack, cmd.series, cmd.extent, cmd.maxDepth);
+    : collectSurfaces(stack, cmd.series, cmd.extent, cmd.maxDepth, cmd.weldTJunctions ?? true);
 
   // The hierarchy round-trip payload (declared state + derived view) — parsed from the
   // core's single JSON getter (contract D3+D5). The UI treats `derived` as a read-only cache.

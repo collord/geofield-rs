@@ -79,8 +79,8 @@
 
 use crate::mesh::Mesh;
 use crate::octree::{
-    octree_dual_contour_scene, AxisBox, Boundary, ContactHalfSpace, OctreeConfig, PlaneHalfSpace,
-    Scene, SlabComplement,
+    octree_dual_contour_scene, octree_dual_contour_shared, AxisBox, Boundary, ContactHalfSpace,
+    OctreeConfig, PlaneHalfSpace, Scene, SlabComplement,
 };
 use crate::{clip_mesh_to_half_spaces, max_abs_field_in_box, BlockModel, ScalarField, SeriesModel};
 
@@ -753,6 +753,186 @@ impl<M: SeriesModel + BlockModel> Stack<M> {
         }
         let scene = Scene::new(&field, isovalue, contributors);
         Some(octree_dual_contour_scene(&scene, min, size, cfg))
+    }
+
+    /// Mesh a cross-cutting body's wall (`mesh_cross_cut_surface`) and, when `weld` is set, WELD
+    /// into it the crease vertices of every contact that terminates against it — removing the
+    /// T-junctions that otherwise leave see-through slivers where a flat contact meets the wall
+    /// (the surface-mode gaps; see `crate::weld`). Returns `None` for a series / out-of-range.
+    ///
+    /// How: a body at `i` cuts the older elements `cuts_below(i)` reports. Each such series' OPEN
+    /// contact sheets are clipped to OUTSIDE this body, so their inner free boundary is the crease
+    /// lying on this wall. We harvest those free-boundary points and weld the ones within
+    /// `weld_eps` of the wall surface into the wall mesh, so the crease becomes shared vertices.
+    /// `weld = false` reproduces the old independent-mesh behavior (the runtime escape hatch).
+    pub fn mesh_cross_cut_surface_welded(
+        &self,
+        i: usize,
+        interface_idx: usize,
+        min: [f64; 3],
+        size: f64,
+        ext_max: [f64; 3],
+        cfg: OctreeConfig,
+        weld: bool,
+    ) -> Option<Mesh> {
+        let mut wall = self.mesh_cross_cut_surface(i, interface_idx, min, size, ext_max, cfg)?;
+        if !weld {
+            return Some(wall);
+        }
+        // Crease points = the free boundaries of every contact this body cuts (its clipped edge
+        // lying on this wall). Welding them inserts the contact's crease vertices into the wall.
+        // (A contact's box-rim boundary is also in this set, but those points are far from the wall
+        // and the `weld_eps` filter in `weld_points_into_mesh` drops them.)
+        let cell = size / (1u32 << cfg.max_depth) as f64;
+        // A crease vertex lies on the wall SURFACE, but the wall's independent TESSELLATION can be
+        // up to ~a cell off it (flat triangles chord a curved wall). Reach across that chord error.
+        let weld_eps = cell * 1.5;
+        let mut crease: Vec<[f64; 3]> = Vec::new();
+        let surf_cfg = OctreeConfig { cap: false, ..cfg };
+        for &j in self.cuts_below(i, min, size).iter() {
+            // Mesh every interface of the cut series as a clipped open sheet, collect its crease.
+            let Some(s) = self.series_at(j) else { continue };
+            let n = s.model.interface_ids().len();
+            for k in 0..n {
+                if let Some(contact) = self.mesh_one_clipped(j, k, min, size, ext_max, surf_cfg) {
+                    crease.extend(crate::weld::free_boundary_points(&contact));
+                }
+            }
+        }
+        crate::weld::weld_points_into_mesh(&mut wall, &crease, weld_eps, cell);
+        Some(wall)
+    }
+
+    /// SHARED-CREASE meshing for a cross-cutting body `i`: co-contour ALL the body's walls AND the
+    /// contacts it cuts on ONE octree, so a contact's clipped edge and the wall share the SAME
+    /// crease discretization — no T-junctions, no see-through holes (the watertight-by-construction
+    /// fix, vs the approximate point-weld in `mesh_cross_cut_surface_welded`).
+    ///
+    /// Returns `(walls, contacts)`:
+    ///   * `walls[k]` is the body's interface-`k` wall mesh;
+    ///   * `contacts` is one `(series, interface, mesh)` per cut contact — tagged so the caller can
+    ///     emit it in place of the independently-meshed series contact (and skip that one).
+    /// All are contoured on a single tree refined for every surface (the body field is primary;
+    /// each cut contact is added as a `ContactHalfSpace` contributor so the build subdivides near
+    /// it too). `None` for a series / out-of-range body.
+    pub fn mesh_cross_cut_shared(
+        &self,
+        i: usize,
+        min: [f64; 3],
+        size: f64,
+        ext_max: [f64; 3],
+        cfg: OctreeConfig,
+    ) -> Option<(Vec<Mesh>, Vec<(usize, usize, Mesh)>)> {
+        let body = self.series.get(i)?;
+        if body.is_series() {
+            return None;
+        }
+        let body_model = body.model();
+        let body_field = body_model.field();
+        let body_isos = body_model.interface_isovalues();
+        let n_walls = body_isos.len();
+        if n_walls == 0 {
+            return None;
+        }
+
+        // The cut contacts: (series j, interface k, isovalue, field).
+        let cut = self.cuts_below(i, min, size);
+        let surf_cfg = OctreeConfig { cap: false, ..cfg };
+
+        // --- Boundary locals (must outlive every Scene) -------------------------------------
+        let box_b = AxisBox::from_bounds(min, ext_max);
+        // Body's own clip maskers (younger elements clipping the body's walls).
+        let body_masker_fields = self.clip_maskers(i);
+        let body_maskers: Vec<Box<dyn Boundary + '_>> =
+            body_masker_fields.iter().map(|m| m.boundary()).collect();
+
+        // Each cut contact's field + isovalue, owned here so their `ContactHalfSpace`s borrow them.
+        // Parallel vectors (not a struct) so the masker type stays inferred — `Masker` is private
+        // and generic over the model's field type.
+        let mut cut_fields: Vec<Box<dyn ScalarField + '_>> = Vec::new();
+        let mut cut_isos: Vec<f64> = Vec::new();
+        let mut cut_masker_fields = Vec::new();
+        let mut cut_ids: Vec<(usize, usize)> = Vec::new(); // (series j, interface k) per contact
+        for &j in &cut {
+            let Some(s) = self.series_at(j) else { continue };
+            let isos = s.model.interface_isovalues();
+            for (k, &iso) in isos.iter().enumerate() {
+                cut_fields.push(Box::new(s.model.field()) as Box<dyn ScalarField + '_>);
+                cut_isos.push(iso);
+                cut_masker_fields.push(self.clip_maskers(j));
+                cut_ids.push((j, k));
+            }
+        }
+        // Each cut contact's clip maskers as boundaries (for the contact's own Scene).
+        let cut_maskers: Vec<Vec<Box<dyn Boundary + '_>>> = cut_masker_fields
+            .iter()
+            .map(|mf: &Vec<_>| mf.iter().map(|m| m.boundary()).collect())
+            .collect();
+        // The cut contacts AS contributors to the BUILD scene (so the tree refines near them).
+        // `below=false` is an arbitrary side — only the crossing location matters for refinement.
+        let cut_as_contrib: Vec<ContactHalfSpace> = cut_fields
+            .iter()
+            .zip(&cut_isos)
+            .map(|(f, &iso)| ContactHalfSpace::new(f.as_ref(), iso, false))
+            .collect();
+
+        // --- Build scene: body field primary, refined for body walls + box + body maskers +
+        // every cut contact (so all surfaces are resolved on the shared tree). -----------------
+        let mut build_contrib: Vec<&dyn Boundary> = Vec::new();
+        build_contrib.push(&box_b);
+        for m in &body_maskers {
+            build_contrib.push(m.as_ref());
+        }
+        for c in &cut_as_contrib {
+            build_contrib.push(c);
+        }
+        // Use the FIRST wall isovalue as the build primary's isovalue; refinement also fires on the
+        // cut-contact contributors, so both walls and contacts get resolved.
+        let build_scene = Scene::new(&body_field, body_isos[0], build_contrib);
+
+        // --- Per-surface contour scenes ------------------------------------------------------
+        // Body walls: body field at each wall isovalue, clipped by box + body maskers.
+        let mut wall_contribs: Vec<&dyn Boundary> = Vec::new();
+        wall_contribs.push(&box_b);
+        for m in &body_maskers {
+            wall_contribs.push(m.as_ref());
+        }
+        let wall_scenes: Vec<Scene> = body_isos
+            .iter()
+            .map(|&iso| Scene::new(&body_field, iso, wall_contribs.clone()))
+            .collect();
+
+        // Cut contacts: each contact field at its isovalue, clipped by box + its maskers + the BODY
+        // (so the contact terminates on the body wall — the crease).
+        let body_as_contrib = ContactHalfSpace::new(&body_field, body_isos[0], false);
+        let contact_scenes: Vec<Scene> = (0..cut_fields.len())
+            .map(|ci| {
+                let mut contribs: Vec<&dyn Boundary> = Vec::new();
+                contribs.push(&box_b);
+                for m in &cut_maskers[ci] {
+                    contribs.push(m.as_ref());
+                }
+                contribs.push(&body_as_contrib);
+                Scene::new(cut_fields[ci].as_ref(), cut_isos[ci], contribs)
+            })
+            .collect();
+
+        // Contour everything on ONE shared tree.
+        let mut all_scenes: Vec<&Scene> = Vec::new();
+        for s in &wall_scenes {
+            all_scenes.push(s);
+        }
+        for s in &contact_scenes {
+            all_scenes.push(s);
+        }
+        let meshes = octree_dual_contour_shared(&build_scene, &all_scenes, min, size, surf_cfg);
+        let (walls, contacts) = meshes.split_at(n_walls);
+        let tagged_contacts: Vec<(usize, usize, Mesh)> = contacts
+            .iter()
+            .zip(&cut_ids)
+            .map(|(m, &(j, k))| (j, k, m.clone()))
+            .collect();
+        Some((walls.to_vec(), tagged_contacts))
     }
 
     /// Mesh the closed, watertight INTERIOR SOLID of a cross-cutting body (vein/intrusion) at
@@ -2136,5 +2316,651 @@ mod tests {
         let (nm, open, total) = edge_stats(&solid);
         assert_eq!(nm, 0, "vein interior non-manifold {nm}/{total}");
         assert_eq!(open, 0, "vein interior not watertight, open {open}/{total}");
+    }
+
+    /// A DIPPING vein cross-cutting a TWO-contact column (contacts at z=350 and z=650 ⇒ three
+    /// stacked units), so adjacent units share the SAME oblique vein wall. The walls tilt in x
+    /// with z (`dxdz`), so they cut the octree grid obliquely — the case the browser repro shows
+    /// opening a staircase gap between adjacent unit solids (and even between contact sheets in
+    /// surface mode). Returns the stack plus a probe copy of the vein field.
+    fn vertical_vein_over_column() -> (Stack<Model>, Model) {
+        let dxdz = 0.5; // matches web3 `cross-cutting-vein-dipping`
+        // EXACTLY the web3 `dippingWall` fit: TWO points per wall, BOTH on the y=500 centerline, at
+        // z=200 and z=800, x = x0 + dxdz·(z−500). This under-constrained 2-point fit is what the
+        // browser meshes — far wavier in y than a 3-point fit, and the geometry that produced the
+        // user's staircase. We replicate it so the native weld test sees the SAME wall.
+        let build_vein = || {
+            let mut sps = Vec::new();
+            for (id, x0) in [(0u32, 400.0), (1u32, 600.0)] {
+                sps.push(SurfacePoint::new([x0 + dxdz * (200.0 - 500.0), 500.0, 200.0], id));
+                sps.push(SurfacePoint::new([x0 + dxdz * (800.0 - 500.0), 500.0, 800.0], id));
+            }
+            let oris = vec![Orientation::new([500.0, 500.0, 500.0], normalize([1.0, 0.0, -dxdz]))];
+            Model::fit(&Series::new(sps, oris), KernelOptions::default())
+        };
+        let column = StackedSeries::floor(two_contact_model(350.0, 650.0));
+        let stack = Stack::new(vec![
+            StackElement::Vein(Vein::new(build_vein(), 0, 1)),
+            StackElement::Series(column),
+        ]);
+        (stack, build_vein())
+    }
+
+    /// REPRO (surface-mode clip-seam gap) — the user observed gaps in SURFACE mode too, where a
+    /// flat contact sheet meets the dipping vein wall (the staircase of see-through triangles in
+    /// the wireframe). In surface mode each flat contact is an open sheet CLIPPED by the vein's
+    /// `SlabExterior` masker; its clipped free boundary SHOULD lie exactly on the vein wall
+    /// surface (`vein_field == band edge`), where it meets the vein's own wall sheet flush.
+    ///
+    /// We mesh the column's contacts (surface mode), collect each sheet's free-boundary vertices
+    /// that are NOT on the domain box rim, and check they lie on the vein wall (vein field within
+    /// ε of a band edge). A staircase gap shows up as free-boundary vertices sitting OFF the wall
+    /// — the contact's clip boundary stepped away from where the vein wall actually is.
+    #[test]
+    fn flat_contact_clip_meets_the_vein_wall_in_surface_mode() {
+        let (stack, vein_field) = vertical_vein_over_column();
+        let min = [0.0, 0.0, 0.0];
+        let size = 1000.0;
+        let depth = 6u32;
+        let cfg = OctreeConfig { max_depth: depth, min_depth: 2, qef_threshold: 1e-6, cap: false };
+        let cell = size / (1u32 << depth) as f64;
+
+        let (lo, hi) = {
+            let isos = vein_field.interface_isovalues();
+            (isos[0].min(isos[1]), isos[0].max(isos[1]))
+        };
+        // The band edges in WORLD units are where vein_field == lo / hi. We measure a vertex's
+        // distance to the nearer wall as |vein_field − edge| / |∇vein_field|, a first-order world
+        // distance to the wall surface.
+        let wall_dist = |p: [f64; 3]| -> f64 {
+            let f = vein_field.scalar_field(p);
+            let g = vein_field.scalar_field_gradient(p);
+            let gn = (g[0] * g[0] + g[1] * g[1] + g[2] * g[2]).sqrt().max(1e-12);
+            (f - lo).abs().min((f - hi).abs()) / gn
+        };
+
+        // Mesh the column (element 1) contacts in surface mode.
+        let meshes = stack.mesh_surfaces(min, size, cfg);
+        let column = meshes.iter().find(|m| m.series == 1).expect("column meshes");
+
+        let on_box = |p: [f64; 3]| -> bool {
+            const E: f64 = 1.0;
+            p[0] < min[0] + E || p[0] > min[0] + size - E
+                || p[1] < min[1] + E || p[1] > min[1] + size - E
+                || p[2] < min[2] + E || p[2] > min[2] + size - E
+        };
+
+        let mut interior_free = 0usize; // free-boundary verts off the box AND off the wall
+        let mut max_off_wall = 0.0_f64;
+        let mut total_free = 0usize;
+        for (_iid, mesh) in &column.interfaces {
+            if mesh.triangle_count() == 0 {
+                continue;
+            }
+            // Undirected edges with incidence 1 are free boundary.
+            let mut inc: std::collections::HashMap<(u32, u32), u32> = std::collections::HashMap::new();
+            for t in mesh.indices.chunks_exact(3) {
+                for &(a, b) in &[(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+                    let e = if a < b { (a, b) } else { (b, a) };
+                    *inc.entry(e).or_insert(0) += 1;
+                }
+            }
+            for (&(a, b), &c) in &inc {
+                if c != 1 {
+                    continue;
+                }
+                for vi in [a, b] {
+                    let p = [
+                        mesh.positions[vi as usize * 3] as f64,
+                        mesh.positions[vi as usize * 3 + 1] as f64,
+                        mesh.positions[vi as usize * 3 + 2] as f64,
+                    ];
+                    if on_box(p) {
+                        continue; // expected free boundary on the domain rim
+                    }
+                    total_free += 1;
+                    let d = wall_dist(p);
+                    max_off_wall = max_off_wall.max(d);
+                    if d > cell {
+                        interior_free += 1; // a free-boundary vertex more than a cell off the wall
+                    }
+                }
+            }
+        }
+        eprintln!(
+            "finest_cell={cell:.2} | non-box free-boundary verts={total_free}, off-wall(>1 cell)={interior_free}, max off-wall dist={max_off_wall:.2} ({:.2} cells)",
+            max_off_wall / cell
+        );
+
+        // The contact clip-edges all lie ON the wall (interior_free≈0) — confirmed. So the gap is
+        // NOT the contact stepping off the wall. We now pin the actual mechanism: the vein WALL is
+        // meshed as its own independent full sheet (`mesh_cross_cut_surface`) that does NOT have
+        // edges/vertices at the contact crease — the wall doesn't know the contact terminates
+        // against it. So the contact's clip-edge vertices land in the MIDDLE of wall triangles: a
+        // T-junction. Any sub-cell mismatch between the two independent tessellations of the wall
+        // opens the triangular slivers the user sees. We confirm the wall sheet has NO crease
+        // vertices to share with the contact (its boundary is entirely on the domain box).
+        let ext = [size, size, size];
+        let mut wall_crease: Vec<[f64; 3]> = Vec::new();
+        for k in 0..2 {
+            let wall = stack
+                .mesh_cross_cut_surface(0, k, min, size, ext, cfg)
+                .expect("vein wall should mesh");
+            let mut inc: std::collections::HashMap<(u32, u32), u32> = std::collections::HashMap::new();
+            for t in wall.indices.chunks_exact(3) {
+                for &(a, b) in &[(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+                    let e = if a < b { (a, b) } else { (b, a) };
+                    *inc.entry(e).or_insert(0) += 1;
+                }
+            }
+            for (&(a, b), &c) in &inc {
+                if c != 1 {
+                    continue;
+                }
+                for vi in [a, b] {
+                    let p = [
+                        wall.positions[vi as usize * 3] as f64,
+                        wall.positions[vi as usize * 3 + 1] as f64,
+                        wall.positions[vi as usize * 3 + 2] as f64,
+                    ];
+                    if !on_box(p) {
+                        wall_crease.push(p);
+                    }
+                }
+            }
+        }
+
+        // For each contact clip-edge crease vertex, the nearest vein-wall crease vertex.
+        let mut worst_seam = 0.0_f64;
+        let mut contact_crease = 0usize;
+        for (_iid, mesh) in &column.interfaces {
+            if mesh.triangle_count() == 0 {
+                continue;
+            }
+            let mut inc: std::collections::HashMap<(u32, u32), u32> = std::collections::HashMap::new();
+            for t in mesh.indices.chunks_exact(3) {
+                for &(a, b) in &[(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+                    let e = if a < b { (a, b) } else { (b, a) };
+                    *inc.entry(e).or_insert(0) += 1;
+                }
+            }
+            for (&(a, b), &c) in &inc {
+                if c != 1 {
+                    continue;
+                }
+                for vi in [a, b] {
+                    let p = [
+                        mesh.positions[vi as usize * 3] as f64,
+                        mesh.positions[vi as usize * 3 + 1] as f64,
+                        mesh.positions[vi as usize * 3 + 2] as f64,
+                    ];
+                    if on_box(p) || wall_dist(p) > cell {
+                        continue; // only crease vertices on the wall
+                    }
+                    contact_crease += 1;
+                    let nearest = wall_crease
+                        .iter()
+                        .map(|w| {
+                            let d = [w[0] - p[0], w[1] - p[1], w[2] - p[2]];
+                            (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt()
+                        })
+                        .fold(f64::INFINITY, f64::min);
+                    worst_seam = worst_seam.max(nearest);
+                }
+            }
+        }
+        let _ = worst_seam;
+        eprintln!(
+            "contact crease verts on wall={contact_crease}, vein-wall crease verts to share with={}",
+            wall_crease.len(),
+        );
+
+        // THE DIAGNOSIS, asserted: the contact has hundreds of crease vertices on the wall, but
+        // the wall sheet offers ZERO crease vertices to meet them — it's a full independent sheet
+        // with no edge at the crease. So the contact terminates in a T-junction against the wall's
+        // interior, and the two surfaces' sub-cell mismatch shows as the surface-mode slivers.
+        // (The fix is shared-crease meshing / T-junction welding, octree.rs:35-37's follow-up.)
+        assert!(contact_crease > 0, "expected the clipped contact to have crease vertices on the wall");
+        assert!(
+            wall_crease.is_empty(),
+            "regression guard: if the vein wall starts emitting crease vertices at the contact, the shared-crease fix has landed — update this test"
+        );
+    }
+
+    /// THE FIX (T-junction weld) — `mesh_cross_cut_surface_welded` welds each cut contact's crease
+    /// vertices INTO the vein wall, so the shared crease becomes shared vertices instead of a
+    /// T-junction. We assert every contact crease vertex on the wall now coincides with an ACTUAL
+    /// wall vertex (to sub-ε), which the un-welded wall (above) provably did not have. With
+    /// `weld=false` the same check fails (the escape hatch reproduces the old behavior).
+    #[test]
+    fn welding_shares_the_contact_crease_with_the_vein_wall() {
+        let (stack, vein_field) = vertical_vein_over_column();
+        let min = [0.0, 0.0, 0.0];
+        let size = 1000.0;
+        let depth = 6u32;
+        let cfg = OctreeConfig { max_depth: depth, min_depth: 2, qef_threshold: 1e-6, cap: false };
+        let ext = [size, size, size];
+        let cell = size / (1u32 << depth) as f64;
+        let (lo, hi) = {
+            let isos = vein_field.interface_isovalues();
+            (isos[0].min(isos[1]), isos[0].max(isos[1]))
+        };
+        let wall_dist = |p: [f64; 3]| -> f64 {
+            let f = vein_field.scalar_field(p);
+            let g = vein_field.scalar_field_gradient(p);
+            let gn = (g[0] * g[0] + g[1] * g[1] + g[2] * g[2]).sqrt().max(1e-12);
+            (f - lo).abs().min((f - hi).abs()) / gn
+        };
+        let on_box = |p: [f64; 3]| -> bool {
+            const E: f64 = 1.0;
+            p[0] < E || p[0] > size - E || p[1] < E || p[1] > size - E || p[2] < E || p[2] > size - E
+        };
+
+        // Harvest the contact crease points (on the wall, off the box) we need the wall to share.
+        let column_meshes = stack.mesh_surfaces(min, size, cfg);
+        let column = column_meshes.iter().find(|m| m.series == 1).unwrap();
+        let mut crease: Vec<[f64; 3]> = Vec::new();
+        for (_iid, m) in &column.interfaces {
+            for p in crate::weld::free_boundary_points(m) {
+                if !on_box(p) && wall_dist(p) <= cell {
+                    crease.push(p);
+                }
+            }
+        }
+        assert!(!crease.is_empty(), "no contact crease points harvested");
+
+        // All wall vertices of the WELDED wall, bucketed for nearest lookup.
+        let nearest_wall_vertex = |wall: &Mesh, p: [f64; 3]| -> f64 {
+            wall.positions
+                .chunks_exact(3)
+                .map(|v| {
+                    let d = [v[0] as f64 - p[0], v[1] as f64 - p[1], v[2] as f64 - p[2]];
+                    (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt()
+                })
+                .fold(f64::INFINITY, f64::min)
+        };
+
+        for k in 0..2 {
+            let welded = stack
+                .mesh_cross_cut_surface_welded(0, k, min, size, ext, cfg, true)
+                .expect("welded wall");
+            let unwelded = stack
+                .mesh_cross_cut_surface_welded(0, k, min, size, ext, cfg, false)
+                .expect("unwelded wall");
+
+            // For this wall, only count crease points that actually lie on IT (a vein has two
+            // walls; a given crease point belongs to one). A point is "on wall k" if welding put a
+            // wall vertex right at it.
+            let mut on_this_wall = 0;
+            let mut worst_welded = 0.0_f64;
+            let mut worst_unwelded = 0.0_f64;
+            for &p in &crease {
+                let dw = nearest_wall_vertex(&welded, p);
+                if dw > cell * 0.5 {
+                    continue; // this crease point belongs to the other wall
+                }
+                on_this_wall += 1;
+                worst_welded = worst_welded.max(dw);
+                worst_unwelded = worst_unwelded.max(nearest_wall_vertex(&unwelded, p));
+            }
+            eprintln!(
+                "wall {k}: {on_this_wall} crease pts | worst dist to a wall vertex: welded={worst_welded:.3}, unwelded={worst_unwelded:.3} (cell {cell:.2})",
+            );
+            assert!(on_this_wall > 0, "wall {k} shared no crease points");
+            // Welded: every crease point coincides with a wall vertex (the split inserted it). The
+            // tolerance is f32 mesh precision on a 1000-unit domain (~1e-2), not exact: the weld
+            // projects the point onto the wall surface, which can differ from the harvested point
+            // by f32 round-off, but it is the SAME shared vertex for rendering.
+            assert!(
+                worst_welded <= 0.05,
+                "wall {k}: welded wall should have a vertex AT each crease point; worst {worst_welded:.3}"
+            );
+            // Unwelded: the old behavior leaves them mid-face — a sizeable fraction of a cell away.
+            assert!(
+                worst_unwelded > cell * 0.1,
+                "wall {k}: expected the unwelded wall to MISS crease points (the bug); worst {worst_unwelded:.3}"
+            );
+        }
+    }
+
+    /// THE REAL TEST (see-through holes) — vertex-coincidence (above) is necessary but NOT
+    /// sufficient: two separate meshes can share approximate vertices and still leave gaps BETWEEN
+    /// them. This is what the user still sees. We MERGE the contact sheets and the welded vein
+    /// walls into one combined mesh (snapping coincident vertices to a shared index), then count
+    /// open edges that are NOT on the domain box — genuine see-through holes. A correct weld drives
+    /// these to zero along the crease; the un-welded path leaves many.
+    #[test]
+    fn welded_contact_and_wall_seam_is_watertight() {
+        let (stack, _vein_field) = vertical_vein_over_column();
+        let min = [0.0, 0.0, 0.0];
+        let size = 1000.0;
+        let depth = 6u32;
+        let ext = [size, size, size];
+        let cfg = OctreeConfig { max_depth: depth, min_depth: 2, qef_threshold: 1e-6, cap: false };
+        let cell = size / (1u32 << depth) as f64;
+
+        // Merge several meshes into one, welding vertices within `snap` to a shared index (a grid
+        // hash on the snap cell). Returns (positions, indices).
+        let merge = |meshes: &[&Mesh], snap: f64| -> (Vec<[f64; 3]>, Vec<u32>) {
+            let mut verts: Vec<[f64; 3]> = Vec::new();
+            let mut indices: Vec<u32> = Vec::new();
+            let mut hash: std::collections::HashMap<(i64, i64, i64), Vec<u32>> = std::collections::HashMap::new();
+            let key = |p: [f64; 3]| {
+                (
+                    (p[0] / snap).round() as i64,
+                    (p[1] / snap).round() as i64,
+                    (p[2] / snap).round() as i64,
+                )
+            };
+            for m in meshes {
+                let mut remap = vec![0u32; m.vertex_count()];
+                for vi in 0..m.vertex_count() {
+                    let p = [
+                        m.positions[vi * 3] as f64,
+                        m.positions[vi * 3 + 1] as f64,
+                        m.positions[vi * 3 + 2] as f64,
+                    ];
+                    // Find an existing vertex within snap in the 3³ neighbourhood.
+                    let (kx, ky, kz) = key(p);
+                    let mut found = u32::MAX;
+                    'outer: for dx in -1..=1 {
+                        for dy in -1..=1 {
+                            for dz in -1..=1 {
+                                if let Some(ids) = hash.get(&(kx + dx, ky + dy, kz + dz)) {
+                                    for &id in ids {
+                                        let q = verts[id as usize];
+                                        let d2 = (q[0] - p[0]).powi(2) + (q[1] - p[1]).powi(2) + (q[2] - p[2]).powi(2);
+                                        if d2 <= snap * snap {
+                                            found = id;
+                                            break 'outer;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    let id = if found != u32::MAX {
+                        found
+                    } else {
+                        let id = verts.len() as u32;
+                        verts.push(p);
+                        hash.entry((kx, ky, kz)).or_default().push(id);
+                        id
+                    };
+                    remap[vi] = id;
+                }
+                for &i in &m.indices {
+                    indices.push(remap[i as usize]);
+                }
+            }
+            (verts, indices)
+        };
+
+        let on_box = |p: [f64; 3]| -> bool {
+            const E: f64 = 1.0;
+            p[0] < E || p[0] > size - E || p[1] < E || p[1] > size - E || p[2] < E || p[2] > size - E
+        };
+
+        let count_interior_open = |weld: bool| -> usize {
+            // Contacts (series 1) + both vein walls (series 0), welded or not.
+            let column = stack.mesh_surfaces(min, size, cfg);
+            let col = column.iter().find(|m| m.series == 1).unwrap();
+            let mut meshes: Vec<Mesh> = col.interfaces.iter().map(|(_i, m)| m.clone()).collect();
+            for k in 0..2 {
+                meshes.push(
+                    stack
+                        .mesh_cross_cut_surface_welded(0, k, min, size, ext, cfg, weld)
+                        .unwrap(),
+                );
+            }
+            let refs: Vec<&Mesh> = meshes.iter().collect();
+            // Snap tolerance: a fraction of a cell (the weld places shared verts within ~0.006).
+            let (verts, indices) = merge(&refs, cell * 0.1);
+            // Count non-box open edges.
+            let mut inc: std::collections::HashMap<(u32, u32), u32> = std::collections::HashMap::new();
+            for t in indices.chunks_exact(3) {
+                for &(a, b) in &[(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+                    let e = if a < b { (a, b) } else { (b, a) };
+                    *inc.entry(e).or_insert(0) += 1;
+                }
+            }
+            let holes: Vec<[f64; 3]> = inc
+                .iter()
+                .filter(|(_, &c)| c == 1)
+                .filter(|((a, b), _)| !on_box(verts[*a as usize]) && !on_box(verts[*b as usize]))
+                .map(|((a, b), _)| {
+                    let (p, q) = (verts[*a as usize], verts[*b as usize]);
+                    [(p[0] + q[0]) * 0.5, (p[1] + q[1]) * 0.5, (p[2] + q[2]) * 0.5]
+                })
+                .collect();
+            holes.len()
+        };
+
+        let unwelded = count_interior_open(false);
+        let welded = count_interior_open(true);
+        eprintln!("interior (non-box) open edges: unwelded={unwelded}, welded={welded}");
+
+        // The weld must REDUCE the see-through holes. (Strict watertightness — welded==0 — may need
+        // more than vertex sharing; this asserts the weld at least closes the bulk of them, and
+        // pins the current number so we can drive it to zero.)
+        assert!(
+            welded < unwelded,
+            "weld did not reduce see-through holes: unwelded={unwelded} welded={welded}"
+        );
+    }
+
+    /// THE SHARED-CREASE FIX — co-contour the vein walls AND the cut contacts on ONE octree
+    /// (`mesh_cross_cut_shared`) so their crease is the SAME discretization. Merge all the meshes
+    /// and count non-box open edges: this should be DRAMATICALLY fewer than the independent meshes
+    /// (and far fewer than the point-weld's residual), because the seam is watertight by
+    /// construction, not patched after the fact.
+    #[test]
+    fn shared_crease_closes_the_seam() {
+        for probe_depth in [6u32, 7] {
+            shared_crease_holes_at_depth(probe_depth);
+        }
+    }
+
+    fn shared_crease_holes_at_depth(depth: u32) {
+        let (stack, _vein_field) = vertical_vein_over_column();
+        let min = [0.0, 0.0, 0.0];
+        let size = 1000.0;
+        let ext = [size, size, size];
+        let cfg = OctreeConfig { max_depth: depth, min_depth: 2, qef_threshold: 1e-6, cap: false };
+        let cell = size / (1u32 << depth) as f64;
+
+        let (walls, contacts) = stack
+            .mesh_cross_cut_shared(0, min, size, ext, cfg)
+            .expect("shared cross-cut meshing");
+        let mut all: Vec<&Mesh> = Vec::new();
+        for m in &walls {
+            all.push(m);
+        }
+        for (_j, _k, m) in &contacts {
+            all.push(m);
+        }
+
+        // Merge with vertex snapping (the contact and wall crease should now use IDENTICAL vertices
+        // since they were contoured on the same tree — snap is just for f32 round-off).
+        let snap = cell * 0.01;
+        let mut verts: Vec<[f64; 3]> = Vec::new();
+        let mut indices: Vec<u32> = Vec::new();
+        let mut hash: std::collections::HashMap<(i64, i64, i64), Vec<u32>> = std::collections::HashMap::new();
+        let key = |p: [f64; 3]| ((p[0] / snap).round() as i64, (p[1] / snap).round() as i64, (p[2] / snap).round() as i64);
+        for m in &all {
+            let mut remap = vec![0u32; m.vertex_count()];
+            for vi in 0..m.vertex_count() {
+                let p = [m.positions[vi * 3] as f64, m.positions[vi * 3 + 1] as f64, m.positions[vi * 3 + 2] as f64];
+                let (kx, ky, kz) = key(p);
+                let mut found = u32::MAX;
+                'o: for dx in -1..=1 {
+                    for dy in -1..=1 {
+                        for dz in -1..=1 {
+                            if let Some(ids) = hash.get(&(kx + dx, ky + dy, kz + dz)) {
+                                for &id in ids {
+                                    let q = verts[id as usize];
+                                    if (q[0] - p[0]).powi(2) + (q[1] - p[1]).powi(2) + (q[2] - p[2]).powi(2) <= snap * snap {
+                                        found = id;
+                                        break 'o;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                remap[vi] = if found != u32::MAX {
+                    found
+                } else {
+                    let id = verts.len() as u32;
+                    verts.push(p);
+                    hash.entry((kx, ky, kz)).or_default().push(id);
+                    id
+                };
+            }
+            for &idx in &m.indices {
+                indices.push(remap[idx as usize]);
+            }
+        }
+        let on_box = |p: [f64; 3]| -> bool {
+            const E: f64 = 1.0;
+            p[0] < E || p[0] > size - E || p[1] < E || p[1] > size - E || p[2] < E || p[2] > size - E
+        };
+        let mut inc: std::collections::HashMap<(u32, u32), u32> = std::collections::HashMap::new();
+        for t in indices.chunks_exact(3) {
+            for &(a, b) in &[(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+                let e = if a < b { (a, b) } else { (b, a) };
+                *inc.entry(e).or_insert(0) += 1;
+            }
+        }
+        let open_edges: Vec<[f64; 3]> = inc
+            .iter()
+            .filter(|(_, &c)| c == 1)
+            .map(|(&(a, b), _)| (verts[a as usize], verts[b as usize]))
+            .filter(|(p, q)| !on_box(*p) && !on_box(*q))
+            .map(|(p, q)| [(p[0] + q[0]) * 0.5, (p[1] + q[1]) * 0.5, (p[2] + q[2]) * 0.5])
+            .collect();
+        let interior_open = open_edges.len();
+
+        // The few remaining non-box open edges are the contact sheets' LEGITIMATE free boundary
+        // where they end against the wall (a clipped open sheet has a free perimeter, exactly like
+        // an onlap pinch-out). What matters is whether they are SEE-THROUGH: an open edge is benign
+        // if a WALL triangle backs it (the wall is right behind where the contact ends), and a real
+        // hole only if NOTHING backs it. We count the genuinely-unbacked edges — the visible gaps.
+        let backed = |mid: [f64; 3]| -> bool {
+            for w in &walls {
+                for t in w.indices.chunks_exact(3) {
+                    let tp = |k: usize| {
+                        let v = t[k] as usize * 3;
+                        [w.positions[v] as f64, w.positions[v + 1] as f64, w.positions[v + 2] as f64]
+                    };
+                    let closest = crate::weld::closest_point_on_triangle_pub(mid, tp(0), tp(1), tp(2));
+                    let d2 = (closest[0] - mid[0]).powi(2) + (closest[1] - mid[1]).powi(2) + (closest[2] - mid[2]).powi(2);
+                    if d2 < (cell * 0.1).powi(2) {
+                        return true;
+                    }
+                }
+            }
+            false
+        };
+        let see_through = open_edges.iter().filter(|&&mid| !backed(mid)).count();
+        eprintln!(
+            "shared-crease: {interior_open} non-box open edges, {see_through} genuinely SEE-THROUGH (point-weld left ~68 holes, many see-through)"
+        );
+
+        // The fix: NO genuinely see-through holes at the contact↔wall seam (the residual open edges
+        // are backed contact-sheet perimeters, not visible gaps).
+        assert_eq!(
+            see_through, 0,
+            "shared-crease left {see_through} see-through holes at the seam"
+        );
+    }
+
+    /// REPRO (vein-body ↔ cross-cut-rock gap) — the bug behind the see-through vertical channel
+    /// in the web3 solid view. The web3 worker meshes the vein's INTERIOR solid (its namesake
+    /// lithology) via `mesh_cross_cut_solid`, AND the surrounding rock units via
+    /// `mesh_one_block_unit_solid`. These are TWO independent dual-contourings of the SAME
+    /// foot-wall surface, from OPPOSITE sides (the vein fills the band UP TO the wall; the rock
+    /// pulls back to the wall from outside) — different code paths, no shared vertices, no weld.
+    /// If they disagree by a sub-cell amount the vein body and the rock don't meet, leaving the
+    /// channel. (`adjacent_units_share_the_vein_wall` showed same-side rock units DO agree; the
+    /// untested seam is body-vs-rock.)
+    ///
+    /// We sample each mesh's foot-wall x per y-row at the bed level and compare. A flush model
+    /// has the two surfaces coincide to a sub-cell tolerance.
+    #[test]
+    fn vein_body_meets_the_cross_cut_rock() {
+        let (stack, vein_field) = vertical_vein_over_column();
+        let min = [0.0, 0.0, 0.0];
+        let size = 1000.0;
+        let ext = [1000.0, 1000.0, 1000.0];
+        let depth = 6u32;
+        let cfg = OctreeConfig { max_depth: depth, min_depth: 2, qef_threshold: 1e-6, cap: true };
+        let cell = size / (1u32 << depth) as f64;
+
+        let (lo, hi) = {
+            let isos = vein_field.interface_isovalues();
+            (isos[0].min(isos[1]), isos[0].max(isos[1]))
+        };
+
+        let _ = (lo, hi);
+        // Per (y,z) cell along the wall, the x each mesh's foot-wall vertices reach. Both the
+        // vein body's RIGHT-going face and the rock's right face live in x∈[350,450] near the FW
+        // plane; we take, per cell, the x nearest the plane from each mesh and compare. No
+        // field-sign split — vertices ON the wall (f≈lo) must not be discarded.
+        let wall_x = |mesh: &Mesh| -> std::collections::HashMap<(i64, i64), f64> {
+            let mut by_cell: std::collections::HashMap<(i64, i64), f64> = std::collections::HashMap::new();
+            for v in mesh.positions.chunks_exact(3) {
+                let p = [v[0] as f64, v[1] as f64, v[2] as f64];
+                if p[1] < 200.0 || p[1] > 800.0 || p[2] < 100.0 || p[2] > 900.0 {
+                    continue; // wall interior, away from box rims
+                }
+                if p[0] < 350.0 || p[0] > 450.0 {
+                    continue; // foot-wall plane (x≈400) vicinity only
+                }
+                let key = ((p[1] / cell).round() as i64, (p[2] / cell).round() as i64);
+                // x closest to the FW plane (x=400) in this cell.
+                by_cell
+                    .entry(key)
+                    .and_modify(|x| {
+                        if (p[0] - 400.0).abs() < (*x - 400.0).abs() {
+                            *x = p[0];
+                        }
+                    })
+                    .or_insert(p[0]);
+            }
+            by_cell
+        };
+
+        let vein_body = stack
+            .mesh_cross_cut_solid(0, min, size, ext, cfg)
+            .expect("vein interior should mesh");
+        // The cross-cut rock: unit 0 of the column (below z=350) survives left of the FW wall.
+        let rock = stack
+            .mesh_one_block_unit_solid(1, 0, 0, min, size, ext, cfg)
+            .expect("rock unit should mesh");
+
+        let body_x = wall_x(&vein_body);
+        let rock_x = wall_x(&rock);
+        assert!(!body_x.is_empty() && !rock_x.is_empty(), "no foot-wall vertices to compare");
+
+        let mut worst = 0.0_f64;
+        let mut compared = 0;
+        for (key, &bx) in &body_x {
+            if let Some(&rx) = rock_x.get(key) {
+                worst = worst.max((bx - rx).abs());
+                compared += 1;
+            }
+        }
+        eprintln!(
+            "finest_cell={cell:.2} compared {compared} cells | worst body↔rock foot-wall disagreement = {worst:.2} ({:.2} cells)",
+            worst / cell
+        );
+        assert!(compared > 0, "body and rock shared no wall cells to compare");
+
+        let tol = cell * 0.25;
+        assert!(
+            worst <= tol,
+            "vein body and cross-cut rock disagree on the foot-wall by {worst:.2} (> {tol:.2}); they contour it independently → the visible see-through channel"
+        );
     }
 }

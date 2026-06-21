@@ -49,6 +49,10 @@ export interface RunCommand {
    *  assignment to this index form alongside `toSeriesJson`. Absent ⇒ solids untagged
    *  (default Unknown colour applied UI-side). (feature 003 §5.3) */
   assignment?: Record<string, string>;
+  /** Weld each cross-cutting wall's T-junctions against the contacts it cuts (the surface-mode
+   *  sliver fix, `crate::weld`). Defaults to `true` when omitted. The UI passes `false` to A/B the
+   *  old independent-mesh behavior. */
+  weldTJunctions?: boolean;
 }
 
 export type Command = RunCommand;

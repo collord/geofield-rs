@@ -33,6 +33,8 @@ pub mod faulted;
 // boundaries (correlative conformity) without duplication. Data layer only in v1.
 pub mod surface;
 
+pub mod weld;
+
 #[cfg(feature = "wasm")]
 pub mod wasm;
 

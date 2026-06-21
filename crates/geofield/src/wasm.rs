@@ -176,6 +176,51 @@ const EMPTY_MESH: fn() -> WasmMesh = || WasmMesh {
     indices: Vec::new(),
 };
 
+/// A mesh tagged with the `(series, interface)` it belongs to — the return shape of the
+/// shared-crease cross-cut meshing, so the worker can place each contact in its own payload and
+/// SKIP re-meshing it on the series path. `kind` is "wall" for the body's own surface, "contact"
+/// for a cut series' contact.
+#[wasm_bindgen]
+pub struct WasmTaggedMesh {
+    series: usize,
+    interface: usize,
+    is_contact: bool,
+    positions: Vec<f32>,
+    normals: Vec<f32>,
+    indices: Vec<u32>,
+}
+
+#[wasm_bindgen]
+impl WasmTaggedMesh {
+    #[wasm_bindgen(getter)]
+    pub fn series(&self) -> usize {
+        self.series
+    }
+    #[wasm_bindgen(getter)]
+    pub fn interface(&self) -> usize {
+        self.interface
+    }
+    /// `true` if this is a cut series' contact (route it to the series path's payload and skip the
+    /// duplicate); `false` if it's the cross-cutting body's own wall.
+    #[wasm_bindgen(getter)]
+    pub fn is_contact(&self) -> bool {
+        self.is_contact
+    }
+    pub fn positions(&self) -> Vec<f32> {
+        self.positions.clone()
+    }
+    pub fn normals(&self) -> Vec<f32> {
+        self.normals.clone()
+    }
+    pub fn indices(&self) -> Vec<u32> {
+        self.indices.clone()
+    }
+    #[wasm_bindgen(getter)]
+    pub fn triangle_count(&self) -> usize {
+        self.indices.len() / 3
+    }
+}
+
 /// A fitted model exposed to JS. Wraps a [`RemoteModel`] handle into the kernel module.
 #[wasm_bindgen]
 pub struct WasmModel {
@@ -752,14 +797,72 @@ impl WasmStack {
         max_depth: u32,
         min_depth: u32,
         qef_threshold: f64,
+        weld: bool,
     ) -> WasmMesh {
         let cfg = octree_cfg(max_depth, min_depth, qef_threshold, false);
+        // When `weld` is set, the wall's T-junctions against the contacts it cuts are welded shut
+        // (the surface-mode slivers fix); `false` is the escape hatch to the old independent mesh.
         self.inner
-            .mesh_cross_cut_surface(
-                series, interface_idx, [min_x, min_y, min_z], size, [ext_x, ext_y, ext_z], cfg,
+            .mesh_cross_cut_surface_welded(
+                series, interface_idx, [min_x, min_y, min_z], size, [ext_x, ext_y, ext_z], cfg, weld,
             )
             .map(Into::into)
             .unwrap_or_else(EMPTY_MESH)
+    }
+
+    /// SHARED-CREASE cross-cut meshing (the watertight-by-construction fix for the contact↔wall
+    /// see-through holes). Co-contours the body's walls AND the contacts it cuts on ONE octree, and
+    /// returns them tagged: each [`WasmTaggedMesh`] carries its `(series, interface)` and an
+    /// `is_contact` flag. The worker emits the walls (body's own surfaces) and the contacts, and
+    /// SKIPS re-meshing the returned `(series, interface)` contacts on the series path. Empty Vec
+    /// for a stratigraphic series / out-of-range body.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mesh_cross_cut_shared_octree(
+        &self,
+        series: usize,
+        min_x: f64,
+        min_y: f64,
+        min_z: f64,
+        size: f64,
+        ext_x: f64,
+        ext_y: f64,
+        ext_z: f64,
+        max_depth: u32,
+        min_depth: u32,
+        qef_threshold: f64,
+    ) -> Vec<WasmTaggedMesh> {
+        let cfg = octree_cfg(max_depth, min_depth, qef_threshold, false);
+        let Some((walls, contacts)) = self.inner.mesh_cross_cut_shared(
+            series,
+            [min_x, min_y, min_z],
+            size,
+            [ext_x, ext_y, ext_z],
+            cfg,
+        ) else {
+            return Vec::new();
+        };
+        let mut out: Vec<WasmTaggedMesh> = Vec::new();
+        for (k, m) in walls.into_iter().enumerate() {
+            out.push(WasmTaggedMesh {
+                series,
+                interface: k,
+                is_contact: false,
+                positions: m.positions,
+                normals: m.normals,
+                indices: m.indices,
+            });
+        }
+        for (j, k, m) in contacts {
+            out.push(WasmTaggedMesh {
+                series: j,
+                interface: k,
+                is_contact: true,
+                positions: m.positions,
+                normals: m.normals,
+                indices: m.indices,
+            });
+        }
+        out
     }
 
     /// Closed watertight INTERIOR SOLID of a cross-cutting body (vein/intrusion) — its

@@ -76,6 +76,29 @@ function verticalWall(name: string, x0: number): InterfaceData {
   };
 }
 
+/** A DIPPING planar wall: the plane through `(x0, *, 500)` tilted by `dxdz` (Δx per Δz), so the
+ *  vein walls are oblique to the octree grid instead of axis-aligned. Two points at different z
+ *  (so the wall's x shifts with depth) + one orientation whose pole tilts with the dip. This is
+ *  the diagnostic variant: an oblique cut-wall is the case a grid-aligned vertical wall can't
+ *  exercise, and the one most likely to expose a sub-cell seam between the vein body and the
+ *  cross-cut rock (the suspected see-through channel). */
+function dippingWall(name: string, x0: number, dxdz: number): InterfaceData {
+  // x(z) = x0 + dxdz·(z − 500). Pole faces +X tilted by the dip: (1, 0, −dxdz) normalized.
+  const x = (z: number) => x0 + dxdz * (z - 500);
+  const n = Math.hypot(1, 0, dxdz);
+  const dip = (Math.acos(1 / n) * 180) / Math.PI; // 90° when vertical (dxdz→∞ would be flat)
+  return {
+    id: newId("iface"),
+    name,
+    points: [
+      { x: x(200), y: 500, z: 200 },
+      { x: x(800), y: 500, z: 800 },
+    ],
+    // dipDir 90° = facing +X; the dip angle off-vertical is governed by the tilt.
+    orientations: [{ x: x0, y: 500, z: 500, dip: 90 - dip, dipDir: 90 }],
+  };
+}
+
 /** The 3-contact floor (z = 300/500/700) as one conformable, unbounded-above series. */
 function threeContactFloor(): ProjectElement {
   return {
@@ -149,6 +172,27 @@ export const TEMPLATES: Template[] = [
           name: "quartz vein",
           footWall: verticalWall("foot wall", 400),
           hangingWall: verticalWall("hanging wall", 600),
+        },
+        threeContactFloor(),
+      ],
+      extent: EXTENT,
+    }),
+  },
+  {
+    id: "cross-cutting-vein-dipping",
+    name: "Cross-cutting vein (dipping) — repro",
+    description:
+      "DIAGNOSTIC: like the vein scenario but the walls DIP (oblique to the grid), the case a vertical wall can't exercise. Toggle to Solids and look for a see-through channel between the vein body and the cross-cut beds.",
+    build: () => ({
+      version: 1,
+      name: "cross-cutting-vein-dipping",
+      elements: [
+        {
+          kind: "vein",
+          id: newId("el"),
+          name: "quartz vein",
+          footWall: dippingWall("foot wall", 400, 0.5),
+          hangingWall: dippingWall("hanging wall", 600, 0.5),
         },
         threeContactFloor(),
       ],

@@ -912,6 +912,74 @@ pub fn octree_dual_contour_scene(
     mesh
 }
 
+/// Re-sample every leaf's cached corner data (`corners`, `inside`) from `scene`, and clear the
+/// per-contour output (`out`, `edge_owner`). Used by [`octree_dual_contour_shared`] to contour a
+/// DIFFERENT scene on a tree whose topology was built for another — so both contours run on the
+/// SAME cell subdivision and their shared-edge crossings coincide.
+fn resample_leaves(tree: &mut Octree, scene: &Scene) {
+    for id in 0..tree.nodes.len() {
+        let (min, size) = tree.bounds[id];
+        if let Node::Leaf(_) = &tree.nodes[id] {
+            let (corners, inside) = sample_corners(scene, min, size);
+            if let Node::Leaf(l) = &mut tree.nodes[id] {
+                l.corners = corners;
+                l.inside = inside;
+                l.out = Vec::new();
+                l.edge_owner = [u8::MAX; 12];
+            }
+        }
+    }
+}
+
+/// Contour `scene` on an already-built `tree` (its leaves re-sampled for `scene`), returning the
+/// mesh. Mirrors the tail of [`octree_dual_contour_scene`] but takes the tree as given — no
+/// build/refine/balance, so the subdivision is whatever the caller built.
+fn contour_on_tree(tree: &mut Octree, scene: &Scene, cfg: &OctreeConfig) -> Mesh {
+    let mut mesh = Mesh::default();
+    let mut contact_face: Vec<bool> = Vec::new();
+    assign_vertices(tree, scene, &mut mesh, true);
+    contour_edges(tree, scene, &mut mesh, &mut contact_face);
+    orient_closed_outward(&mut mesh);
+    if !cfg.cap {
+        keep_contact_faces(&mut mesh, &contact_face);
+    }
+    mesh
+}
+
+/// SHARED-CREASE contouring. Build ONE octree from `build_scene` (which must carry every other
+/// surface as a contributor, so refinement subdivides wherever ANY of them crosses — `is_surface`
+/// and `edge_double_crossed` already consider contributors), then contour each scene in `scenes`
+/// on that SAME subdivision. Because both passes evaluate `edge_crossings` on identical cell edges,
+/// a crease shared by two surfaces lands on the SAME edge crossings in both meshes — no T-junctions
+/// or see-through holes at the seam (the octree.rs:35-37 follow-up, solved by sharing the tree).
+///
+/// Returns one mesh per scene, in order. `build_scene` is typically `scenes[0]` (the primary), but
+/// is passed separately so the caller can use a richer refinement scene than any single contour.
+pub fn octree_dual_contour_shared(
+    build_scene: &Scene,
+    scenes: &[&Scene],
+    min: [f64; 3],
+    size: f64,
+    cfg: OctreeConfig,
+) -> Vec<Mesh> {
+    let mut tree = Octree {
+        nodes: Vec::new(),
+        bounds: Vec::new(),
+        root: 0,
+    };
+    tree.root = build(&mut tree, build_scene, min, size, 0, &cfg);
+    refine_double_crossed(&mut tree, build_scene, &cfg);
+    balance(&mut tree, build_scene, &cfg);
+
+    scenes
+        .iter()
+        .map(|s| {
+            resample_leaves(&mut tree, s);
+            contour_on_tree(&mut tree, s, &cfg)
+        })
+        .collect()
+}
+
 /// Flood-fill a globally consistent winding across a closed mesh's shared edges,
 /// then flip the whole mesh outward by signed volume. No per-face probe, so no
 /// back-face band.
