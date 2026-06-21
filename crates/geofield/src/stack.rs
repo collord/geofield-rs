@@ -902,9 +902,14 @@ impl<M: SeriesModel + BlockModel> Stack<M> {
             .map(|&iso| Scene::new(&body_field, iso, wall_contribs.clone()))
             .collect();
 
-        // Cut contacts: each contact field at its isovalue, clipped by box + its maskers + the BODY
-        // (so the contact terminates on the body wall — the crease).
-        let body_as_contrib = ContactHalfSpace::new(&body_field, body_isos[0], false);
+        // Cut contacts: each contact field at its isovalue, clipped by box + its OWN maskers.
+        // Those maskers ALREADY include this younger body's clip (a vein's `SlabExterior` — the
+        // contact survives OUTSIDE the band, on BOTH sides — or an intrusion's exterior), exactly
+        // as the independent `mesh_one_clipped` path builds it. (An earlier version ALSO pushed a
+        // one-sided `ContactHalfSpace` for the body here, which double-clipped the contact to a
+        // single side and erased half the sediments — the body clip is the masker, not a
+        // half-space.) The crease still lands on the wall because the body's `SlabExterior` masker
+        // crosses there, contoured on the SHARED tree so it coincides with the wall.
         let contact_scenes: Vec<Scene> = (0..cut_fields.len())
             .map(|ci| {
                 let mut contribs: Vec<&dyn Boundary> = Vec::new();
@@ -912,7 +917,6 @@ impl<M: SeriesModel + BlockModel> Stack<M> {
                 for m in &cut_maskers[ci] {
                     contribs.push(m.as_ref());
                 }
-                contribs.push(&body_as_contrib);
                 Scene::new(cut_fields[ci].as_ref(), cut_isos[ci], contribs)
             })
             .collect();
@@ -2772,6 +2776,29 @@ mod tests {
         let (walls, contacts) = stack
             .mesh_cross_cut_shared(0, min, size, ext, cfg)
             .expect("shared cross-cut meshing");
+
+        // REGRESSION: a vein clips the contacts to OUTSIDE its band — both the foot-wall side
+        // (small x) AND the hanging-wall side (large x) survive. A one-sided clip (the bug that
+        // erased half the sediments) would leave contact vertices on only ONE side of the band
+        // (≈[400,600] in x at the column mid). Assert each contact has vertices on BOTH sides.
+        for (j, k, m) in &contacts {
+            let mut has_left = false;
+            let mut has_right = false;
+            for v in m.positions.chunks_exact(3) {
+                let x = v[0] as f64;
+                if x < 350.0 {
+                    has_left = true;
+                }
+                if x > 650.0 {
+                    has_right = true;
+                }
+            }
+            assert!(
+                has_left && has_right,
+                "contact (series {j}, iface {k}) survives on only one side of the vein (left={has_left}, right={has_right}) — the clip is one-sided"
+            );
+        }
+
         let mut all: Vec<&Mesh> = Vec::new();
         for m in &walls {
             all.push(m);
