@@ -942,12 +942,33 @@ impl<M: SeriesModel + BlockModel> Stack<M> {
         }
         let meshes = octree_dual_contour_shared(&build_scene, &all_scenes, min, size, surf_cfg);
         let (walls, contacts) = meshes.split_at(n_walls);
+        let walls: Vec<Mesh> = walls.to_vec();
+
+        // SNAP each contact's clip-edge crease onto the wall surface. The shared tree makes the
+        // contact and wall agree on the crease to SUB-cell, but their projected vertices still
+        // differ by a sub-cell amount (the contact's Seam vertex is contact∩wall; the wall's vertex
+        // is mid-wall), leaving see-through dashes where the contact edge lands just short of the
+        // wall. Snapping the contact's free-boundary crease vertices onto the nearest wall triangle
+        // closes that gap. This is the MESH-AGNOSTIC closer (triangles only) — the same call will
+        // serve an IMPORTED wall mesh that has no defining field.
+        let cell = size / (1u32 << surf_cfg.max_depth) as f64;
+        // A crease vertex normally sits within ~a cell of the wall, but where an under-constrained
+        // wall fit bulges, the contact's clip can diverge up to ~2.5 cells; reach across that so
+        // those worst-case dashes still close. (Larger than the wall's own facet error would risk
+        // snapping unrelated geometry, so this is bounded, not unlimited.)
+        let snap_eps = cell * 3.0;
         let tagged_contacts: Vec<(usize, usize, Mesh)> = contacts
             .iter()
             .zip(&cut_ids)
-            .map(|(m, &(j, k))| (j, k, m.clone()))
+            .map(|(m, &(j, k))| {
+                let mut contact = m.clone();
+                for w in &walls {
+                    crate::weld::snap_free_boundary_to_mesh(&mut contact, w, snap_eps, cell);
+                }
+                (j, k, contact)
+            })
             .collect();
-        Some((walls.to_vec(), tagged_contacts))
+        Some((walls, tagged_contacts))
     }
 
     /// Mesh the closed, watertight INTERIOR SOLID of a cross-cutting body (vein/intrusion) at
@@ -2789,6 +2810,104 @@ mod tests {
             hi <= lo * 3,
             "vein walls wildly asymmetric ({lo} vs {hi} tris) — one wall is under-refined (the spiky-crest bug)"
         );
+    }
+
+    /// REGRESSION (see-through dashes) — at fine resolution the contact's clip-edge crease lands
+    /// SUB-cell short of the vein wall, leaving open edges with no wall triangle behind them (the
+    /// dashes the user saw). The shared tree shrinks the gap but doesn't close it; the
+    /// `snap_free_boundary_to_mesh` pass in `mesh_cross_cut_shared` does. We reproduce at depth 7
+    /// (where the gap is visible — depth 6 hid it) on the BROWSER geometry exactly (2-point dipping
+    /// walls over a 3-bed 2-point floor), and assert ZERO genuinely-unbacked open edges.
+    #[test]
+    fn no_see_through_dashes_at_the_contact_wall_seam() {
+        // Match the BROWSER geometry exactly: a dipping vein (2-point walls) over a 3-bed floor
+        // whose beds are each a 2-POINT dipping fit (z=300/500/700) — the under-constrained, wavy
+        // contacts the browser meshes (web3 `dippingInterface`/`threeContactFloor`). The
+        // well-conditioned `two_contact_model` 4x4 fit does NOT reproduce the holes.
+        let dxdz = 0.5;
+        let build_vein = || {
+            let mut sps = Vec::new();
+            for (id, x0) in [(0u32, 400.0), (1u32, 600.0)] {
+                sps.push(SurfacePoint::new([x0 + dxdz * (200.0 - 500.0), 500.0, 200.0], id));
+                sps.push(SurfacePoint::new([x0 + dxdz * (800.0 - 500.0), 500.0, 800.0], id));
+            }
+            let oris = vec![Orientation::new([500.0, 500.0, 500.0], normalize([1.0, 0.0, -dxdz]))];
+            Model::fit(&Series::new(sps, oris), KernelOptions::default())
+        };
+        // A 3-bed floor: each bed a 2-point flat fit at z0 (mirrors web3 dippingInterface(z0,0,0)).
+        let bed = |z0: f64| {
+            let sps = vec![
+                SurfacePoint::new([200.0, 500.0, z0], 0),
+                SurfacePoint::new([800.0, 500.0, z0], 0),
+            ];
+            let oris = vec![Orientation::new([500.0, 500.0, z0], [0.0, 0.0, 1.0])];
+            Model::fit(&Series::new(sps, oris), KernelOptions::default())
+        };
+        let _ = bed; // (single-bed helper kept for clarity; a 3-interface model is used)
+        let mut sps = Vec::new();
+        for (id, z0) in [(0u32, 300.0), (1u32, 500.0), (2u32, 700.0)] {
+            sps.push(SurfacePoint::new([200.0, 500.0, z0], id));
+            sps.push(SurfacePoint::new([800.0, 500.0, z0], id));
+        }
+        let floor_model = Model::fit(
+            &Series::new(sps, vec![Orientation::new([500.0, 500.0, 500.0], [0.0, 0.0, 1.0])]),
+            KernelOptions::default(),
+        );
+        let stack = Stack::new(vec![
+            StackElement::Vein(Vein::new(build_vein(), 0, 1)),
+            StackElement::Series(StackedSeries::floor(floor_model)),
+        ]);
+        let vf = build_vein();
+        let min = [0.0, 0.0, 0.0];
+        let size = 1000.0;
+        let depth = 7u32; // browser-like fine walls (its walls were ~16k tris vs native ~3k at d6)
+        let cfg = OctreeConfig { max_depth: depth, min_depth: 2, qef_threshold: 1e-6, cap: false };
+        let cell = size / (1u32 << depth) as f64;
+        let (walls, contacts) = stack.mesh_cross_cut_shared(0, min, size, [size, size, size], cfg).unwrap();
+        let on_box = |p: [f64; 3]| {
+            const E: f64 = 1.0;
+            p[0] < E || p[0] > size - E || p[1] < E || p[1] > size - E || p[2] < E || p[2] > size - E
+        };
+        // Backed by a wall triangle?
+        let backed = |mid: [f64; 3]| {
+            for w in &walls {
+                for t in w.indices.chunks_exact(3) {
+                    let tp = |k: usize| { let v = t[k] as usize * 3; [w.positions[v] as f64, w.positions[v+1] as f64, w.positions[v+2] as f64] };
+                    let c = crate::weld::closest_point_on_triangle_pub(mid, tp(0), tp(1), tp(2));
+                    if (c[0]-mid[0]).powi(2)+(c[1]-mid[1]).powi(2)+(c[2]-mid[2]).powi(2) < (cell*0.1).powi(2) { return true; }
+                }
+            }
+            false
+        };
+        let _ = vf;
+        let count_unbacked = |meshes: &[&Mesh]| -> usize {
+            let mut n = 0;
+            for m in meshes {
+                let mut inc: std::collections::HashMap<(u32,u32),u32> = std::collections::HashMap::new();
+                for t in m.indices.chunks_exact(3) {
+                    for &(a,b) in &[(t[0],t[1]),(t[1],t[2]),(t[2],t[0])] { let e = if a<b {(a,b)} else {(b,a)}; *inc.entry(e).or_insert(0)+=1; }
+                }
+                for (&(a,b),&c) in &inc {
+                    if c != 1 { continue; }
+                    let pa = [m.positions[a as usize*3] as f64, m.positions[a as usize*3+1] as f64, m.positions[a as usize*3+2] as f64];
+                    let pb = [m.positions[b as usize*3] as f64, m.positions[b as usize*3+1] as f64, m.positions[b as usize*3+2] as f64];
+                    if on_box(pa) || on_box(pb) { continue; }
+                    let mid = [(pa[0]+pb[0])*0.5,(pa[1]+pb[1])*0.5,(pa[2]+pb[2])*0.5];
+                    if !backed(mid) { n += 1; }
+                }
+            }
+            n
+        };
+        let wall_refs: Vec<&Mesh> = walls.iter().collect();
+        let contact_refs: Vec<&Mesh> = contacts.iter().map(|(_,_,m)| m).collect();
+        let wall_unbacked = count_unbacked(&wall_refs);
+        let contact_unbacked = count_unbacked(&contact_refs);
+        eprintln!("unbacked open edges — walls: {wall_unbacked}, contacts: {contact_unbacked}");
+        assert_eq!(
+            contact_unbacked, 0,
+            "contact crease leaves {contact_unbacked} see-through dashes (unbacked by the wall) — the snap-to-wall closer regressed"
+        );
+        assert_eq!(wall_unbacked, 0, "wall has {wall_unbacked} unbacked open edges");
     }
 
     /// THE SHARED-CREASE FIX — co-contour the vein walls AND the cut contacts on ONE octree

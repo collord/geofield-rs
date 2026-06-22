@@ -457,6 +457,74 @@ pub fn weld_points_into_mesh(
     welded
 }
 
+/// SNAP `sheet`'s free-boundary vertices ONTO `target`'s surface: move each free-boundary vertex
+/// within `weld_eps` of a `target` triangle to the closest point on that triangle. This is the
+/// MESH-AGNOSTIC seam closer — `target` is just triangles, so it works whether the wall came from
+/// our implicit field OR was IMPORTED (no field). Unlike [`weld_points_into_mesh`] (which splits
+/// the TARGET to admit the sheet's vertices), this moves the SHEET's own crease vertices onto the
+/// target, closing the gap where a clipped contact's edge lands sub-cell SHORT of the wall (the
+/// see-through dashes the shared tree shrinks but doesn't eliminate). Returns vertices moved.
+///
+/// Only free-boundary vertices are touched (interior sheet vertices stay put), and only those
+/// within `weld_eps` of the target (so the box-rim boundary, far from the wall, is left alone).
+/// `cell` sizes the spatial hash (≈ the target's typical edge length).
+pub fn snap_free_boundary_to_mesh(
+    sheet: &mut Mesh,
+    target: &Mesh,
+    weld_eps: f64,
+    cell: f64,
+) -> usize {
+    if sheet.triangle_count() == 0 || target.triangle_count() == 0 {
+        return 0;
+    }
+    // Which sheet vertices are on its free boundary (incidence-1 edges).
+    let mut inc: std::collections::HashMap<(u32, u32), u32> = std::collections::HashMap::new();
+    for t in sheet.indices.chunks_exact(3) {
+        for &(a, b) in &[(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+            let e = if a < b { (a, b) } else { (b, a) };
+            *inc.entry(e).or_insert(0) += 1;
+        }
+    }
+    let mut free: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    for (&(a, b), &c) in &inc {
+        if c == 1 {
+            free.insert(a);
+            free.insert(b);
+        }
+    }
+
+    let grid = TriGrid::build(target, cell);
+    let mut moved = 0;
+    for vi in free {
+        let p = pos(sheet, vi);
+        let cand = grid.candidates(p);
+        // Closest point across candidate target triangles.
+        let mut best = (weld_eps * weld_eps, None::<[f64; 3]>);
+        for &tri in &cand {
+            let i = tri * 3;
+            let (a, b, c) = (
+                pos(target, target.indices[i]),
+                pos(target, target.indices[i + 1]),
+                pos(target, target.indices[i + 2]),
+            );
+            let (q, _) = closest_on_triangle(p, a, b, c);
+            let d = sub(q, p);
+            let d2 = dot(d, d);
+            if d2 < best.0 {
+                best = (d2, Some(q));
+            }
+        }
+        if let Some(q) = best.1 {
+            let o = vi as usize * 3;
+            sheet.positions[o] = q[0] as f32;
+            sheet.positions[o + 1] = q[1] as f32;
+            sheet.positions[o + 2] = q[2] as f32;
+            moved += 1;
+        }
+    }
+    moved
+}
+
 /// The positions of `mesh`'s free-boundary vertices (those on an undirected edge with incidence
 /// 1). These are a clipped open sheet's rim — its outer box rim AND its inner clip crease where it
 /// terminates against another surface. Callers filter to the ones actually on the target surface
@@ -576,5 +644,35 @@ mod tests {
         assert_eq!(m.triangle_count(), before + 2);
         let (nm, _) = edge_incidence(&m);
         assert_eq!(nm, 0);
+    }
+
+    /// A sheet whose free-boundary vertex sits slightly OFF a target wall is snapped onto the
+    /// wall's surface (the mesh-agnostic seam closer — works for an imported wall, no field). A
+    /// vertex too far (> weld_eps) is left alone.
+    #[test]
+    fn snap_moves_only_near_free_boundary_onto_target() {
+        // Target: a vertical wall quad in the x=1 plane, spanning y,z ∈ [0,1].
+        let mut wall = Mesh::default();
+        for p in [[1.0, 0.0, 0.0], [1.0, 1.0, 0.0], [1.0, 1.0, 1.0], [1.0, 0.0, 1.0]] {
+            wall.positions.extend([p[0] as f32, p[1] as f32, p[2] as f32]);
+            wall.normals.extend([1.0, 0.0, 0.0]);
+        }
+        wall.indices.extend([0, 1, 2, 0, 2, 3]);
+
+        // Sheet: a horizontal quad whose RIGHT edge (x≈0.92) is a free boundary just short of the
+        // wall at x=1 — the contact-crease-short-of-the-wall case. Its left edge is far away.
+        let mut sheet = Mesh::default();
+        for p in [[0.0, 0.0, 0.5], [0.92, 0.0, 0.5], [0.92, 1.0, 0.5], [0.0, 1.0, 0.5]] {
+            sheet.positions.extend([p[0] as f32, p[1] as f32, p[2] as f32]);
+            sheet.normals.extend([0.0, 0.0, 1.0]);
+        }
+        sheet.indices.extend([0, 1, 2, 0, 2, 3]);
+
+        let moved = snap_free_boundary_to_mesh(&mut sheet, &wall, 0.2, 1.0);
+        assert_eq!(moved, 2, "the two right-edge vertices (within eps of the wall) snap");
+        // Those two vertices now lie ON the wall (x == 1); the far-left two are untouched (x == 0).
+        let xs: Vec<f32> = sheet.positions.chunks_exact(3).map(|p| p[0]).collect();
+        assert_eq!(xs.iter().filter(|&&x| (x - 1.0).abs() < 1e-5).count(), 2, "right edge on wall");
+        assert_eq!(xs.iter().filter(|&&x| x.abs() < 1e-5).count(), 2, "left edge untouched");
     }
 }

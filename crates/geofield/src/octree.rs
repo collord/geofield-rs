@@ -102,6 +102,17 @@ pub trait Boundary {
     /// left where the QEF placed it).
     fn surface_normal(&self, p: [f64; 3]) -> Option<[f64; 3]>;
 
+    /// Unsigned world distance from `p` to THIS boundary's surface (approximate is fine).
+    /// A seam vertex lies on whichever contributor's surface it is ACTUALLY on; the scene
+    /// uses this to constrain the seam projection to the NEAREST contributor's tangent plane
+    /// rather than the first one in the list (the domain box answers `surface_normal` for
+    /// every point, so first-responder picks it wrongly when the real wall is a truncating
+    /// contact). `None` if the implementor cannot estimate a distance — then it is not a
+    /// candidate for the nearest-surface choice. Defaults to `None`.
+    fn surface_distance(&self, _p: [f64; 3]) -> Option<f64> {
+        None
+    }
+
     /// How many DISTINCT surfaces of this boundary cross the edge `a → b` (for the
     /// double-crossed-edge refinement). Defaults to `edge_crossing().is_some()` (0 or
     /// 1) — correct for a single level set. A multi-contact boundary (a
@@ -151,6 +162,13 @@ impl Boundary for ContactSurface<'_> {
 
     fn surface_normal(&self, p: [f64; 3]) -> Option<[f64; 3]> {
         Some(normalize(self.model.scalar_field_gradient(p)))
+    }
+
+    fn surface_distance(&self, p: [f64; 3]) -> Option<f64> {
+        let df = (self.model.scalar_field(p) - self.isovalue).abs();
+        let g = self.model.scalar_field_gradient(p);
+        let gn = (g[0] * g[0] + g[1] * g[1] + g[2] * g[2]).sqrt();
+        Some(if gn > 1e-12 { df / gn } else { df })
     }
 }
 
@@ -208,6 +226,13 @@ impl Boundary for ContactHalfSpace<'_> {
 
     fn surface_normal(&self, p: [f64; 3]) -> Option<[f64; 3]> {
         Some(normalize(self.model.scalar_field_gradient(p)))
+    }
+
+    fn surface_distance(&self, p: [f64; 3]) -> Option<f64> {
+        let df = (self.model.scalar_field(p) - self.isovalue).abs();
+        let g = self.model.scalar_field_gradient(p);
+        let gn = (g[0] * g[0] + g[1] * g[1] + g[2] * g[2]).sqrt();
+        Some(if gn > 1e-12 { df / gn } else { df })
     }
 }
 
@@ -275,6 +300,15 @@ impl Boundary for SlabComplement<'_> {
         let sign = if (f - self.lo).abs() <= (f - self.hi).abs() { 1.0 } else { -1.0 };
         let g = normalize(self.field.scalar_field_gradient(p));
         Some([sign * g[0], sign * g[1], sign * g[2]])
+    }
+
+    fn surface_distance(&self, p: [f64; 3]) -> Option<f64> {
+        // First-order world distance to the NEARER band wall: |field − nearer edge| / |∇field|.
+        let f = self.field.scalar_field(p);
+        let df = (f - self.lo).abs().min((f - self.hi).abs());
+        let g = self.field.scalar_field_gradient(p);
+        let gn = (g[0] * g[0] + g[1] * g[1] + g[2] * g[2]).sqrt();
+        Some(if gn > 1e-12 { df / gn } else { df })
     }
 
     fn edge_crossing_count(&self, a: [f64; 3], b: [f64; 3]) -> usize {
@@ -418,6 +452,21 @@ impl<'a> Scene<'a> {
     /// the first contributor that can supply a normal (the convention is contributor
     /// 0 is the domain). `None` if none can.
     fn seam_boundary_normal(&self, p: [f64; 3]) -> Option<[f64; 3]> {
+        // Constrain the seam to the contributor whose surface `p` is ACTUALLY on — the NEAREST one
+        // by `surface_distance`, not the first responder. (The domain box answers `surface_normal`
+        // for every point, so first-responder wrongly slides a contact↔vein-wall seam vertex along
+        // a box face instead of the vein wall, leaving the contact crease off the wall — the
+        // see-through dashes.) Fall back to first-responder when no contributor reports a distance.
+        let nearest = self
+            .contributors
+            .iter()
+            .filter_map(|c| c.surface_distance(p).map(|d| (d, c)))
+            .min_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        if let Some((_, c)) = nearest {
+            if let Some(n) = c.surface_normal(p) {
+                return Some(n);
+            }
+        }
         self.contributors.iter().find_map(|c| c.surface_normal(p))
     }
 
@@ -578,6 +627,18 @@ impl Boundary for AxisBox {
         let mut n = [0.0; 3];
         n[best.0] = best.2;
         Some(n)
+    }
+
+    fn surface_distance(&self, p: [f64; 3]) -> Option<f64> {
+        // Distance to the nearest box FACE (not the box interior): min over axes of the distance
+        // to either face plane. A point deep inside the domain is far from every face.
+        let mut best = f64::INFINITY;
+        for ax in 0..3 {
+            best = best
+                .min((self.min[ax] - p[ax]).abs())
+                .min((p[ax] - self.max[ax]).abs());
+        }
+        Some(best)
     }
 }
 
