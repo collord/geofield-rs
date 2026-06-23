@@ -1473,6 +1473,207 @@ impl<M: SeriesModel + BlockModel> Stack<M> {
         }
         Some(mesh)
     }
+
+    /// SHARED-SEAM volume path (`docs/volume_mesh_seam.md`, Strategy A): mesh the cross-cutting
+    /// body `ib`'s interior solid AND every rock UNIT solid it cuts on ONE shared octree, so the
+    /// body and the surrounding rock land on IDENTICAL wall vertices (same leaves → same field
+    /// crossing → same QEF) instead of contouring the wall independently. Returns the body solid
+    /// plus the rock units tagged `(series, block, unit)`; `None` for a stratigraphic series /
+    /// topography / out-of-range / wall-less body.
+    ///
+    /// This is the `Clip` counterpart to the independent `Snap` path
+    /// ([`Self::mesh_cross_cut_solid`] + [`Self::mesh_one_block_unit_solid`]), which is left
+    /// byte-for-byte unchanged. Strategy A needs ONE function because the body and its rock cannot
+    /// share a tree across two independent calls. Each solid is closed by the octree's own
+    /// `cap = true` closure (no hand-grafted cap face); sharing the tree only makes the two solids'
+    /// wall caps coincide. The rock units' `ContactHeightField::weld` is omitted here — on the
+    /// shared tree the bed contacts already coincide, and the height-field weld would only fight the
+    /// shared wall seam (and cannot represent a vertical/overhanging wall anyway).
+    pub fn mesh_cross_cut_solids_shared(
+        &self,
+        ib: usize,
+        min: [f64; 3],
+        size: f64,
+        ext_max: [f64; 3],
+        cfg: OctreeConfig,
+    ) -> Option<(Mesh, Vec<(usize, usize, usize, Mesh)>)> {
+        // The body band/interior bounds (mirrors `mesh_cross_cut_solid`).
+        let (body_upper, body_lower_iso): (f64, Option<f64>) = match self.series.get(ib)? {
+            StackElement::Vein(v) => {
+                let (lo, hi) = v.band()?;
+                (hi, Some(lo))
+            }
+            StackElement::Intrusion(it) => {
+                let isos = it.model.interface_isovalues();
+                match it.envelope {
+                    Envelope::Single(k) => (*isos.get(k)?, None),
+                    Envelope::Shell { inner, outer } => {
+                        let (a, b) = (*isos.get(inner)?, *isos.get(outer)?);
+                        let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+                        (hi, Some(lo))
+                    }
+                }
+            }
+            _ => return None, // series / topography
+        };
+
+        // ---- Owned data: fields boxed for a uniform type the half-spaces can borrow; all built
+        // BEFORE any Scene takes a reference into them (mirrors `mesh_cross_cut_shared`). ----------
+        let box_b = AxisBox::from_bounds(min, ext_max);
+        let body_e = self.series.get(ib)?;
+        let body_field: Box<dyn ScalarField + '_> = Box::new(body_e.model().field());
+        let body_isos = body_e.model().interface_isovalues();
+        let body_maskers = self.clip_maskers(ib);
+
+        // Each cut block's field + interfaces + fault planes (parallel vecs so the masker/field
+        // types stay inferred — `Masker` is private and generic over the model's field type).
+        let cut = self.cuts_below(ib, min, size);
+        let mut rb_j: Vec<usize> = Vec::new();
+        let mut rb_b: Vec<usize> = Vec::new();
+        let mut rb_field: Vec<Box<dyn ScalarField + '_>> = Vec::new();
+        let mut rb_isos: Vec<Vec<f64>> = Vec::new();
+        let mut rb_planes: Vec<Vec<PlaneHalfSpace>> = Vec::new();
+        let mut rb_nunits: Vec<usize> = Vec::new();
+        let mut rb_maskers = Vec::new();
+        for &j in &cut {
+            let Some(s) = self.series_at(j) else { continue };
+            for b in 0..self.series_block_count(j).max(1) {
+                let Some(bf) = s.model.block_field(b) else { continue };
+                let isos = s.model.block_interface_isovalues(b);
+                if isos.is_empty() {
+                    continue; // field-less / interface-less block has no unit slabs (matches Snap)
+                }
+                let planes: Vec<PlaneHalfSpace> = s
+                    .model
+                    .block_half_spaces(b)
+                    .into_iter()
+                    .map(|hs| PlaneHalfSpace::new(hs.point, hs.normal, hs.keep_positive))
+                    .collect();
+                rb_nunits.push(self.present_unit_count(j, b));
+                rb_j.push(j);
+                rb_b.push(b);
+                rb_field.push(Box::new(bf));
+                rb_isos.push(isos);
+                rb_planes.push(planes);
+                rb_maskers.push(self.clip_maskers(j));
+            }
+        }
+
+        // Flat list of unit output scenes: (block-entry index `k`, unit `u`).
+        let mut unit_keys: Vec<(usize, usize)> = Vec::new();
+        for (k, &nunits) in rb_nunits.iter().enumerate() {
+            for u in 0..nunits {
+                unit_keys.push((k, u));
+            }
+        }
+
+        // ---- Owned half-spaces (borrow the boxed fields above) -------------------------------
+        // Body band lower cap (output) + both body walls as build-scene refinement drivers.
+        let body_lower: Option<ContactHalfSpace> =
+            body_lower_iso.map(|lo| ContactHalfSpace::new(body_field.as_ref(), lo, false));
+        let body_wall_refine: Vec<ContactHalfSpace> = body_isos
+            .iter()
+            .map(|&iso| ContactHalfSpace::new(body_field.as_ref(), iso, false))
+            .collect();
+        // Every cut block's bed contacts as build-scene refinement drivers (so the tree subdivides
+        // near every unit boundary, not just the body wall).
+        let mut bed_refine: Vec<ContactHalfSpace> = Vec::new();
+        for k in 0..rb_j.len() {
+            for &iso in &rb_isos[k] {
+                bed_refine.push(ContactHalfSpace::new(rb_field[k].as_ref(), iso, false));
+            }
+        }
+        // Per unit-scene upper bound + lower cap (mirrors `mesh_one_block_unit_solid`).
+        let mut unit_upper: Vec<f64> = Vec::with_capacity(unit_keys.len());
+        let mut unit_lower: Vec<Option<ContactHalfSpace>> = Vec::with_capacity(unit_keys.len());
+        for &(k, u) in &unit_keys {
+            let isos = &rb_isos[k];
+            let n = isos.len();
+            let upper = if u < n {
+                isos[u]
+            } else {
+                max_abs_field_in_box(rb_field[k].as_ref(), min, size) + 1.0
+            };
+            let lower = (u > 0).then(|| ContactHalfSpace::new(rb_field[k].as_ref(), isos[u - 1], false));
+            unit_upper.push(upper);
+            unit_lower.push(lower);
+        }
+
+        // Masker boundaries (borrow the maskers above).
+        let body_masker_b: Vec<Box<dyn Boundary + '_>> =
+            body_maskers.iter().map(|m| m.boundary()).collect();
+        let rb_masker_b: Vec<Vec<Box<dyn Boundary + '_>>> = rb_maskers
+            .iter()
+            .map(|ms: &Vec<_>| ms.iter().map(|m| m.boundary()).collect())
+            .collect();
+
+        // ---- Build scene: refines for the body band + ALL body walls + every cut block's beds,
+        // fault planes, and wall maskers — so EVERY output surface resolves on the shared tree. ----
+        let mut build_contrib: Vec<&dyn Boundary> = Vec::new();
+        build_contrib.push(&box_b);
+        for m in &body_masker_b {
+            build_contrib.push(m.as_ref());
+        }
+        for c in &body_wall_refine {
+            build_contrib.push(c);
+        }
+        for c in &bed_refine {
+            build_contrib.push(c);
+        }
+        for planes in &rb_planes {
+            for p in planes {
+                build_contrib.push(p);
+            }
+        }
+        for ms in &rb_masker_b {
+            for m in ms {
+                build_contrib.push(m.as_ref());
+            }
+        }
+        let build_primary = *body_isos.first().unwrap_or(&body_upper);
+        let build_scene = Scene::new(body_field.as_ref(), build_primary, build_contrib);
+
+        // ---- Output scenes: the body band, then each rock unit — all closed solids (cap=true). ----
+        let cfg = OctreeConfig { cap: true, ..cfg };
+        let mut scenes: Vec<Scene> = Vec::with_capacity(1 + unit_keys.len());
+        {
+            let mut c: Vec<&dyn Boundary> = Vec::new();
+            c.push(&box_b);
+            if let Some(lo) = &body_lower {
+                c.push(lo);
+            }
+            for m in &body_masker_b {
+                c.push(m.as_ref());
+            }
+            scenes.push(Scene::new(body_field.as_ref(), body_upper, c));
+        }
+        for (idx, &(k, _u)) in unit_keys.iter().enumerate() {
+            let mut c: Vec<&dyn Boundary> = Vec::new();
+            c.push(&box_b);
+            for p in &rb_planes[k] {
+                c.push(p);
+            }
+            if let Some(lo) = &unit_lower[idx] {
+                c.push(lo);
+            }
+            for m in &rb_masker_b[k] {
+                c.push(m.as_ref());
+            }
+            scenes.push(Scene::new(rb_field[k].as_ref(), unit_upper[idx], c));
+        }
+
+        let scene_refs: Vec<&Scene> = scenes.iter().collect();
+        let meshes = octree_dual_contour_shared(&build_scene, &scene_refs, min, size, cfg);
+
+        let mut it = meshes.into_iter();
+        let body_solid = it.next()?;
+        let rock_solids: Vec<(usize, usize, usize, Mesh)> = unit_keys
+            .iter()
+            .zip(it)
+            .map(|(&(k, u), m)| (rb_j[k], rb_b[k], u, m))
+            .collect();
+        Some((body_solid, rock_solids))
+    }
 }
 
 // Builds in-process kernel `Model`s, so native-only.
@@ -3918,10 +4119,144 @@ mod tests {
         );
         assert!(compared > 0, "body and rock shared no wall cells to compare");
 
-        let tol = cell * 0.25;
+        // Tightened from `cell * 0.25` to near float noise (positions are f32; a planar wall at full
+        // refinement coincides to a few ULP of ~400.0 ≈ 5e-5). The two independent dual-contourings
+        // already agree to 0.00 — the see-through channel the task feared does not reproduce here
+        // (see `cross_cut_solid_seam_is_watertight` and `docs/volume_mesh_seam.md`).
+        let tol = cell * 1e-3;
         assert!(
             worst <= tol,
-            "vein body and cross-cut rock disagree on the foot-wall by {worst:.2} (> {tol:.2}); they contour it independently → the visible see-through channel"
+            "vein body and cross-cut rock disagree on the foot-wall by {worst} (> {tol:.5}); they contour it independently → the visible see-through channel"
         );
+    }
+
+    /// Shared edges (and helpers) for the solid-seam watertightness checks. Merges several meshes
+    /// into one vertex/triangle soup, deduping vertices by a quantized position key (`q`), so
+    /// coincident wall vertices from different solids collapse to one index.
+    fn merge_dedup(meshes: &[&Mesh], q: f64) -> (Vec<[f64; 3]>, Vec<[usize; 3]>) {
+        let mut map: std::collections::HashMap<(i64, i64, i64), usize> = std::collections::HashMap::new();
+        let mut pos: Vec<[f64; 3]> = Vec::new();
+        let mut tris: Vec<[usize; 3]> = Vec::new();
+        for m in meshes {
+            for t in m.indices.chunks_exact(3) {
+                let v: Vec<usize> = t
+                    .iter()
+                    .map(|&vi| {
+                        let p = [
+                            m.positions[vi as usize * 3] as f64,
+                            m.positions[vi as usize * 3 + 1] as f64,
+                            m.positions[vi as usize * 3 + 2] as f64,
+                        ];
+                        let k = ((p[0] / q).round() as i64, (p[1] / q).round() as i64, (p[2] / q).round() as i64);
+                        *map.entry(k).or_insert_with(|| {
+                            pos.push(p);
+                            pos.len() - 1
+                        })
+                    })
+                    .collect();
+                tris.push([v[0], v[1], v[2]]);
+            }
+        }
+        (pos, tris)
+    }
+
+    /// Undirected-edge incidence over a triangle soup.
+    fn edge_incidence(tris: &[[usize; 3]]) -> std::collections::HashMap<(usize, usize), u32> {
+        let mut inc: std::collections::HashMap<(usize, usize), u32> = std::collections::HashMap::new();
+        for t in tris {
+            for &(a, b) in &[(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+                let e = if a < b { (a, b) } else { (b, a) };
+                *inc.entry(e).or_insert(0) += 1;
+            }
+        }
+        inc
+    }
+
+    /// `(open_off_box, shared_off_box)` for a merged soup: count of incidence-1 edges whose
+    /// endpoints are NOT both on the domain box rim (genuine see-through tears), and incidence-≥3
+    /// edges off the rim (where two solids' wall caps fused — positive evidence of sharing).
+    fn seam_incidence_stats(pos: &[[f64; 3]], tris: &[[usize; 3]], size: f64) -> (usize, usize) {
+        let on_box = |p: [f64; 3]| (0..3).any(|d| p[d] < 1.0 || p[d] > size - 1.0);
+        let inc = edge_incidence(tris);
+        let mut open = 0usize;
+        let mut shared = 0usize;
+        for (&(a, b), &c) in &inc {
+            let off_rim = !(on_box(pos[a]) && on_box(pos[b]));
+            if c == 1 && off_rim {
+                open += 1;
+            }
+            if c >= 3 && off_rim {
+                shared += 1;
+            }
+        }
+        (open, shared)
+    }
+
+    /// Strategy A (`docs/volume_mesh_seam.md`): the body interior solid and the cross-cut rock unit
+    /// solids meshed on ONE shared tree fuse watertight across the shared wall — no see-through
+    /// edges, and the wall is genuinely SHARED (incidence-≥3 fused edges). Also asserts the
+    /// independent (`Snap`) path is itself watertight + deterministic (acceptance: Snap unchanged).
+    #[test]
+    fn cross_cut_solid_seam_is_watertight() {
+        let (stack, _vein) = vertical_vein_over_column();
+        let min = [0.0, 0.0, 0.0];
+        let size = 1000.0;
+        let ext = [1000.0, 1000.0, 1000.0];
+        let depth = 5u32; // coarse enough to be fast; the shared tree resamples every unit
+        let cfg = OctreeConfig { max_depth: depth, min_depth: 2, qef_threshold: 1e-6, cap: true };
+        let cell = size / (1u32 << depth) as f64;
+        let q = (cell * 1e-4).max(1e-9);
+
+        // --- Shared path (Strategy A) ---
+        let (body, rocks) =
+            stack.mesh_cross_cut_solids_shared(0, min, size, ext, cfg).expect("shared solids mesh");
+        // Each solid individually watertight (closed, cap=true → no tears off the box rim).
+        let solo_open = |m: &Mesh| {
+            let (p, t) = merge_dedup(&[m], q);
+            seam_incidence_stats(&p, &t, size).0
+        };
+        assert_eq!(solo_open(&body), 0, "body solid has see-through edges");
+        for (j, b, u, m) in &rocks {
+            if m.triangle_count() > 0 {
+                assert_eq!(solo_open(m), 0, "rock unit ({j},{b},{u}) solid has see-through edges");
+            }
+        }
+        // Merge body ∪ all rock units and check the seam fuses watertight.
+        let mut all: Vec<&Mesh> = vec![&body];
+        for (_, _, _, m) in &rocks {
+            if m.triangle_count() > 0 {
+                all.push(m);
+            }
+        }
+        let (pos, tris) = merge_dedup(&all, q);
+        let (open, shared) = seam_incidence_stats(&pos, &tris, size);
+        eprintln!("SHARED: merged verts={} tris={} | see-through={open} fused(inc≥3)={shared}", pos.len(), tris.len());
+        assert_eq!(open, 0, "shared-tree body∪rock left {open} see-through edges off the box rim");
+        assert!(shared > 0, "body and rock did not fuse on the wall (no incidence-≥3 edges)");
+
+        // --- Snap path (independent calls) — watertight + deterministic (acceptance #3) ---
+        let body_snap = stack.mesh_cross_cut_solid(0, min, size, ext, cfg).expect("snap body");
+        let body_snap2 = stack.mesh_cross_cut_solid(0, min, size, ext, cfg).expect("snap body");
+        assert_eq!(body_snap.positions, body_snap2.positions, "Snap body nondeterministic");
+        assert_eq!(body_snap.indices, body_snap2.indices, "Snap body nondeterministic");
+        let mut snap_all: Vec<Mesh> = vec![body_snap];
+        for (j, b) in (0..stack.series.len())
+            .filter(|&j| stack.series_at(j).is_some())
+            .flat_map(|j| (0..stack.series_block_count(j).max(1)).map(move |b| (j, b)))
+            .collect::<Vec<_>>()
+        {
+            for u in 0..stack.present_unit_count(j, b) {
+                if let Some(m) = stack.mesh_one_block_unit_solid(j, b, u, min, size, ext, cfg) {
+                    if m.triangle_count() > 0 {
+                        snap_all.push(m);
+                    }
+                }
+            }
+        }
+        let snap_refs: Vec<&Mesh> = snap_all.iter().collect();
+        let (sp, st) = merge_dedup(&snap_refs, q);
+        let (sopen, _sshared) = seam_incidence_stats(&sp, &st, size);
+        eprintln!("SNAP:   merged verts={} tris={} | see-through={sopen}", sp.len(), st.len());
+        assert_eq!(sopen, 0, "Snap (independent) body∪rock left {sopen} see-through edges — regression");
     }
 }
