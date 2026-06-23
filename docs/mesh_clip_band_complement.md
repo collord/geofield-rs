@@ -45,7 +45,38 @@ Two structural improvements ride along:
   `octree::SlabComplement` (express the union as one complement, not two ANDed half-spaces).
 - **Robust `nearest_w_signed`:** for the field-less `Keep::Side` path (future imported meshes), it now
   takes the CLAMPED closest point on W and signs by that triangle's normal, instead of the nearest
-  centroid's infinite plane (partially addresses Thread-2 item-2).
+  centroid's infinite plane.
+
+## Imported, field-less keep: the geometric predicate (Task 03)
+
+An imported wall has no field, so it cannot use the `Predicate` forms above — it must classify by
+the **mesh** itself. Task 03 (`docs/03_clip_keepside_curved_wall_robustness.md`) makes that path as
+bent-wall-robust as the field path and gives it the same closure-shaped API, so the field and
+field-less keeps read as exact parallels:
+
+| Path | field predicate (generated) | geometric predicate (imported, field-less) |
+|---|---|---|
+| Single wall / erode | `Keep::Predicate(\|p\| field(p) - iso >= 0)` | `Keep::Predicate(&keep_side_of_mesh(w, side))` |
+| Vein / shell band | `Keep::Predicate(\|p\| f(p) < lo \|\| f(p) > hi)` | `Keep::Predicate(&keep_outside_band(&lo, &hi))` |
+
+`keep_side_of_mesh` is `\|p\| side_kept(nearest_w_signed(w, p), side)`; `keep_outside_band` is
+`\|p\| nearest_w_signed(lo, p) < 0 \|\| nearest_w_signed(hi, p) > 0` — the field-less mirror of the
+band complement (a UNION of two half-spaces a single `KeepSide` cannot express). Both **assume a
+winding-normalized W** (`ClipMesh::winding_normalized`) so the CCW-normal sense is meaningful, and
+both `debug_assert!` it; the band's two walls must additionally be **co-oriented** (both normals
+toward increasing band coordinate).
+
+**The cut-face `Keep::Side` fix that backs this.** `nearest_w_signed`'s clamped-closest-point test
+covered only the *uncut* path; the cut-face path still kept a sub-triangle only if its centroid lay
+on the keep side of **every** cutting W plane (`.all()` over infinite planes). Against a curved/bent
+W those cutters splay, so a sub-triangle on the keep side of its OWN nearest cutter was discarded for
+falling behind a splayed co-cutter's extended plane — carving a wedge out of the kept surface (the
+wedge-gap bug, previously only defended on the field path). The cut-face path now signs each
+sub-triangle by the **nearest** of its face's cutters (`nearest_w_signed_among`), the same clamped
+test the uncut path uses. So `Keep::Side` — and therefore `keep_side_of_mesh` — is now bent-wall-safe
+end to end. Verified field-agnostically by `keep_side_curved_wall_no_wedge_carve_either_bend` (torn
+seam in both bend orientations under the old `.all()`, watertight under the fix) and
+`keep_side_of_mesh_predicate_curved_wall_watertight_no_scallop`.
 
 ## Verification
 
@@ -113,5 +144,9 @@ The erode call site (`stack.rs:850`) becomes `Keep::Side(keep_side_for_erosion(.
 ## Out of scope (Thread 2, follow-ups)
 
 Combinatorial seam keying (the quantization-keying honesty item — the *most likely* wasm culprit if
-orphans are seam-id-based), `nearest_w_signed` winding-number replacement, cdt-vs-spade doc
-reconciliation, and the `cdt_face` silent-skip hardening are tracked separately and done after this.
+orphans are seam-id-based), cdt-vs-spade doc reconciliation, and the `cdt_face` silent-skip hardening
+are tracked separately and done after this. Thread-2 item-2 (curved-`W` keep robustness) is **done** —
+see the imported field-less section above; the cut-face path now uses the same clamped nearest-cutter
+classification as the uncut path, and `keep_side_of_mesh` / `keep_outside_band` are the imported
+analogs of the field predicates. A full winding-number sign for `nearest_w_signed` (vs nearest-facet
+normal) is the remaining refinement, only relevant for a closed imported solid, not an open wall.

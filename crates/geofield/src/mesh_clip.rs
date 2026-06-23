@@ -214,13 +214,6 @@ pub fn clip(
         .collect();
 
     // --- Step C+D: re-triangulate the cut faces and assemble the two output buffers. ---------
-    let w_planes: Vec<WPlane> = (0..w.triangles.len())
-        .map(|t| {
-            let (a, _, _) = w.tri(t);
-            WPlane { n: w.tri_normal_raw(t), p0: a }
-        })
-        .collect();
-
     let mut out_c = SideBuilder::from_mesh(c);
     let mut out_w = SideBuilder::from_mesh(w);
 
@@ -247,7 +240,7 @@ pub fn clip(
                     (a[2] + b[2] + cc[2]) / 3.0,
                 ];
                 let kept = match keep {
-                    Keep::Side(ks) => side_kept(nearest_w_signed(w, &w_planes, centroid), ks),
+                    Keep::Side(ks) => side_kept(nearest_w_signed(w, centroid), ks),
                     Keep::Predicate(p) => p(centroid),
                 };
                 if kept {
@@ -256,9 +249,7 @@ pub fn clip(
             }
             Some(segs) => {
                 let segs: Vec<&SeamSeg> = segs.iter().map(|&i| &segments[i]).collect();
-                retriangulate_c_face(
-                    c, tc, &segs, &seam, &w_planes, keep, &mut out_c, &mut c_seam_index,
-                );
+                retriangulate_c_face(c, w, tc, &segs, &seam, keep, &mut out_c, &mut c_seam_index);
             }
         }
     }
@@ -295,6 +286,56 @@ pub fn clip(
         .collect();
 
     ClipResult { c: c_out, w: w_out, shared }
+}
+
+/// A geometric keep predicate for clipping C against an IMPORTED, field-less SINGLE wall `w`: keep
+/// the side selected by `side`, classified by the CLAMPED closest point on `w` (signed by that
+/// triangle's CCW normal). This is the field-less analog of the generated path's field predicate
+/// `|p| field(p) - iso >= 0`, and the RECOMMENDED way to clip against an import.
+///
+/// Pass it as `clip(c, w, Keep::Predicate(&keep_side_of_mesh(w, side)), None)`. Equivalent in
+/// robustness to `Keep::Side(side)` (both now use the clamped nearest-cutter test — see
+/// [`nearest_w_signed_among`]); offered as a `Predicate` so an imported caller can carry the same
+/// closure-shaped keep rule the field callers use, and so single-wall and [`keep_outside_band`]
+/// imports read alike.
+///
+/// Assumes `w` is winding-normalized so its CCW normal sense is meaningful — run
+/// [`ClipMesh::winding_normalized`] first. Debug-asserts it.
+pub fn keep_side_of_mesh(w: &ClipMesh, side: KeepSide) -> impl Fn([f64; 3]) -> bool + '_ {
+    debug_assert!(
+        w_is_consistently_wound(w),
+        "keep_side_of_mesh: W must be winding-normalized — see ClipMesh::winding_normalized"
+    );
+    move |p| side_kept(nearest_w_signed(w, p), side)
+}
+
+/// A geometric keep predicate for an IMPORTED, field-less vein/shell BAND bounded by two walls: keep
+/// the band EXTERIOR — `p` below `lo_wall` OR above `hi_wall`, where "below"/"above" are each wall's
+/// CCW-normal sense (signed `< 0` / `> 0`). A single [`KeepSide`] cannot express this (it is a UNION
+/// of two half-spaces, not one); this is the field-less analog of the generated band predicate
+/// `|p| field(p) < lo || field(p) > hi` and the mesh form of [`crate::octree::SlabComplement`].
+///
+/// Feed `clip` the two walls combined into ONE `w` — append `hi_wall`'s vertices/triangles after
+/// `lo_wall`'s with a base-index offset, so the disjoint ranges keep it consistently wound and both
+/// seams share one vertex space, exactly as the field band path does (`stack.rs` `clip_walls`):
+/// `clip(c, &combined, Keep::Predicate(&keep_outside_band(&lo, &hi)), None)`.
+///
+/// Precondition: each wall is winding-normalized AND the two are CO-ORIENTED — both CCW normals
+/// point the SAME way across the band (toward increasing band coordinate), so `lo_wall` signed `< 0`
+/// means "below the band" and `hi_wall` signed `> 0` means "above". Debug-asserts each is wound.
+pub fn keep_outside_band<'a>(
+    lo_wall: &'a ClipMesh,
+    hi_wall: &'a ClipMesh,
+) -> impl Fn([f64; 3]) -> bool + 'a {
+    debug_assert!(
+        w_is_consistently_wound(lo_wall),
+        "keep_outside_band: lo_wall must be winding-normalized"
+    );
+    debug_assert!(
+        w_is_consistently_wound(hi_wall),
+        "keep_outside_band: hi_wall must be winding-normalized"
+    );
+    move |p| nearest_w_signed(lo_wall, p) < 0.0 || nearest_w_signed(hi_wall, p) > 0.0
 }
 
 /// Remove vertices not referenced by any triangle, remapping the triangle indices. Returns the
@@ -511,18 +552,6 @@ impl SeamBuilder {
 // Step C — per-cut-face re-triangulation, and Step D buffer assembly.
 // =============================================================================================
 
-struct WPlane {
-    n: [f64; 3],
-    p0: [f64; 3],
-}
-
-impl WPlane {
-    /// Signed distance of `p` to this W triangle's plane (sign by the CCW normal).
-    fn signed(&self, p: [f64; 3]) -> f64 {
-        dot(self.n, sub(p, self.p0))
-    }
-}
-
 /// Accumulates one output side (C or W): starts as a copy of the input vertices, appends seam
 /// vertices, and collects the kept triangles. Original vertex indices are preserved so untouched
 /// interior triangles stay bit-identical.
@@ -559,10 +588,10 @@ impl SideBuilder {
 /// once per seam-id into `c_seam_index`.
 fn retriangulate_c_face(
     c: &ClipMesh,
+    w: &ClipMesh,
     tc: usize,
     segs: &[&SeamSeg],
     seam: &SeamBuilder,
-    w_planes: &[WPlane],
     keep: Keep,
     out: &mut SideBuilder,
     c_seam_index: &mut HashMap<usize, usize>,
@@ -571,11 +600,13 @@ fn retriangulate_c_face(
     let normal = c.tri_normal_raw(tc);
     let sub = cdt_face(&pts3, &constraints, normal);
 
-    // For `Keep::Side`: which W planes cut this face (keep = on the keep side of every cutter).
+    // For `Keep::Side`: the W triangles that actually cut THIS face. A sub-triangle is signed by the
+    // NEAREST of these (clamped closest point), NOT `.all()` of their infinite planes — see
+    // `nearest_w_signed_among` for why the `.all()` form carved a wedge against a curved/bent W.
     // `Keep::Predicate` ignores these — it classifies each sub-triangle's centroid directly.
-    let cut_w_planes: Vec<&WPlane> = {
+    let cut_tw: Vec<usize> = {
         let mut seen = std::collections::HashSet::new();
-        segs.iter().filter(|s| seen.insert(s.tw)).map(|s| &w_planes[s.tw]).collect()
+        segs.iter().filter(|s| seen.insert(s.tw)).map(|s| s.tw).collect()
     };
 
     // Emit only kept sub-triangles; allocate a seam vertex's out-index LAZILY, the first time a
@@ -588,7 +619,9 @@ fn retriangulate_c_face(
             (pts3[i][2] + pts3[j][2] + pts3[k][2]) / 3.0,
         ];
         let kept = match keep {
-            Keep::Side(ks) => cut_w_planes.iter().all(|wp| side_kept(wp.signed(centroid), ks)),
+            Keep::Side(ks) => {
+                side_kept(nearest_w_signed_among(w, cut_tw.iter().copied(), centroid), ks)
+            }
             Keep::Predicate(p) => p(centroid),
         };
         if !kept {
@@ -719,22 +752,45 @@ fn retriangulate_w_face(
 /// wrong side → that uncut face is wrongly kept, leaving an isolated 1-triangle sliver in the eroded
 /// zone. The clamped closest point is an actual point ON the sheet, so its normal gives the correct
 /// side for a point off a non-planar sheet. Used to classify an UNCUT C face (one not crossing W).
-fn nearest_w_signed(w: &ClipMesh, w_planes: &[WPlane], p: [f64; 3]) -> f64 {
+fn nearest_w_signed(w: &ClipMesh, p: [f64; 3]) -> f64 {
+    nearest_w_signed_among(w, 0..w.triangles.len(), p)
+}
+
+/// As [`nearest_w_signed`], but restricted to a SUBSET of W's triangles (`tw_iter`): the signed
+/// distance from the subset triangle whose clamped closest point to `p` is nearest, by that
+/// triangle's normal. Returns `0.0` for an empty subset (no triangle ⇒ `p` is treated as on-seam).
+/// Only the winning triangle's normal is needed, so it is computed once at the end.
+///
+/// This is the cut-face keep test for `Keep::Side`: a sub-triangle is signed by the NEAREST of the
+/// W triangles that actually cut its face — NOT by `.all()` of their infinite planes. Against a
+/// curved/bent W those cutters splay, and the `.all()` form discards a sub-triangle that sits on the
+/// keep side of its OWN nearest cutter merely because it falls behind a splayed co-cutter's extended
+/// plane — carving a wedge out of the kept surface (the bent-wall wedge-gap bug). The clamped
+/// nearest-cutter test is the same robust classification the uncut path uses, so the imported
+/// `Keep::Side` path is now as bent-wall-safe as the generated `Keep::Predicate` (field) path.
+fn nearest_w_signed_among(
+    w: &ClipMesh,
+    tw_iter: impl IntoIterator<Item = usize>,
+    p: [f64; 3],
+) -> f64 {
     let mut best_d2 = f64::INFINITY;
-    let mut best_t = 0usize;
+    let mut best: Option<usize> = None;
     let mut best_closest = p;
-    for t in 0..w.triangles.len() {
+    for t in tw_iter {
         let (a, b, c) = w.tri(t);
         let cl = crate::weld::closest_point_on_triangle_pub(p, a, b, c);
         let d = sub(p, cl);
         let d2 = dot(d, d);
         if d2 < best_d2 {
             best_d2 = d2;
-            best_t = t;
+            best = Some(t);
             best_closest = cl;
         }
     }
-    dot(w_planes[best_t].n, sub(p, best_closest))
+    match best {
+        Some(t) => dot(w.tri_normal_raw(t), sub(p, best_closest)),
+        None => 0.0,
+    }
 }
 
 /// 2D constrained Delaunay re-triangulation of one face: project 3D points to the face plane by
@@ -837,13 +893,10 @@ fn empty_seam_result(c: &ClipMesh, w: &ClipMesh, keep: Keep) -> ClipResult {
     } else {
         c.vertices[0]
     };
-    // Side of the nearest W triangle's plane — enough when C lies wholly on one side and W spans
-    // the region.
-    let w_planes: Vec<WPlane> = (0..w.triangles.len())
-        .map(|t| WPlane { n: w.tri_normal_raw(t), p0: w.tri(t).0 })
-        .collect();
+    // Side of the nearest W triangle (clamped closest point) — enough when C lies wholly on one
+    // side and W spans the region.
     let kept = match keep {
-        Keep::Side(ks) => side_kept(nearest_w_signed(w, &w_planes, rep), ks),
+        Keep::Side(ks) => side_kept(nearest_w_signed(w, rep), ks),
         Keep::Predicate(p) => p(rep),
     };
     if kept {
@@ -1553,5 +1606,143 @@ mod tests {
         wt[0].swap(0, 1); // one flipped triangle is enough to break consistency
         let w_bad = ClipMesh::new(w.vertices.clone(), wt);
         let _ = clip(&c, &w_bad, Keep::Side(KeepSide::Above), None);
+    }
+
+    // ── Task 03: robust Keep::Side / geometric predicate against a CURVED imported W ──────────
+    // (docs/03_clip_keepside_curved_wall_robustness.md)
+
+    /// A field-agnostic CURVED wall (a parabolic curtain): x = `bend`·0.01·(y−40)² over y∈[0,100],
+    /// z∈[−60,60], FINELY tessellated in y (24 segments) so adjacent triangles' normals SPLAY along
+    /// the curve, coarse (4) in z. The apex (y=40) sits off the coarse contact's grid lines. `bend`
+    /// = ±1 bows the curtain toward ±x. The parametric grid is consistently wound; every triangle's
+    /// CCW normal has `n_x = Δy·Δz > 0`, so the sheet is coherently +x-oriented.
+    fn curved_wall(bend: f64) -> ClipMesh {
+        grid(24, 4, |s, t| {
+            let y = s * 100.0;
+            let z = -60.0 + t * 120.0;
+            [bend * 0.01 * (y - 40.0).powi(2), y, z]
+        })
+    }
+
+    /// A COARSE flat contact at z=15 — mid-cell vs the curtain's z rows at 0/30, so the seam cuts
+    /// wall-triangle INTERIORS not edges; x∈[−65,55] (x=0 off any grid line), y∈[0,100]. Overshoots
+    /// the curved wall on BOTH sides; coarse in y so a single contact face straddles the curve and
+    /// is cut by SEVERAL splayed wall triangles — the condition the `.all()`-over-planes keep test
+    /// mis-handled.
+    fn coarse_contact() -> ClipMesh {
+        grid(4, 4, |s, t| [-65.0 + s * 120.0, t * 100.0, 15.0])
+    }
+
+    /// Rim whitelist shared by the curved-wall tests: the contact's outer boundary (x = −65/55,
+    /// y = 0/100) and the curtain's (y = 0/100, z = ±60). The seam is interior (z = 15, x ∈ [0,36]),
+    /// so any incidence-1 edge OFF this frame is a torn (wedge-carved) seam.
+    fn curved_on_frame(p: [f64; 3]) -> bool {
+        let eps = 0.5;
+        p[1].abs() < eps
+            || (p[1] - 100.0).abs() < eps
+            || (p[0] + 65.0).abs() < eps
+            || (p[0] - 55.0).abs() < eps
+            || (p[2] + 60.0).abs() < eps
+            || (p[2] - 60.0).abs() < eps
+    }
+
+    /// Acceptance (a): the curved-wall wedge-carve driven through `Keep::Side` — the imported,
+    /// field-LESS path, NOT the field `Keep::Predicate` the generated wedge regression exercises. A
+    /// coarse contact overruns a curved wall; each straddling contact face is cut by several splayed
+    /// wall triangles. The old keep test kept a sub-triangle only if its centroid lay on the keep
+    /// side of EVERY cutter's infinite plane (`.all()`), carving a wedge out of the kept surface next
+    /// to the seam (a torn boundary). The clamped nearest-cutter test keeps it watertight — in BOTH
+    /// bend orientations (a flat wall can't catch this: a face's cutters are then coplanar).
+    #[test]
+    fn keep_side_curved_wall_no_wedge_carve_either_bend() {
+        for bend in [1.0_f64, -1.0] {
+            let c = coarse_contact();
+            let w = curved_wall(bend).winding_normalized();
+            let res = clip(&c, &w, Keep::Side(KeepSide::Above), None);
+            assert_seam_watertight(&res, &curved_on_frame);
+        }
+    }
+
+    /// Acceptance (b): clip an imported, field-LESS contact against a curved imported wall via the
+    /// geometric [`keep_side_of_mesh`] predicate (the recommended import path). The seam is watertight
+    /// AND no contact vertex is pulled off the contact's own plane (anti-scallop) — the curved wall
+    /// does not scallop the kept surface, the field-less analog of
+    /// `m2_staircase_watertight_and_no_scallop_field_agnostic`.
+    #[test]
+    fn keep_side_of_mesh_predicate_curved_wall_watertight_no_scallop() {
+        let c = coarse_contact(); // planar at z = 15
+        let w = curved_wall(1.0).winding_normalized();
+        let pred = keep_side_of_mesh(&w, KeepSide::Above);
+        let res = clip(&c, &w, Keep::Predicate(&pred), None);
+
+        assert_seam_watertight(&res, &curved_on_frame);
+
+        // Anti-scallop: every kept contact vertex stays on the plane z = 15 (the contact is exactly
+        // planar; only float noise deviates). Seam vertices are the true C∩W line, which lies on C.
+        let mut off_max = 0.0_f64;
+        for v in &res.c.vertices {
+            off_max = off_max.max((v[2] - 15.0).abs());
+        }
+        assert!(off_max < 1e-6, "kept C vertices strayed off z=15: {off_max} (scalloping)");
+    }
+
+    /// Flip a consistently-wound sheet whole if its CCW normal points −x, so KeepSide/predicate
+    /// "above" is the +x half. Flipping every triangle preserves consistency. (A curtain's normals
+    /// are uniformly ±x, so triangle 0's sign speaks for the sheet — see [`curved_wall`].)
+    fn orient_plus_x(mut m: ClipMesh) -> ClipMesh {
+        if m.tri_normal_raw(0)[0] < 0.0 {
+            for t in &mut m.triangles {
+                t.swap(0, 1);
+            }
+        }
+        m
+    }
+
+    /// Task 03: [`keep_outside_band`] classifies the band EXTERIOR — below `lo_wall` OR above
+    /// `hi_wall` (each wall's CCW-normal sense) — which a single `KeepSide` cannot express. Two
+    /// parallel curved curtains offset in x; assert the predicate is true outside / false inside,
+    /// then drive `clip` with both walls combined into one W and confirm the kept contact is the band
+    /// exterior (no vertex strictly between the walls).
+    #[test]
+    fn keep_outside_band_keeps_imported_band_exterior() {
+        let curve = |y: f64| 0.01 * (y - 40.0).powi(2);
+        let curtain = |x0: f64| {
+            orient_plus_x(
+                grid(24, 4, |s, t| {
+                    let (y, z) = (s * 100.0, -60.0 + t * 120.0);
+                    [x0 + curve(y), y, z]
+                })
+                .winding_normalized(),
+            )
+        };
+        let lo = curtain(-20.0); // band low wall at x = −20 + curve(y)
+        let hi = curtain(20.0); //  band high wall at x = +20 + curve(y)
+
+        let pred = keep_outside_band(&lo, &hi);
+        // At y = 40 the curtains sit at x = −20 and x = +20.
+        assert!(pred([-50.0, 40.0, 15.0]), "x=−50 is below lo → kept (exterior)");
+        assert!(!pred([0.0, 40.0, 15.0]), "x=0 is inside the band → dropped");
+        assert!(pred([50.0, 40.0, 15.0]), "x=+50 is above hi → kept (exterior)");
+
+        // Drive it through clip: combine both curtains into ONE W (offset indices keep it
+        // consistently wound), clip a contact spanning the whole x-range.
+        let mut combined = lo.clone();
+        let base = combined.vertices.len();
+        combined.vertices.extend_from_slice(&hi.vertices);
+        combined
+            .triangles
+            .extend(hi.triangles.iter().map(|t| [t[0] + base, t[1] + base, t[2] + base]));
+
+        let c = coarse_contact(); // z = 15, x ∈ [−65,55]
+        let res = clip(&c, &combined, Keep::Predicate(&pred), None);
+        assert!(!res.c.triangles.is_empty(), "band exterior should keep some contact");
+        // No kept vertex is strictly inside the band, measured by the SAME mesh signed distance the
+        // predicate uses (above lo AND below hi). A seam vertex sits on a wall (signed ≈ 0), so it is
+        // not "inside"; comparing against the smooth curve would false-positive on the walls' chord
+        // error (~0.04 at 24 segments).
+        for &v in &res.c.vertices {
+            let strictly_inside = nearest_w_signed(&lo, v) > 1e-6 && nearest_w_signed(&hi, v) < -1e-6;
+            assert!(!strictly_inside, "kept C vertex {v:?} is strictly inside the band");
+        }
     }
 }
