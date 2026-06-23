@@ -391,6 +391,13 @@ impl Boundary for PlaneHalfSpace {
             [-self.normal[0], -self.normal[1], -self.normal[2]]
         })
     }
+
+    fn surface_distance(&self, p: [f64; 3]) -> Option<f64> {
+        // Perpendicular distance to the plane: `|signed(p)|`. A planar-fault contributor
+        // is otherwise invisible to the nearest-surface seam choice (defaults to `None`),
+        // so a contact↔fault seam vertex slides onto the domain box.
+        Some(self.signed(p).abs())
+    }
 }
 
 /// The combined implicit solid the contourer meshes: the PRIMARY contact (`model`
@@ -709,6 +716,28 @@ impl TriMesh {
         }
         omega / (4.0 * std::f64::consts::PI)
     }
+
+    /// The triangle whose CLAMPED closest point to `p` is nearest, as
+    /// `(triangle, distance, closest_point)`. Unlike a centroid test this is exact for
+    /// `p` sitting on a large facet whose centroid is far (or beyond a small facet whose
+    /// big neighbor's centroid is nearer), so it is the right basis for both the
+    /// nearest-surface distance and the seam normal. `None` only for an empty mesh.
+    /// Mirrors `mesh_clip::nearest_w_signed_among`'s clamped-distance selection.
+    fn nearest_triangle_clamped(&self, p: [f64; 3]) -> Option<(usize, f64, [f64; 3])> {
+        let mut best_d2 = f64::INFINITY;
+        let mut best: Option<(usize, [f64; 3])> = None;
+        for ti in 0..self.triangles.len() {
+            let (a, b, c) = self.tri(ti);
+            let cl = crate::weld::closest_point_on_triangle_pub(p, a, b, c);
+            let d = sub(p, cl);
+            let d2 = dot(d, d);
+            if d2 < best_d2 {
+                best_d2 = d2;
+                best = Some((ti, cl));
+            }
+        }
+        best.map(|(t, cl)| (t, best_d2.sqrt(), cl))
+    }
 }
 
 impl Boundary for TriMesh {
@@ -739,26 +768,35 @@ impl Boundary for TriMesh {
     }
 
     fn surface_normal(&self, p: [f64; 3]) -> Option<[f64; 3]> {
-        // Normal of the nearest triangle (by centroid distance — enough to pick the
-        // facet a near-surface seam vertex sits on).
-        let mut best = (f64::INFINITY, 0usize);
+        // Normal of the triangle whose clamped closest point to `p` is nearest — the
+        // facet `p` actually sits on, even when a large neighbor's centroid is closer.
+        self.nearest_triangle_clamped(p)
+            .map(|(t, _, _)| self.tri_normal(t))
+    }
+
+    fn surface_distance(&self, p: [f64; 3]) -> Option<f64> {
+        // Unsigned distance to the nearest triangle (clamped closest point). Without this
+        // an imported fault mesh defaults to `None` and can never be picked as the nearest
+        // surface — `seam_boundary_normal` then slides the seam onto the domain box.
+        self.nearest_triangle_clamped(p).map(|(_, d, _)| d)
+    }
+
+    fn edge_crossing_count(&self, a: [f64; 3], b: [f64; 3]) -> usize {
+        // Count ALL segment/triangle intersections along a→b, not just the nearest. A
+        // non-convex imported mesh (a folded fault) can be entered and exited by one cell
+        // edge; that double crossing must force a subdivision, exactly as `SlabComplement`
+        // does for its two band contacts — otherwise the contour cracks at the cell.
+        let dir = sub(b, a);
+        let mut count = 0;
         for ti in 0..self.triangles.len() {
-            let (a, b, c) = self.tri(ti);
-            let ctr = [
-                (a[0] + b[0] + c[0]) / 3.0,
-                (a[1] + b[1] + c[1]) / 3.0,
-                (a[2] + b[2] + c[2]) / 3.0,
-            ];
-            let d = norm(sub(p, ctr));
-            if d < best.0 {
-                best = (d, ti);
+            let (v0, v1, v2) = self.tri(ti);
+            if let Some(t) = ray_triangle(a, dir, v0, v1, v2) {
+                if (0.0..=1.0).contains(&t) {
+                    count += 1;
+                }
             }
         }
-        if best.0.is_finite() {
-            Some(self.tri_normal(best.1))
-        } else {
-            None
-        }
+        count
     }
 }
 
@@ -2387,6 +2425,87 @@ mod tests {
             "crease residual grew beyond a handful: open={open} nm={nonmanifold} / {total}"
         );
         eprintln!("[trimesh] tris={} open={open} crease_nm={nonmanifold}", mesh.triangle_count());
+    }
+
+    /// Issue A acceptance: an imported `TriMesh` fault, as contributor 1 behind the
+    /// domain box (contributor 0), is now picked as the NEAREST surface for a seam
+    /// vertex sitting on it — `seam_boundary_normal` returns the FAULT's normal, not
+    /// the box's. Before `TriMesh::surface_distance` existed it returned `None`, so the
+    /// box (which answers `surface_distance` everywhere) always won and slid the seam
+    /// onto a box face.
+    #[test]
+    fn seam_normal_picks_imported_trimesh_over_box() {
+        let model = flat_model();
+        // Large box; small octahedron "fault" near the box center, far from any face.
+        let domain = AxisBox::new([0.0, 0.0, 0.0], 1000.0);
+        let fault = octahedron([500.0, 500.0, 500.0], 100.0);
+        let scene = Scene::new(&model, 0.0, vec![&domain, &fault]);
+
+        // Centroid of the fault's +++ face (verts +x/+y/+z): sits ON that facet, whose
+        // outward normal is (1,1,1)/√3. ~467 from the nearest box face.
+        let p = [
+            (600.0 + 500.0 + 500.0) / 3.0,
+            (500.0 + 600.0 + 500.0) / 3.0,
+            (500.0 + 500.0 + 600.0) / 3.0,
+        ];
+
+        // The fault really is the nearer surface here.
+        let d_box = domain.surface_distance(p).unwrap();
+        let d_fault = fault.surface_distance(p).unwrap();
+        assert!(
+            d_fault < d_box,
+            "fault should be nearer than the box: d_fault={d_fault} d_box={d_box}"
+        );
+
+        let n = scene
+            .seam_boundary_normal(p)
+            .expect("a contributor must supply a seam normal");
+        let inv_sqrt3 = 1.0 / 3.0_f64.sqrt();
+        for (i, c) in n.iter().enumerate() {
+            assert!(
+                (c - inv_sqrt3).abs() < 1e-6,
+                "expected the fault's (1,1,1)/√3 normal, got component {i} = {c} (n={n:?})"
+            );
+        }
+        // And it is NOT the box's normal (axis-aligned) at this point.
+        let nb = domain.surface_normal(p).unwrap();
+        assert!(
+            nb != n,
+            "seam normal collapsed onto the box face normal {nb:?}"
+        );
+    }
+
+    /// Issue B acceptance: a cell edge that passes THROUGH a `TriMesh` body (enters and
+    /// exits) double-crosses it, and `edge_crossing_count` now reports both hits — so
+    /// `Scene::edge_double_crossed` forces the subdivision that keeps the contour
+    /// watertight. The default `is_some() as usize` capped this at 1, leaving such a
+    /// cell un-subdivided (a potential crack), exactly the `SlabComplement` exposure.
+    #[test]
+    fn trimesh_edge_double_crossing_forces_subdivision() {
+        let fault = octahedron([500.0, 500.0, 500.0], 100.0);
+
+        // Off-axis edge clean through the interior: one entry facet, one exit facet.
+        let through = ([300.0, 510.0, 505.0], [700.0, 510.0, 505.0]);
+        assert_eq!(
+            fault.edge_crossing_count(through.0, through.1),
+            2,
+            "an edge through the body must report BOTH facet crossings"
+        );
+        // A segment grazing only one face crosses once…
+        let one_face = ([520.0, 520.0, 520.0], [700.0, 700.0, 700.0]);
+        assert_eq!(fault.edge_crossing_count(one_face.0, one_face.1), 1);
+        // …and an edge entirely outside crosses zero.
+        let outside = ([0.0, 0.0, 0.0], [50.0, 0.0, 0.0]);
+        assert_eq!(fault.edge_crossing_count(outside.0, outside.1), 0);
+
+        // As the sole contributor in a Scene, the through-body edge now trips the
+        // double-crossed-edge refinement (it would not have at count ≤ 1).
+        let model = flat_model();
+        let scene = Scene::new(&model, 0.0, vec![&fault]);
+        assert!(
+            scene.edge_double_crossed(through.0, through.1),
+            "double-crossed imported-mesh edge must force subdivision"
+        );
     }
 
     /// A planar contact `z = z0 + sx*(x-500) + sy*(y-500)` as a fitted Model. The
