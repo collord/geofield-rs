@@ -1057,48 +1057,12 @@ fn orient_closed_outward(mesh: &mut Mesh) {
         ]
     };
 
-    // Undirected edge → triangles sharing it, each with the directed pair as that
-    // triangle currently traverses it.
-    let mut edge_tris: std::collections::HashMap<(u32, u32), Vec<(usize, (u32, u32))>> =
-        std::collections::HashMap::new();
-    for t in 0..tris {
-        let v = tri(t);
-        for &(a, b) in &[(v[0], v[1]), (v[1], v[2]), (v[2], v[0])] {
-            let e = if a < b { (a, b) } else { (b, a) };
-            edge_tris.entry(e).or_default().push((t, (a, b)));
-        }
-    }
-
-    // BFS each connected component, flipping a neighbor when it traverses a shared
-    // edge in the SAME direction as us (inconsistent winding).
-    let mut flip = vec![false; tris];
-    let mut visited = vec![false; tris];
-    for start in 0..tris {
-        if visited[start] {
-            continue;
-        }
-        visited[start] = true;
-        let mut stack = vec![start];
-        while let Some(t) = stack.pop() {
-            let v = tri(t);
-            for &(a, b) in &[(v[0], v[1]), (v[1], v[2]), (v[2], v[0])] {
-                let e = if a < b { (a, b) } else { (b, a) };
-                for &(nt, (na, nb)) in &edge_tris[&e] {
-                    if nt == t || visited[nt] {
-                        continue;
-                    }
-                    let our = if flip[t] { (b, a) } else { (a, b) };
-                    let theirs = if flip[nt] { (nb, na) } else { (na, nb) };
-                    // Consistent iff we traverse the edge opposite to them.
-                    if our != (theirs.1, theirs.0) {
-                        flip[nt] = true;
-                    }
-                    visited[nt] = true;
-                    stack.push(nt);
-                }
-            }
-        }
-    }
+    // Per-component consistent winding via the shared flood-fill (also used to normalize imported
+    // `W` meshes — `mesh::winding_flood_fill`). Octree meshes are closed manifolds (one component,
+    // every edge incidence 2), so this reproduces the previous in-line flood-fill exactly; we then
+    // orient the whole mesh outward by its signed volume, as before.
+    let nested: Vec<[u32; 3]> = (0..tris).map(tri).collect();
+    let (flip, _comp) = crate::mesh::winding_flood_fill(&nested);
 
     // Signed volume (×6) under the now-consistent winding; flip all if it's < 0.
     let pos = |i: u32| {

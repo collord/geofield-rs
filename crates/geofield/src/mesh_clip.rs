@@ -96,6 +96,26 @@ impl ClipMesh {
         let (a, b, c) = self.tri(t);
         cross(sub(b, a), sub(c, a))
     }
+
+    /// Winding-normalize an IMPORTED mesh so it satisfies [`clip`]'s `W` precondition: each connected
+    /// component is made consistently wound, CLOSED components are oriented outward by volume, and an
+    /// OPEN component is left internally consistent (its absolute sense is the caller's
+    /// [`KeepSide`]/[`Keep::Predicate`] choice — `clip` only needs consistency). BIT-tight duplicate
+    /// vertices are welded and degenerate triangles dropped, so a split-vertex import still
+    /// flood-fills. Field-agnostic; delegates to [`crate::mesh::normalize_winding_per_component`].
+    /// Our octree output is already consistently wound and does not need this.
+    pub fn winding_normalized(self) -> Self {
+        let tris: Vec<[u32; 3]> = self
+            .triangles
+            .iter()
+            .map(|t| [t[0] as u32, t[1] as u32, t[2] as u32])
+            .collect();
+        let (vertices, tris) = crate::mesh::normalize_winding_per_component(&self.vertices, &tris);
+        Self {
+            vertices,
+            triangles: tris.into_iter().map(|t| [t[0] as usize, t[1] as usize, t[2] as usize]).collect(),
+        }
+    }
 }
 
 /// Which side of W to keep for C, signed by W's per-triangle outward (CCW) normal: `Above` keeps
@@ -103,8 +123,9 @@ impl ClipMesh {
 ///
 /// Precondition: W is a coherently oriented sheet (all triangles wound consistently). Our octree
 /// contourer satisfies this; imported meshes must be winding-normalized BEFORE `clip` (per
-/// connected component — a multi-part import may mix normal senses). `clip` asserts this in debug
-/// builds; it does not repair winding.
+/// connected component — a multi-part import may mix normal senses) via
+/// [`ClipMesh::winding_normalized`] / [`crate::mesh::normalize_winding_per_component`]. `clip`
+/// asserts this in debug builds; it does not repair winding.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KeepSide {
     Above,
@@ -149,7 +170,10 @@ pub fn clip(
     keep: Keep,
     refine: Option<&dyn ScalarField>,
 ) -> ClipResult {
-    debug_assert!(w_is_consistently_wound(w), "W must be winding-normalized before clip");
+    debug_assert!(
+        w_is_consistently_wound(w),
+        "W must be winding-normalized before clip — see ClipMesh::winding_normalized"
+    );
     let _ = refine; // Milestone 1: hook is accepted but the no-op default is the only path wired.
 
     // --- Step A: intersection segments per (C-tri, W-tri) crossing pair. ---------------------
@@ -1404,5 +1428,130 @@ mod tests {
     fn normalize_t(v: [f64; 3]) -> [f64; 3] {
         let l = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt().max(1e-300);
         [v[0] / l, v[1] / l, v[2] / l]
+    }
+
+    // ---- Imported-mesh winding normalization (docs/02_imported_mesh_winding_normalization.md) ----
+
+    /// A mis-wound multi-component fixture: a CLOSED tetrahedron (verts 0..4) + a disjoint OPEN
+    /// quad sheet (verts 4..), with a deterministic subset of triangles flipped so the mesh is NOT
+    /// consistently wound. Returns it plus the count of tetra verts (4) for component identification.
+    fn miswound_two_components() -> ClipMesh {
+        let mut verts: Vec<[f64; 3]> =
+            vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        // Outward-wound tetra (CCW seen from outside).
+        let mut tris: Vec<[usize; 3]> = vec![[0, 2, 1], [0, 1, 3], [0, 3, 2], [1, 2, 3]];
+        // A disjoint 2×2 open sheet at z = 5, well clear of the tetra.
+        let base = verts.len();
+        for i in 0..3 {
+            for j in 0..3 {
+                verts.push([10.0 + i as f64, 20.0 + j as f64, 5.0]);
+            }
+        }
+        let sidx = |i: usize, j: usize| base + i * 3 + j;
+        for i in 0..2 {
+            for j in 0..2 {
+                let (a, b, c, d) = (sidx(i, j), sidx(i + 1, j), sidx(i + 1, j + 1), sidx(i, j + 1));
+                tris.push([a, b, c]);
+                tris.push([a, c, d]);
+            }
+        }
+        // Mis-wind: flip every 3rd triangle (local inconsistency in BOTH components).
+        for (k, t) in tris.iter_mut().enumerate() {
+            if k % 3 == 0 {
+                t.swap(0, 1);
+            }
+        }
+        ClipMesh::new(verts, tris)
+    }
+
+    /// Acceptance (1): a mis-wound multi-component mesh, after `winding_normalized`, is consistently
+    /// wound, and its CLOSED component (the tetra) is oriented OUTWARD by signed volume. Exercises
+    /// the per-component path (the open sheet stays open-consistent; only the tetra gets oriented).
+    #[test]
+    fn winding_normalize_is_per_component_consistent_and_outward() {
+        let m = miswound_two_components();
+        assert!(!w_is_consistently_wound(&m), "fixture should be mis-wound");
+
+        let n = m.winding_normalized();
+        assert!(w_is_consistently_wound(&n), "normalized mesh is not consistently wound");
+
+        // No duplicate verts in the fixture, so the weld is identity → tetra triangles still
+        // reference verts 0..4. Its signed volume must be POSITIVE (outward).
+        let vol6: f64 = n
+            .triangles
+            .iter()
+            .filter(|t| t.iter().all(|&v| v < 4))
+            .map(|t| {
+                let (a, b, c) = (n.vertices[t[0]], n.vertices[t[1]], n.vertices[t[2]]);
+                a[0] * (b[1] * c[2] - b[2] * c[1]) - a[1] * (b[0] * c[2] - b[2] * c[0])
+                    + a[2] * (b[0] * c[1] - b[1] * c[0])
+            })
+            .sum();
+        assert!(vol6 > 0.0, "closed tetra was not oriented outward (vol6 = {vol6})");
+    }
+
+    /// Acceptance (1b): welding lets a SPLIT-VERTEX import (each face authored with its own vertex
+    /// copies, no shared indices) still flood-fill — without the weld every triangle is its own
+    /// component and nothing can be made mutually consistent.
+    #[test]
+    fn winding_normalize_welds_split_vertex_import() {
+        // Two adjacent triangles of a quad, authored as 6 independent vertices (STL style), with the
+        // second triangle wound the opposite way.
+        let verts = vec![
+            [0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0], // tri 0 (CCW)
+            [0.0, 0.0, 0.0], [1.0, 1.0, 0.0], [0.0, 1.0, 0.0], // tri 1, duplicated shared edge verts
+        ];
+        let tris = vec![[0usize, 1, 2], [3, 5, 4]]; // tri 1 reversed → inconsistent across the shared edge
+        let m = ClipMesh::new(verts, tris);
+        let n = m.winding_normalized();
+        assert_eq!(n.vertices.len(), 4, "shared-edge duplicates should weld to 4 unique verts");
+        assert!(w_is_consistently_wound(&n), "welded sheet should normalize to one consistent component");
+    }
+
+    /// Acceptance (2): an imported (mis-wound) wall `W`, after `winding_normalized`, clips cleanly —
+    /// the seam is watertight and the debug precondition holds. Keep is a winding-INDEPENDENT
+    /// predicate on the wall plane, so the kept side does not depend on the normalizer's arbitrary
+    /// open-sheet sense.
+    #[test]
+    fn imported_wall_normalized_then_clip_is_watertight() {
+        let (c, w) = contact_and_wall();
+        // Simulate an arbitrary import: flip a subset of W's triangles.
+        let mut wt = w.triangles.clone();
+        for (k, t) in wt.iter_mut().enumerate() {
+            if k % 2 == 0 {
+                t.swap(0, 1);
+            }
+        }
+        let w_bad = ClipMesh::new(w.vertices.clone(), wt);
+        assert!(!w_is_consistently_wound(&w_bad), "fixture should be mis-wound");
+
+        let w_fixed = w_bad.winding_normalized();
+        assert!(w_is_consistently_wound(&w_fixed), "normalize failed to make W consistent");
+
+        // x = 0.2·z is the wall plane; keep the +x side regardless of W's winding sense.
+        let keep_plus_x = |p: [f64; 3]| p[0] > 0.2 * p[2];
+        let res = clip(&c, &w_fixed, Keep::Predicate(&keep_plus_x), None);
+        let eps = 0.5;
+        let on_frame = move |p: [f64; 3]| {
+            p[1].abs() < eps
+                || (p[1] - 100.0).abs() < eps
+                || (p[0] - 100.0).abs() < eps
+                || (p[2] + 60.0).abs() < eps
+                || (p[2] - 60.0).abs() < eps
+        };
+        assert_seam_watertight(&res, &on_frame);
+    }
+
+    /// The precondition is actually enforced: an un-normalized mis-wound `W` trips `clip`'s debug
+    /// assert (so the normalize step above is doing real work). Only meaningful in debug builds.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "winding-normalized")]
+    fn clip_rejects_unnormalized_wall_in_debug() {
+        let (c, w) = contact_and_wall();
+        let mut wt = w.triangles.clone();
+        wt[0].swap(0, 1); // one flipped triangle is enough to break consistency
+        let w_bad = ClipMesh::new(w.vertices.clone(), wt);
+        let _ = clip(&c, &w_bad, Keep::Side(KeepSide::Above), None);
     }
 }

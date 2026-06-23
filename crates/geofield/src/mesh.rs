@@ -361,6 +361,196 @@ fn solve3(a: [[f64; 3]; 3], b: [f64; 3]) -> Option<[f64; 3]> {
     ])
 }
 
+// =================================================================================================
+// Winding repair — make a triangle soup consistently wound per connected component.
+//
+// `mesh_clip::clip` requires its clipping wall `W` to be a coherently oriented sheet. Our octree
+// contourer already produces that; an IMPORTED mesh generally does not (and a multi-part import may
+// mix normal senses across disjoint pieces). These field-agnostic helpers satisfy that precondition.
+// See `docs/02_imported_mesh_winding_normalization.md`.
+// =================================================================================================
+
+/// Flood-fill a per-connected-component CONSISTENT winding over a triangle soup. Returns, per
+/// triangle, whether it must be FLIPPED (swap its last two indices) for its component to wind
+/// consistently, plus each triangle's component id.
+///
+/// Adjacency is the shared UNDIRECTED edge, but the flood crosses ONLY manifold edges (exactly two
+/// triangles): an open sheet's rim (incidence 1) and a non-manifold junction (incidence ≥ 3) are
+/// component boundaries, so they neither force a (possibly contradictory) flip nor merge pieces.
+/// Purely topological — vertex positions are not consulted.
+///
+/// Shared by [`normalize_winding_per_component`] and the octree's closed-mesh orienter
+/// (`octree::orient_closed_outward`), so both use one flood-fill.
+pub(crate) fn winding_flood_fill(tris: &[[u32; 3]]) -> (Vec<bool>, Vec<usize>) {
+    use std::collections::HashMap;
+    // Undirected edge → each incident (triangle, directed pair as that triangle traverses it).
+    let mut edge_tris: HashMap<(u32, u32), Vec<(usize, (u32, u32))>> = HashMap::new();
+    for (t, v) in tris.iter().enumerate() {
+        for &(a, b) in &[(v[0], v[1]), (v[1], v[2]), (v[2], v[0])] {
+            let e = if a < b { (a, b) } else { (b, a) };
+            edge_tris.entry(e).or_default().push((t, (a, b)));
+        }
+    }
+
+    let mut flip = vec![false; tris.len()];
+    let mut comp = vec![usize::MAX; tris.len()];
+    let mut next_comp = 0usize;
+    for start in 0..tris.len() {
+        if comp[start] != usize::MAX {
+            continue;
+        }
+        let cid = next_comp;
+        next_comp += 1;
+        comp[start] = cid;
+        let mut stack = vec![start];
+        while let Some(t) = stack.pop() {
+            let v = tris[t];
+            for &(a, b) in &[(v[0], v[1]), (v[1], v[2]), (v[2], v[0])] {
+                let e = if a < b { (a, b) } else { (b, a) };
+                let inc = &edge_tris[&e];
+                if inc.len() != 2 {
+                    continue; // rim / non-manifold → component boundary, don't cross
+                }
+                for &(nt, (na, nb)) in inc {
+                    if nt == t || comp[nt] != usize::MAX {
+                        continue;
+                    }
+                    let our = if flip[t] { (b, a) } else { (a, b) };
+                    let theirs = if flip[nt] { (nb, na) } else { (na, nb) };
+                    // Consistent iff we traverse the shared edge OPPOSITE to the neighbour.
+                    if our != (theirs.1, theirs.0) {
+                        flip[nt] = true;
+                    }
+                    comp[nt] = cid;
+                    stack.push(nt);
+                }
+            }
+        }
+    }
+    (flip, comp)
+}
+
+/// `‖(b−a) × (c−a)‖²` — squared (twice-area) magnitude of a triangle's normal; `0` iff degenerate.
+fn tri_normal_len2(a: [f64; 3], b: [f64; 3], c: [f64; 3]) -> f64 {
+    let u = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+    let v = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+    let n = [
+        u[1] * v[2] - u[2] * v[1],
+        u[2] * v[0] - u[0] * v[2],
+        u[0] * v[1] - u[1] * v[0],
+    ];
+    n[0] * n[0] + n[1] * n[1] + n[2] * n[2]
+}
+
+/// Weld BIT-tight duplicate vertices so a split-vertex export (each face authored with its own
+/// copies) still shares edges by index for [`winding_flood_fill`]. The quantum is the bounding-box
+/// diagonal × `1e-9`, so only true duplicates collapse — never geometrically distinct vertices.
+/// Returns the deduplicated vertices and a `remap[old] -> new` table.
+fn weld_coincident(verts: &[[f64; 3]]) -> (Vec<[f64; 3]>, Vec<u32>) {
+    use std::collections::HashMap;
+    let mut lo = [f64::INFINITY; 3];
+    let mut hi = [f64::NEG_INFINITY; 3];
+    for v in verts {
+        for d in 0..3 {
+            lo[d] = lo[d].min(v[d]);
+            hi[d] = hi[d].max(v[d]);
+        }
+    }
+    let diag = ((hi[0] - lo[0]).powi(2) + (hi[1] - lo[1]).powi(2) + (hi[2] - lo[2]).powi(2)).sqrt();
+    let q = if diag.is_finite() && diag > 0.0 { diag * 1e-9 } else { 1.0 };
+    let mut map: HashMap<(i64, i64, i64), u32> = HashMap::new();
+    let mut out: Vec<[f64; 3]> = Vec::new();
+    let mut remap: Vec<u32> = Vec::with_capacity(verts.len());
+    for v in verts {
+        let k = ((v[0] / q).round() as i64, (v[1] / q).round() as i64, (v[2] / q).round() as i64);
+        let idx = *map.entry(k).or_insert_with(|| {
+            out.push(*v);
+            (out.len() - 1) as u32
+        });
+        remap.push(idx);
+    }
+    (out, remap)
+}
+
+/// Orient each CLOSED connected component OUTWARD by signed volume; OPEN components are left as the
+/// flood-fill wound them (their absolute sense is undefined and is the corefiner caller's choice via
+/// `mesh_clip::KeepSide`/`Keep::Predicate`). `comp` is the per-triangle component id from
+/// [`winding_flood_fill`]; `tris` is mutated in place.
+fn orient_components_outward(verts: &[[f64; 3]], tris: &mut [[u32; 3]], comp: &[usize]) {
+    use std::collections::HashMap;
+    let ncomp = comp.iter().copied().max().map_or(0, |m| m + 1);
+    let mut by_comp: Vec<Vec<usize>> = vec![Vec::new(); ncomp];
+    for (i, &c) in comp.iter().enumerate() {
+        by_comp[c].push(i);
+    }
+    for members in &by_comp {
+        // Closed iff every undirected edge within the component appears exactly twice.
+        let mut inc: HashMap<(u32, u32), u32> = HashMap::new();
+        for &ti in members {
+            let v = tris[ti];
+            for &(a, b) in &[(v[0], v[1]), (v[1], v[2]), (v[2], v[0])] {
+                let e = if a < b { (a, b) } else { (b, a) };
+                *inc.entry(e).or_insert(0) += 1;
+            }
+        }
+        if !inc.values().all(|&c| c == 2) {
+            continue; // open component — leave the (consistent) sense as-is
+        }
+        // Signed volume ×6 under the current winding; negative ⇒ inward, so flip the component.
+        let mut vol6 = 0.0;
+        for &ti in members {
+            let v = tris[ti];
+            let a = verts[v[0] as usize];
+            let b = verts[v[1] as usize];
+            let c = verts[v[2] as usize];
+            vol6 += a[0] * (b[1] * c[2] - b[2] * c[1]) - a[1] * (b[0] * c[2] - b[2] * c[0])
+                + a[2] * (b[0] * c[1] - b[1] * c[0]);
+        }
+        if vol6 < 0.0 {
+            for &ti in members {
+                tris[ti].swap(1, 2);
+            }
+        }
+    }
+}
+
+/// Field-agnostic winding repair for an imported clipping wall `W`: returns the mesh with each
+/// connected component consistently wound, CLOSED components oriented outward by signed volume, and
+/// OPEN components left internally consistent (their absolute sense is the corefiner caller's choice
+/// — `clip` only needs consistency). This makes `mesh_clip::clip`'s `W` precondition satisfiable;
+/// call it on any imported mesh before `clip` (our octree output already satisfies it and need not).
+///
+/// Repairs the degeneracies a real import carries: BIT-tight duplicate vertices are welded (see
+/// [`weld_coincident`]) and degenerate (zero-area / repeated-index) triangles are dropped.
+pub(crate) fn normalize_winding_per_component(
+    verts: &[[f64; 3]],
+    tris: &[[u32; 3]],
+) -> (Vec<[f64; 3]>, Vec<[u32; 3]>) {
+    // (1) Weld duplicates so a split-vertex export still shares edges by index.
+    let (welded, remap) = weld_coincident(verts);
+    // (2) Remap and drop degenerate triangles (collapsed indices or zero area).
+    let mut clean: Vec<[u32; 3]> = Vec::with_capacity(tris.len());
+    for t in tris {
+        let r = [remap[t[0] as usize], remap[t[1] as usize], remap[t[2] as usize]];
+        if r[0] == r[1] || r[1] == r[2] || r[2] == r[0] {
+            continue;
+        }
+        if tri_normal_len2(welded[r[0] as usize], welded[r[1] as usize], welded[r[2] as usize]) == 0.0 {
+            continue; // exactly collinear → zero area, no winding to keep
+        }
+        clean.push(r);
+    }
+    // (3) Per-component consistent winding, then (4) outward-by-volume for closed components.
+    let (flip, comp) = winding_flood_fill(&clean);
+    for (t, &f) in clean.iter_mut().zip(&flip) {
+        if f {
+            t.swap(1, 2);
+        }
+    }
+    orient_components_outward(&welded, &mut clean, &comp);
+    (welded, clean)
+}
+
 // Builds an in-process kernel `Model`, so native-only (the wasm engine has no kernel).
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
