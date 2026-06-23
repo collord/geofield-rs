@@ -77,6 +77,7 @@ function collectSurfaces(
   extent: [number, number, number, number, number, number],
   depth: number,
   weld: boolean,
+  seamClip: boolean,
 ): SurfacePayload[] {
   const [x0, x1, y0, y1, z0, z1] = extent;
   const size = Math.max(x1 - x0, y1 - y0, z1 - z0);
@@ -93,9 +94,11 @@ function collectSurfaces(
     // holes). It returns the walls plus the cut contacts, tagged; we emit all and record the
     // contacts so the series loop below skips re-meshing them independently.
     if (series[si]?.crossCut != null && weld) {
-      const tagged = stack.mesh_cross_cut_shared_octree(
-        si, x0, y0, z0, size, x1, y1, z1, depth, minDepth, QEF_EPS,
-      );
+      // Two no-flag bindings (a trailing flag arg is dropped across this wasm-bindgen toolchain —
+      // see `wasm.rs`): pick the clip or snap seam closer by the checkbox.
+      const tagged = seamClip
+        ? stack.mesh_cross_cut_shared_octree_clip(si, x0, y0, z0, size, x1, y1, z1, depth, minDepth, QEF_EPS)
+        : stack.mesh_cross_cut_shared_octree(si, x0, y0, z0, size, x1, y1, z1, depth, minDepth, QEF_EPS);
       for (const tm of tagged) {
         if (tm.triangle_count > 0) {
           out.push({
@@ -127,15 +130,27 @@ function collectSurfaces(
       }
       continue;
     }
+    // Does a YOUNGER erode series clip this one? (youngest-first: indices < si). If so, with the
+    // "clip seam" toggle ON, close that erosion seam with the mesh–mesh COREFINER instead of the
+    // field masker — the A/B that makes the toggle meaningful for erode scenes (it previously only
+    // affected cross-cut bodies). The Rust side falls back to the masker for faulted series.
+    const youngerErodeAbove = series.some(
+      (s, sj) => sj < si && s?.crossCut == null && s?.topography !== true && s?.relation === 0,
+    );
     const blocks = Math.max(1, stack.series_block_count(si));
     for (let b = 0; b < blocks; b++) {
       for (let k = 0; k < n; k++) {
         // Skip a contact already produced by a cross-cut body's shared-crease meshing (block 0
         // only — the shared path doesn't fault-block; faulted series fall through to remesh).
         if (b === 0 && sharedContacts.has(`${si}:${k}`)) continue;
-        const m = stack.mesh_series_block_interface(
-          si, b, k, x0, y0, z0, size, x1, y1, z1, depth, minDepth, QEF_EPS, false,
-        );
+        const m =
+          seamClip && youngerErodeAbove
+            ? stack.mesh_series_block_interface_erode_clip(
+                si, b, k, x0, y0, z0, size, x1, y1, z1, depth, minDepth, QEF_EPS,
+              )
+            : stack.mesh_series_block_interface(
+                si, b, k, x0, y0, z0, size, x1, y1, z1, depth, minDepth, QEF_EPS, false,
+              );
         if (m.triangle_count > 0) {
           out.push({
             series: si,
@@ -231,7 +246,7 @@ async function run(cmd: RunCommand) {
   emit({ type: "status", phase: solid ? "meshing solids…" : "meshing surfaces…" });
   const surfaces = solid
     ? collectSolids(stack, cmd.series, cmd.extent, cmd.maxDepth, cmd.assignment ?? {})
-    : collectSurfaces(stack, cmd.series, cmd.extent, cmd.maxDepth, cmd.weldTJunctions ?? true);
+    : collectSurfaces(stack, cmd.series, cmd.extent, cmd.maxDepth, cmd.weldTJunctions ?? true, cmd.seamClip ?? true);
 
   // The hierarchy round-trip payload (declared state + derived view) — parsed from the
   // core's single JSON getter (contract D3+D5). The UI treats `derived` as a read-only cache.

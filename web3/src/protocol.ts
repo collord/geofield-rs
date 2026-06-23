@@ -53,6 +53,12 @@ export interface RunCommand {
    *  sliver fix, `crate::weld`). Defaults to `true` when omitted. The UI passes `false` to A/B the
    *  old independent-mesh behavior. */
   weldTJunctions?: boolean;
+  /** Close cross-cut contact↔wall seams with the mesh–mesh CLIP corefiner (`SeamMode::Clip`).
+   *  This is now the DEFAULT (`true` when omitted); pass `false` for the legacy snap
+   *  (`SeamMode::Snap`). Clip shares the seam by index — no see-through dashes, no scalloping, no
+   *  rim slivers. Single-wall + two-wall-band bodies (and erode contacts) corefine; others fall back
+   *  to snap. The UI exposes this as an A/B checkbox (default on) so the two closers can be compared. */
+  seamClip?: boolean;
 }
 
 export type Command = RunCommand;

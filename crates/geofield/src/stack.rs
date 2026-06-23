@@ -78,11 +78,81 @@
 //! [`octree_dual_contour_scene`] in one watertight pass — no new contour algorithm.
 
 use crate::mesh::Mesh;
+use crate::mesh_clip::{clip, ClipMesh, Keep};
 use crate::octree::{
     octree_dual_contour_scene, octree_dual_contour_shared, AxisBox, Boundary, ContactHalfSpace,
     OctreeConfig, PlaneHalfSpace, Scene, SlabComplement,
 };
 use crate::{clip_mesh_to_half_spaces, max_abs_field_in_box, BlockModel, ScalarField, SeriesModel};
+
+/// How `mesh_cross_cut_shared` closes a cut contact against the body's wall(s).
+///
+/// `Snap` (default) is the committed, mesh-agnostic seam closer
+/// ([`crate::weld::snap_free_boundary_to_mesh`]): it nudges the contact's free-boundary crease onto
+/// the nearest wall triangle. Watertight-ish (reduces, doesn't always eliminate, see-through holes).
+///
+/// `Clip` routes through [`crate::mesh_clip::clip`]: a true mesh–mesh corefinement that shares the
+/// contact∩wall seam vertices by index (watertight by construction, no scalloping). Wired
+/// incrementally — see `docs/mesh_clip_wiring.md`. Currently handles only the SINGLE-WALL case;
+/// it falls back to `Snap` for multi-wall bands (veins/shells) until step 2 lands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum SeamMode {
+    #[default]
+    Snap,
+    Clip,
+}
+
+// NOTE: the mesh-based keep-side helpers `exterior_keep_side` (probe the wall's CCW normal) and
+// `keep_side_for_erosion` (always `Above` by W's winding) were REMOVED 2026-06-23. The clip keep side
+// is now a body-FIELD predicate evaluated per sub-triangle centroid (`mesh_one_erode_clipped` and the
+// `clip_walls` block) — robust where a wall fit extrapolates past its constraints near the domain rim
+// (the wall MESH and the field disagree there; a nearest-triangle plane test mis-signs an uncut face,
+// leaving an isolated sliver). The pole-flip reasoning the old erode helper documented still holds and
+// is now inherent: `efield > eiso` is the survive side in BOTH orientations (the field flips with the
+// pole). The no-crossing (empty-seam) case is still gated by `contact_survives_erosion` below.
+
+/// Does the older contact `c` survive a younger erosion when it lies WHOLLY on one side of the
+/// surface (no crossing)? The field-CSG convention: survive where `efield > eiso`. We test the
+/// contact's centroid — since `c` doesn't cross the surface, every point of `c` is on the same side,
+/// so one representative point decides the whole bed. (Crossing beds are trimmed by `clip` instead;
+/// this gate is only consulted on the empty-seam branch.)
+fn contact_survives_erosion(c: &ClipMesh, efield: &dyn ScalarField, eiso: f64) -> bool {
+    if c.vertices.is_empty() {
+        return false;
+    }
+    let mut ctr = [0.0; 3];
+    for v in &c.vertices {
+        for d in 0..3 {
+            ctr[d] += v[d];
+        }
+    }
+    for d in 0..3 {
+        ctr[d] /= c.vertices.len() as f64;
+    }
+    efield.scalar_field(ctr) > eiso
+}
+
+/// Fill a mesh's per-vertex normals from a scalar field's gradient (normalized) — the octree
+/// contourer's convention (`octree.rs`: vertex normal = normalized ∇field), so a corefiner-produced
+/// mesh (which carries no normals) shades identically to a directly-contoured one. Used by the erode
+/// corefiner path on the older contact's own field; the vertices lie on/near the contact where the
+/// gradient is the surface normal. Overwrites any existing normals.
+fn fill_normals_from_field(mesh: &mut Mesh, field: &dyn ScalarField) {
+    let vcount = mesh.vertex_count();
+    mesh.normals = Vec::with_capacity(vcount * 3);
+    for v in 0..vcount {
+        let p = [
+            mesh.positions[3 * v] as f64,
+            mesh.positions[3 * v + 1] as f64,
+            mesh.positions[3 * v + 2] as f64,
+        ];
+        let g = field.scalar_field_gradient(p);
+        let len = (g[0] * g[0] + g[1] * g[1] + g[2] * g[2]).sqrt().max(1e-300);
+        mesh.normals.push((g[0] / len) as f32);
+        mesh.normals.push((g[1] / len) as f32);
+        mesh.normals.push((g[2] / len) as f32);
+    }
+}
 
 /// How a series relates to the (older) series beneath it. `Erode`/`Onlap` are the
 /// Lajaunie–Calcagno binary; GemPy's `StackRelationType` and LoopStructural's
@@ -481,6 +551,18 @@ impl<M: SeriesModel> Stack<M> {
     /// The owned fields live in the returned [`Masker`]s so the borrowed boundaries (built via
     /// [`Masker::boundary`]) outlive them.
     fn clip_maskers(&self, i: usize) -> Vec<Masker<M::Field<'_>>> {
+        self.clip_maskers_filtered(i, true)
+    }
+
+    /// As [`Self::clip_maskers`] but OMIT the younger-erode half-spaces — used by the corefiner erode
+    /// path ([`Self::mesh_one_erode_clipped`]), which closes the erode seam by mesh–mesh clip instead,
+    /// so the erode masker must NOT also field-clip the contact (that would end it short of the
+    /// surface and leave nothing for `clip` to trim). Veins/intrusions/topography/onlap still apply.
+    fn clip_maskers_excluding_erode(&self, i: usize) -> Vec<Masker<M::Field<'_>>> {
+        self.clip_maskers_filtered(i, false)
+    }
+
+    fn clip_maskers_filtered(&self, i: usize, include_erode: bool) -> Vec<Masker<M::Field<'_>>> {
         let mut out = Vec::new();
         // (1) Younger bodies clipping element `i` (topography / erode / vein / intrusion).
         for ej in &self.series[..i] {
@@ -496,9 +578,12 @@ impl<M: SeriesModel> Stack<M> {
                     }
                 }
                 // A younger erode series: older survives ABOVE its top contact (`field > iso`).
+                // Omitted when `include_erode` is false (the corefiner path closes this seam instead).
                 StackElement::Series(sj) if sj.relation == Some(Relation::Erode) => {
-                    if let Some(iso_top) = sj.iso_top() {
-                        out.push(Masker::Halfspace { field: sj.model.field(), iso: iso_top, below: false });
+                    if include_erode {
+                        if let Some(iso_top) = sj.iso_top() {
+                            out.push(Masker::Halfspace { field: sj.model.field(), iso: iso_top, below: false });
+                        }
                     }
                 }
                 // A younger vein: present BETWEEN fw/hw — older survives OUTSIDE that band.
@@ -593,6 +678,138 @@ impl<M: SeriesModel> Stack<M> {
         let field = s.model.field();
         let scene = Scene::new(&field, isovalue, contributors);
         Some(octree_dual_contour_scene(&scene, min, size, cfg))
+    }
+
+    /// As [`Stack::mesh_one_clipped`], but close the seam against younger **erode** surfaces with the
+    /// mesh–mesh COREFINER ([`crate::mesh_clip::clip`]) instead of the field half-space masker — the
+    /// A/B counterpart to `mesh_one_clipped`'s field-CSG path, and the path a future IMPORTED,
+    /// field-less erosion surface must use (the corefiner is field-agnostic; the masker needs
+    /// `scalar_field()`). See `docs/mesh_clip_wiring.md` and the unify-erode plan.
+    ///
+    /// `Snap` (or no younger erode surface) → delegates to `mesh_one_clipped` (byte-identical default).
+    /// `Clip` → contour the older contact BOX-ONLY (so it spans across the erosion surface), contour
+    /// each younger erosion surface as its own mesh, and `clip` the contact against each, keeping the
+    /// surface's own-winding `Above` side ([`keep_side_from_winding`] — which tracks the pole flip).
+    /// Non-erode younger clips (veins/intrusions) on the SAME contact are NOT handled here yet (they
+    /// stay on the masker path); this increment is erode-only by design.
+    pub fn mesh_one_erode_clipped(
+        &self,
+        i: usize,
+        interface_idx: usize,
+        min: [f64; 3],
+        size: f64,
+        ext_max: [f64; 3],
+        cfg: OctreeConfig,
+        seam: SeamMode,
+    ) -> Option<Mesh> {
+        let s = self.series_at(i)?;
+        let isovalue = *s.model.interface_isovalues().get(interface_idx)?;
+
+        // The younger ERODE series clipping this one (youngest-first: indices `< i`), as the SAME
+        // set the `clip_maskers` erode branch enumerates — but collected as their top-contact
+        // (field, iso) so we can contour each as a mesh. A non-erode younger clip (vein/intrusion)
+        // is left to the field-masker path: this method only corefines erode surfaces.
+        let erosion_surfaces: Vec<(M::Field<'_>, f64)> = self.series[..i]
+            .iter()
+            .filter_map(|ej| match ej {
+                StackElement::Series(sj) if sj.relation == Some(Relation::Erode) => {
+                    sj.iso_top().map(|iso| (sj.model.field(), iso))
+                }
+                _ => None,
+            })
+            .collect();
+
+        // Snap mode, or nothing to corefine against → the established field-CSG path verbatim.
+        if seam == SeamMode::Snap || erosion_surfaces.is_empty() {
+            return self.mesh_one_clipped(i, interface_idx, min, size, ext_max, cfg);
+        }
+
+        // The other (non-erode) younger maskers still apply as field clips — veins/intrusions clip
+        // this contact exactly as before; only the erode seam moves to the corefiner. We contour the
+        // contact with those maskers BUT WITHOUT the erode half-spaces (which `clip` replaces), so it
+        // spans across each erosion surface for `clip` to trim.
+        let box_b = AxisBox::from_bounds(min, ext_max);
+        // Hold the masker fields in a local so their borrowed boundaries outlive the `Scene` (mirrors
+        // `mesh_one_clipped`).
+        let non_erode_masker_fields = self.clip_maskers_excluding_erode(i);
+        let non_erode_maskers: Vec<Box<dyn Boundary + '_>> =
+            non_erode_masker_fields.iter().map(|m| m.boundary()).collect();
+        let contact_field = s.model.field();
+        // The contact's OWN contributors: box + non-erode maskers ONLY (no erosion clip — the contact
+        // must span across each erosion surface so the corefiner can trim + share the seam).
+        let mut contact_contribs: Vec<&dyn Boundary> = Vec::with_capacity(non_erode_maskers.len() + 1);
+        contact_contribs.push(&box_b);
+        for m in &non_erode_maskers {
+            contact_contribs.push(m.as_ref());
+        }
+        // The BUILD scene drives octree REFINEMENT: it adds each erosion surface as a `ContactHalfSpace`
+        // contributor so the tree refines the contact NEAR the seam. Without this the contact stays
+        // coarse exactly where the seam lands (the octree only refines where the contact field or the
+        // box/maskers cross), so the corefiner produces a coarse, NOTCHED seam. Refinement-only: the
+        // erosion surfaces are in the BUILD scene (tree structure) but NOT the contact scene (kept
+        // geometry), so they drive subdivision without clipping the contact. (`below=false` is
+        // arbitrary — only the crossing LOCATION refines.) Mirrors the vein path's `extra_wall_contrib`.
+        let erode_refine: Vec<ContactHalfSpace> = erosion_surfaces
+            .iter()
+            .map(|(f, iso)| ContactHalfSpace::new(f, *iso, false))
+            .collect();
+        let mut build_contribs = contact_contribs.clone();
+        for r in &erode_refine {
+            build_contribs.push(r);
+        }
+        let build_scene = Scene::new(&contact_field, isovalue, build_contribs);
+        let contact_scene = Scene::new(&contact_field, isovalue, contact_contribs);
+        let contact_mesh = octree_dual_contour_shared(&build_scene, &[&contact_scene], min, size, cfg)
+            .into_iter()
+            .next()
+            .unwrap_or_default();
+        let mut c = ClipMesh::from_mesh(&contact_mesh);
+
+        // Corefine the contact against EACH younger erosion surface, keeping the survive side
+        // (`Above` W's own winding — see `keep_side_for_erosion`). Where the contact CROSSES the
+        // surface, `clip` trims it and shares the seam by index. Where it lies WHOLLY on one side (no
+        // crossing — e.g. a deep bed entirely below the surface), `clip`'s empty-seam branch can only
+        // keep-all or discard-all by W's winding, which is NOT enough to know whether that side is
+        // eroded — so we gate the whole bed by the EROSION FIELD at the contact's centroid (the same
+        // `efield > eiso` survival test the field-CSG masker uses), discarding a bed that sits on the
+        // eroded side. (Field-gating the no-crossing case is what keeps parity with field-CSG; a
+        // future imported field-less surface will use a normal-based whole-bed test here instead.)
+        let surf_box = box_b; // erosion surfaces contour box-only (span the domain) so the seam is found
+        for (efield, eiso) in &erosion_surfaces {
+            let e_scene = Scene::new(efield, *eiso, vec![&surf_box]);
+            let w = ClipMesh::from_mesh(&octree_dual_contour_scene(&e_scene, min, size, cfg));
+            if w.triangles.is_empty() {
+                continue;
+            }
+            // Keep where the older contact SURVIVES the erosion: `efield > eiso` (the field-CSG
+            // convention). This is the field-computed form of `keep_side_for_erosion`'s `Above` (W
+            // winds toward +∇field, so `signed > 0` ⇔ `efield > eiso`) — but evaluating the FIELD
+            // instead of the wall MESH is robust where the wall fit extrapolates past its constraints
+            // near the domain rim: a nearest-triangle plane test there mis-signs a face the field
+            // correctly classifies, leaving an isolated 1-triangle sliver in the eroded zone (the
+            // wall mesh and field disagree only where the fit is under-constrained). See
+            // `docs/mesh_clip_band_complement.md`.
+            let survive = |p: [f64; 3]| efield.scalar_field(p) > *eiso;
+            let res = clip(&c, &w, Keep::Predicate(&survive), None);
+            if res.shared.is_empty() {
+                // No crossing: keep the whole bed only if its centroid survives the erosion field.
+                if !contact_survives_erosion(&c, efield, *eiso) {
+                    c = ClipMesh::default();
+                    break;
+                }
+                // else: bed wholly on the survive side — leave `c` unchanged, try the next surface.
+            } else {
+                c = res.c;
+            }
+        }
+
+        // The corefiner output carries NO normals (mesh_clip drops them). Resample the contact's own
+        // field gradient at each output vertex — the octree convention (`octree.rs`: per-vertex normal
+        // = normalized field gradient), so shading matches the field-CSG path. (The vertices lie on or
+        // near the contact, where the gradient is the surface normal.)
+        let mut out = c.to_mesh();
+        fill_normals_from_field(&mut out, &contact_field);
+        Some(out)
     }
 
     /// One watertight contact mesh per interface per series, each clipped to where
@@ -715,6 +932,33 @@ impl<M: SeriesModel + BlockModel> Stack<M> {
         Some(mesh)
     }
 
+    /// The block-aware A/B counterpart to [`Self::mesh_one_block`]: close the seam against younger
+    /// **erode** surfaces with the COREFINER ([`Self::mesh_one_erode_clipped`]) instead of the field
+    /// masker. `Snap` (or no younger erode) → the field-masker `mesh_one_block` verbatim.
+    ///
+    /// `Clip` is wired for the UNFAULTED case (`nblocks == 1`, block 0), where the block field IS the
+    /// whole-model field, so it delegates to the non-block corefiner path. A FAULTED erode series
+    /// (`nblocks > 1`) still uses the field-masker `mesh_one_block` (corefining per fault block is a
+    /// later step) — so the opt-in never regresses faulted scenes.
+    pub fn mesh_one_block_erode_clipped(
+        &self,
+        i: usize,
+        b: usize,
+        interface_idx: usize,
+        min: [f64; 3],
+        size: f64,
+        ext_max: [f64; 3],
+        cfg: OctreeConfig,
+        seam: SeamMode,
+    ) -> Option<Mesh> {
+        let single_block = self.series_at(i).map(|s| s.model.nblocks()).unwrap_or(0) == 1;
+        if seam == SeamMode::Clip && b == 0 && single_block {
+            self.mesh_one_erode_clipped(i, interface_idx, min, size, ext_max, cfg, seam)
+        } else {
+            self.mesh_one_block(i, b, interface_idx, min, size, ext_max, cfg)
+        }
+    }
+
     /// Mesh ONE surface of a NON-SERIES element (a cross-cutting vein/intrusion wall, or the
     /// topography ground contact, feature 003) at element `i` as an open contact sheet — the
     /// element's OWN surface, clipped to the extent box and to any YOUNGER element above it
@@ -822,6 +1066,7 @@ impl<M: SeriesModel + BlockModel> Stack<M> {
         size: f64,
         ext_max: [f64; 3],
         cfg: OctreeConfig,
+        seam: SeamMode,
     ) -> Option<(Vec<Mesh>, Vec<(usize, usize, Mesh)>)> {
         let body = self.series.get(i)?;
         if body.is_series() {
@@ -834,6 +1079,12 @@ impl<M: SeriesModel + BlockModel> Stack<M> {
         if n_walls == 0 {
             return None;
         }
+        // CLIP path: when on, the cut contact is contoured WITHOUT its body masker (box-only), so it
+        // spans ACROSS the wall(s) — `clip` then does the trim AND the shared seam. (A field-clipped
+        // contact ends short of the wall and never crosses it, so clip would find no seam.) Handles
+        // SINGLE-wall bodies (step 1) and TWO-wall bands (step 2: union of two single-side clips,
+        // §below). Bodies with ≥3 walls fall through to `Snap`.
+        let use_clip = seam == SeamMode::Clip && (n_walls == 1 || n_walls == 2);
 
         // The cut contacts: (series j, interface k, isovalue, field).
         let cut = self.cuts_below(i, min, size);
@@ -925,8 +1176,12 @@ impl<M: SeriesModel + BlockModel> Stack<M> {
             .map(|ci| {
                 let mut contribs: Vec<&dyn Boundary> = Vec::new();
                 contribs.push(&box_b);
-                for m in &cut_maskers[ci] {
-                    contribs.push(m.as_ref());
+                // `use_clip` contours the contact BOX-ONLY (no body masker) so it spans across the
+                // wall for `clip` to trim; otherwise apply the contact's own maskers (the field-clip).
+                if !use_clip {
+                    for m in &cut_maskers[ci] {
+                        contribs.push(m.as_ref());
+                    }
                 }
                 Scene::new(cut_fields[ci].as_ref(), cut_isos[ci], contribs)
             })
@@ -957,15 +1212,71 @@ impl<M: SeriesModel + BlockModel> Stack<M> {
         // those worst-case dashes still close. (Larger than the wall's own facet error would risk
         // snapping unrelated geometry, so this is bounded, not unlimited.)
         let snap_eps = cell * 3.0;
+        // `use_clip` (decided above): clip the box-only contact against the wall(s), keeping the
+        // body/band EXTERIOR. We combine ALL walls into ONE `ClipMesh` (one seam-id space — the old
+        // per-wall two-call concat gave each wall INDEPENDENT seam vertices, orphaning rim-corner
+        // slivers on oblique walls) and trim with ONE `clip` whose keep rule is the body FIELD's
+        // exterior, evaluated at each sub-triangle centroid:
+        //   * 1-wall envelope (intrusion-single): exterior = `field > iso`.
+        //   * 2-wall band (vein / shell):          exterior = `field < lo ∪ field > hi`
+        //                                          (the mesh analog of `octree::SlabComplement`).
+        // Evaluating the FIELD (not the wall MESH via a nearest-triangle plane) is what makes this
+        // robust: where a wall fit EXTRAPOLATES past its constraints near the domain rim, the wall
+        // mesh and the field disagree, and a mesh nearest-plane test mis-signs an uncut face the field
+        // classifies correctly — leaving an isolated 1-triangle sliver in the eroded/interior zone.
+        // The field is the same ground truth the `Snap`/field-CSG path contours against, so the two
+        // paths agree. See `docs/mesh_clip_wiring.md` and `docs/mesh_clip_band_complement.md`.
+        let combined_wall: Option<ClipMesh> = if use_clip {
+            let mut combined = ClipMesh::default();
+            for w in &walls {
+                let cw = ClipMesh::from_mesh(w);
+                let base = combined.vertices.len();
+                combined.vertices.extend_from_slice(&cw.vertices);
+                combined
+                    .triangles
+                    .extend(cw.triangles.iter().map(|t| [t[0] + base, t[1] + base, t[2] + base]));
+            }
+            Some(combined)
+        } else {
+            None
+        };
+        let (lo, hi) = (
+            body_isos.iter().cloned().fold(f64::INFINITY, f64::min),
+            body_isos.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
+        );
+        let band_eps = (hi - lo).abs() * 1e-6 + 1e-9;
+        let single_wall = n_walls <= 1;
         let tagged_contacts: Vec<(usize, usize, Mesh)> = contacts
             .iter()
+            .enumerate()
             .zip(&cut_ids)
-            .map(|(m, &(j, k))| {
-                let mut contact = m.clone();
-                for w in &walls {
-                    crate::weld::snap_free_boundary_to_mesh(&mut contact, w, snap_eps, cell);
+            .map(|((ci, m), &(j, k))| {
+                if use_clip {
+                    let c = ClipMesh::from_mesh(m);
+                    let combined = combined_wall.as_ref().expect("combined wall under use_clip");
+                    // The body field's exterior — the side the older contact survives on.
+                    let exterior = |p: [f64; 3]| {
+                        let f = body_field.scalar_field(p);
+                        if single_wall {
+                            f > hi + band_eps
+                        } else {
+                            f < lo - band_eps || f > hi + band_eps
+                        }
+                    };
+                    let out = clip(&c, combined, Keep::Predicate(&exterior), None).c;
+                    // `clip` drops normals (mesh_clip.rs); refill from the contact's OWN field gradient
+                    // (the octree convention) so the clipped contact still SHADES — without this it
+                    // renders unlit/black and reads as "the sediments vanished" under clip seam.
+                    let mut mesh = out.to_mesh();
+                    fill_normals_from_field(&mut mesh, cut_fields[ci].as_ref());
+                    (j, k, mesh)
+                } else {
+                    let mut contact = m.clone();
+                    for w in &walls {
+                        crate::weld::snap_free_boundary_to_mesh(&mut contact, w, snap_eps, cell);
+                    }
+                    (j, k, contact)
                 }
-                (j, k, contact)
             })
             .collect();
         Some((walls, tagged_contacts))
@@ -1260,6 +1571,213 @@ mod tests {
     #[test]
     fn stack_erode_surfaces_are_watertight() {
         assert_stack_watertight(|| two_series_stack(Relation::Erode), "erode");
+    }
+
+    /// The corefiner erode path ([`Stack::mesh_one_erode_clipped`] with `Clip`) must MATCH the
+    /// field-CSG path ([`Stack::mesh_one_clipped`]) on the exact `erosional-unconformity` web3
+    /// template (scenarios.ts): a basalt erode series with one DIPPING erosion surface
+    /// (z=650+0.4(x−500), pole = dipDirToPole(21.8°,270°)) over the 3-bed sediments floor, in BOTH
+    /// pole orientations. Asserts, per bed, in BOTH flip states:
+    ///   * `Snap` mode is byte-identical to the plain field-CSG mesher (no behavior change),
+    ///   * `Clip` mode produces a non-empty, manifold (no non-manifold edges) eroded bed,
+    ///   * the surviving area is the SAME region as the field-CSG path (within tessellation slack),
+    ///   * the flip reverses the surviving area the SAME way in both paths.
+    /// This is the native gate; the browser/wasm visual gate is separate (the bug was wasm-only).
+    #[test]
+    fn erode_corefiner_matches_field_csg_either_orientation() {
+        // dipDirToPole(dip=acos(1/n), dipDir=270°) for z=650+0.4(x−500) (sx=0.4).
+        let n = (0.4f64 * 0.4 + 1.0).sqrt();
+        let (dip, dir) = ((1.0 / n).acos(), 270.0_f64.to_radians());
+        let pole = [dip.sin() * dir.sin(), dip.sin() * dir.cos(), dip.cos()];
+        let basalt = |flipped: bool| {
+            let s = if flipped { -1.0 } else { 1.0 };
+            let sps = vec![
+                SurfacePoint::new([200.0, 500.0, 650.0 + 0.4 * (200.0 - 500.0)], 0),
+                SurfacePoint::new([800.0, 500.0, 650.0 + 0.4 * (800.0 - 500.0)], 0),
+            ];
+            let oris = vec![Orientation::new(
+                [500.0, 500.0, 650.0],
+                [s * pole[0], s * pole[1], s * pole[2]],
+            )];
+            Model::fit(&Series::new(sps, oris), KernelOptions::default())
+        };
+        let sediments = || {
+            let mut sps = Vec::new();
+            for (id, z0) in [(0u32, 300.0), (1, 500.0), (2, 700.0)] {
+                sps.push(SurfacePoint::new([200.0, 500.0, z0], id));
+                sps.push(SurfacePoint::new([800.0, 500.0, z0], id));
+            }
+            let oris = [300.0, 500.0, 700.0]
+                .map(|z| Orientation::new([500.0, 500.0, z], [0.0, 0.0, 1.0]))
+                .to_vec();
+            Model::fit(&Series::new(sps, oris), KernelOptions::default())
+        };
+        let min = [0.0, 0.0, 0.0];
+        let size = 1000.0;
+        let ext = [1000.0, 1000.0, 1000.0];
+        let depth = cfg(6);
+        // sediments is series index 1 (older); basalt erode is index 0 (younger).
+        let mesh_bed = |flipped: bool, k: usize, seam: SeamMode, corefine: bool| -> Mesh {
+            let stack = Stack::new(vec![
+                StackElement::Series(StackedSeries::new(basalt(flipped), Relation::Erode)),
+                StackElement::Series(StackedSeries::floor(sediments())),
+            ]);
+            if corefine {
+                stack.mesh_one_erode_clipped(1, k, min, size, ext, depth, seam).unwrap()
+            } else {
+                stack.mesh_one_clipped(1, k, min, size, ext, depth).unwrap()
+            }
+        };
+        for flipped in [true, false] {
+            for k in 0..3 {
+                let csg = mesh_bed(flipped, k, SeamMode::Snap, false);
+                let snap = mesh_bed(flipped, k, SeamMode::Snap, true);
+                let clip = mesh_bed(flipped, k, SeamMode::Clip, true);
+
+                // Snap mode is the field-CSG path verbatim.
+                assert_eq!(
+                    snap.triangle_count(),
+                    csg.triangle_count(),
+                    "flipped={flipped} bed{k}: Snap mode must equal the field-CSG mesher"
+                );
+                let (nm, _open, _total) = edge_stats(&clip);
+                assert_eq!(nm, 0, "flipped={flipped} bed{k}: corefiner left non-manifold edges");
+                // The corefiner must match the field-CSG path on which side survives: a fully-eroded
+                // bed stays empty, a surviving bed stays non-empty, and a partially-eroded bed keeps a
+                // comparable area (tessellation differs at the re-triangulated seam, but a wrong-side
+                // keep would roughly invert it).
+                let (ct, tt) = (clip.triangle_count(), csg.triangle_count());
+                if tt == 0 {
+                    assert_eq!(ct, 0, "flipped={flipped} bed{k}: bed is fully eroded but corefiner kept {ct}");
+                } else {
+                    assert!(ct > 0, "flipped={flipped} bed{k}: bed survives but corefiner emptied it");
+                    let slack = tt / 2 + 8;
+                    assert!(
+                        ct.abs_diff(tt) <= slack,
+                        "flipped={flipped} bed{k}: corefiner area {ct} vs field-CSG {tt} differ too much"
+                    );
+                    // Normals filled (renderer needs them; corefiner output had none).
+                    assert_eq!(
+                        clip.normals.len(),
+                        clip.positions.len(),
+                        "flipped={flipped} bed{k}: corefiner output missing per-vertex normals"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Thread-1 REGRESSION: a BENT erosion surface (a ridge in x, so adjacent W triangles' normals
+    /// SPLAY) truncating ONE flat sediment contact, under `SeamMode::Clip`. The flat contact survives
+    /// as exactly TWO edge-strips (where the ridge dips below z=500); the eroded middle must produce NO
+    /// geometry. Before the field-predicate keep fix, the under-constrained erosion fit extrapolated
+    /// below the contact near the y-rim, and the wall-MESH keep test (`nearest_w_signed`) wrongly kept
+    /// isolated 1-triangle slivers there (4 components instead of 2) — the rim-corner slivers the user
+    /// saw. The field keep test (`efield > eiso`) matches the `Snap`/field-CSG ground truth, so Clip
+    /// must now equal Snap: 2 components, no sliver. (The PLANAR `erode_corefiner_matches_field_csg`
+    /// parity test cannot catch this — only a bent wall has a rim region where mesh and field diverge.)
+    #[test]
+    fn bent_erosion_clip_has_no_rim_slivers() {
+        // A single flat sediment contact at z=500 (floor series, index 1).
+        let sediment = || {
+            let mut sps = Vec::new();
+            for i in 0..4 {
+                for j in 0..4 {
+                    sps.push(SurfacePoint::new([i as f64 * 300.0 + 50.0, j as f64 * 300.0 + 50.0, 500.0], 0));
+                }
+            }
+            let oris = vec![Orientation::new([500.0, 500.0, 500.0], [0.0, 0.0, 1.0])];
+            Model::fit(&Series::new(sps, oris), KernelOptions::default())
+        };
+        // A BENT erosion surface (index 0, Erode): a ridge in x — apex z≈700 at x=500, flanks z≈400 at
+        // x=200/800. Adjacent wall triangles' normals splay across the apex. It truncates the flat
+        // contact along two curved seams (where the ridge crosses z=500).
+        let bent_erosion = || {
+            let mut sps = Vec::new();
+            for j in 0..4 {
+                let y = j as f64 * 300.0 + 50.0;
+                sps.push(SurfacePoint::new([200.0, y, 400.0], 0));
+                sps.push(SurfacePoint::new([500.0, y, 700.0], 0));
+                sps.push(SurfacePoint::new([800.0, y, 400.0], 0));
+            }
+            // Orientations on each flank (normal tilts +x on the left flank, −x on the right) + apex up.
+            let oris = vec![
+                Orientation::new([350.0, 500.0, 550.0], normalize([-1.0, 0.0, 1.0])),
+                Orientation::new([500.0, 500.0, 700.0], [0.0, 0.0, 1.0]),
+                Orientation::new([650.0, 500.0, 550.0], normalize([1.0, 0.0, 1.0])),
+            ];
+            Model::fit(&Series::new(sps, oris), KernelOptions::default())
+        };
+        let min = [0.0, 0.0, 0.0];
+        let size = 1000.0;
+        let ext = [1000.0, 1000.0, 1000.0];
+        let depth = 6u32;
+        let octcfg = OctreeConfig { max_depth: depth, min_depth: 2, qef_threshold: 1e-6, cap: false };
+        let cell = size / (1u32 << depth) as f64;
+
+        for seam in [SeamMode::Snap, SeamMode::Clip] {
+            let stack = Stack::new(vec![
+                StackElement::Series(StackedSeries::new(bent_erosion(), Relation::Erode)),
+                StackElement::Series(StackedSeries::floor(sediment())),
+            ]);
+            let contact = stack
+                .mesh_one_erode_clipped(1, 0, min, size, ext, octcfg, seam)
+                .expect("eroded contact");
+
+            let comp_sizes = component_sizes_bbox(&contact, cell * 0.05);
+            let slivers: Vec<usize> = comp_sizes.iter().map(|c| c.0).filter(|&n| n <= 12).collect();
+            assert!(
+                slivers.is_empty(),
+                "[{seam:?}] eroded contact has {} sliver component(s) {slivers:?} (sizes {:?}) — \
+                 a rim-extrapolation tongue was kept as an isolated fragment",
+                slivers.len(),
+                comp_sizes.iter().map(|c| c.0).collect::<Vec<_>>()
+            );
+            assert_eq!(
+                comp_sizes.len(),
+                2,
+                "[{seam:?}] eroded contact has {} components {:?} — expected exactly 2 edge-strips",
+                comp_sizes.len(),
+                comp_sizes.iter().map(|c| c.0).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    /// Position-welded connected components of a mesh, each as `(triangle_count, bbox_lo, bbox_hi)`,
+    /// largest first.
+    fn component_sizes_bbox(m: &Mesh, snap: f64) -> Vec<(usize, [f64; 3], [f64; 3])> {
+        let pos = |vi: usize| [m.positions[vi * 3] as f64, m.positions[vi * 3 + 1] as f64, m.positions[vi * 3 + 2] as f64];
+        let mut node_of = vec![0usize; m.vertex_count()];
+        let mut bucket: HashMap<(i64, i64, i64), usize> = HashMap::new();
+        let mut nn = 0usize;
+        for vi in 0..m.vertex_count() {
+            let p = pos(vi);
+            let key = ((p[0] / snap).round() as i64, (p[1] / snap).round() as i64, (p[2] / snap).round() as i64);
+            node_of[vi] = *bucket.entry(key).or_insert_with(|| { let n = nn; nn += 1; n });
+        }
+        let mut parent: Vec<usize> = (0..nn).collect();
+        fn find(p: &mut [usize], mut x: usize) -> usize { while p[x] != x { p[x] = p[p[x]]; x = p[x]; } x }
+        for t in m.indices.chunks_exact(3) {
+            let (a, b, c) = (node_of[t[0] as usize], node_of[t[1] as usize], node_of[t[2] as usize]);
+            let (ra, rb, rc) = (find(&mut parent, a), find(&mut parent, b), find(&mut parent, c));
+            parent[rb] = ra; parent[rc] = ra;
+        }
+        let mut tris: HashMap<usize, usize> = HashMap::new();
+        let mut lo: HashMap<usize, [f64; 3]> = HashMap::new();
+        let mut hi: HashMap<usize, [f64; 3]> = HashMap::new();
+        for t in m.indices.chunks_exact(3) {
+            let r = find(&mut parent, node_of[t[0] as usize]);
+            *tris.entry(r).or_insert(0) += 1;
+            for &c in t {
+                let p = pos(c as usize);
+                let l = lo.entry(r).or_insert([f64::INFINITY; 3]);
+                let h = hi.entry(r).or_insert([f64::NEG_INFINITY; 3]);
+                for d in 0..3 { l[d] = l[d].min(p[d]); h[d] = h[d].max(p[d]); }
+            }
+        }
+        let mut out: Vec<(usize, [f64; 3], [f64; 3])> = tris.iter().map(|(&r, &n)| (n, lo[&r], hi[&r])).collect();
+        out.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+        out
     }
 
     /// An ONLAP surface now PINCHES OUT against the older topography it laps onto (it is
@@ -2799,7 +3317,7 @@ mod tests {
         let size = 1000.0;
         let cfg = OctreeConfig { max_depth: 6, min_depth: 2, qef_threshold: 1e-6, cap: false };
         let (walls, _contacts) = stack
-            .mesh_cross_cut_shared(0, min, size, [size, size, size], cfg)
+            .mesh_cross_cut_shared(0, min, size, [size, size, size], cfg, SeamMode::Snap)
             .unwrap();
         assert_eq!(walls.len(), 2, "a vein has two walls");
         let tris: Vec<usize> = walls.iter().map(|w| w.triangle_count()).collect();
@@ -2863,7 +3381,7 @@ mod tests {
         let depth = 7u32; // browser-like fine walls (its walls were ~16k tris vs native ~3k at d6)
         let cfg = OctreeConfig { max_depth: depth, min_depth: 2, qef_threshold: 1e-6, cap: false };
         let cell = size / (1u32 << depth) as f64;
-        let (walls, contacts) = stack.mesh_cross_cut_shared(0, min, size, [size, size, size], cfg).unwrap();
+        let (walls, contacts) = stack.mesh_cross_cut_shared(0, min, size, [size, size, size], cfg, SeamMode::Snap).unwrap();
         let on_box = |p: [f64; 3]| {
             const E: f64 = 1.0;
             p[0] < E || p[0] > size - E || p[1] < E || p[1] > size - E || p[2] < E || p[2] > size - E
@@ -2910,6 +3428,265 @@ mod tests {
         assert_eq!(wall_unbacked, 0, "wall has {wall_unbacked} unbacked open edges");
     }
 
+    /// A single-wall cross-cutting body (an `Intrusion::Single` envelope) over a two-contact column,
+    /// so `mesh_cross_cut_shared` produces exactly ONE wall — the case the `SeamMode::Clip` path
+    /// (step 1 of the mesh-clip wiring) handles. The contact terminating against the single envelope
+    /// wall must, under `Clip`, share the seam by index → NO see-through dashes on the contact (every
+    /// non-box contact open edge is backed by the wall). This is the clip path's first end-to-end
+    /// proof inside production meshing; veins (two walls) still use `Snap` until step 2.
+    fn intrusion_single_over_column() -> Stack<Model> {
+        // A near-vertical intrusion envelope through the column centre (dips slightly in x so it
+        // cuts the octree grid obliquely, like the vein case). Single envelope = one wall.
+        let env = {
+            let mut sps = Vec::new();
+            // Two points on the y-centreline define a tilted vertical-ish contact x ≈ 500 + 0.4(z−500).
+            sps.push(SurfacePoint::new([500.0 + 0.4 * (200.0 - 500.0), 500.0, 200.0], 0));
+            sps.push(SurfacePoint::new([500.0 + 0.4 * (800.0 - 500.0), 500.0, 800.0], 0));
+            let oris = vec![Orientation::new([500.0, 500.0, 500.0], normalize([1.0, 0.0, -0.4]))];
+            Model::fit(&Series::new(sps, oris), KernelOptions::default())
+        };
+        Stack::new(vec![
+            StackElement::Intrusion(Intrusion::new(env, Envelope::Single(0))),
+            StackElement::Series(StackedSeries::floor(two_contact_model(350.0, 650.0))),
+        ])
+    }
+
+    /// Count non-box open edges on the clipped contacts whose midpoint is NOT backed by ANY wall (a
+    /// see-through dash). Shared by the single-wall and band clip-seam tests. `size`/`cell` size the
+    /// box-rim filter and the "backed" tolerance (half a cell).
+    fn count_unbacked_contact_dashes(
+        contacts: &[(usize, usize, Mesh)],
+        walls: &[Mesh],
+        size: f64,
+        cell: f64,
+    ) -> usize {
+        let on_box = |p: [f64; 3]| {
+            const E: f64 = 1.0;
+            (0..3).any(|d| p[d] < E || p[d] > size - E)
+        };
+        let backed = |mid: [f64; 3]| -> bool {
+            for wall in walls {
+                for t in wall.indices.chunks_exact(3) {
+                    let tp = |i: usize| {
+                        [
+                            wall.positions[t[i] as usize * 3] as f64,
+                            wall.positions[t[i] as usize * 3 + 1] as f64,
+                            wall.positions[t[i] as usize * 3 + 2] as f64,
+                        ]
+                    };
+                    let c = crate::weld::closest_point_on_triangle_pub(mid, tp(0), tp(1), tp(2));
+                    if (c[0] - mid[0]).powi(2) + (c[1] - mid[1]).powi(2) + (c[2] - mid[2]).powi(2)
+                        < (cell * 0.5).powi(2)
+                    {
+                        return true;
+                    }
+                }
+            }
+            false
+        };
+        let mut unbacked = 0;
+        for (_, _, m) in contacts {
+            let mut inc: std::collections::HashMap<(u32, u32), u32> = std::collections::HashMap::new();
+            for t in m.indices.chunks_exact(3) {
+                for &(a, b) in &[(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+                    let e = if a < b { (a, b) } else { (b, a) };
+                    *inc.entry(e).or_insert(0) += 1;
+                }
+            }
+            for (&(a, b), &c) in &inc {
+                if c != 1 {
+                    continue;
+                }
+                let pa = [m.positions[a as usize * 3] as f64, m.positions[a as usize * 3 + 1] as f64, m.positions[a as usize * 3 + 2] as f64];
+                let pb = [m.positions[b as usize * 3] as f64, m.positions[b as usize * 3 + 1] as f64, m.positions[b as usize * 3 + 2] as f64];
+                if on_box(pa) || on_box(pb) {
+                    continue;
+                }
+                let mid = [(pa[0] + pb[0]) * 0.5, (pa[1] + pb[1]) * 0.5, (pa[2] + pb[2]) * 0.5];
+                if !backed(mid) {
+                    unbacked += 1;
+                }
+            }
+        }
+        unbacked
+    }
+
+    #[test]
+    fn clip_seam_single_wall_is_watertight() {
+        let stack = intrusion_single_over_column();
+        let min = [0.0, 0.0, 0.0];
+        let size = 1000.0;
+        let ext = [size, size, size];
+        let depth = 6u32;
+        let cfg = OctreeConfig { max_depth: depth, min_depth: 2, qef_threshold: 1e-6, cap: false };
+
+        // Confirm this fixture is genuinely the single-wall case (so the Clip path is exercised, not
+        // silently falling back to Snap).
+        let (walls, contacts) = stack
+            .mesh_cross_cut_shared(0, min, size, ext, cfg, SeamMode::Clip)
+            .expect("shared cross-cut meshing");
+        assert_eq!(walls.len(), 1, "fixture must be single-wall to exercise the Clip path");
+        assert!(!contacts.is_empty(), "intrusion did not cut any column contact");
+        assert!(
+            contacts.iter().any(|(_, _, m)| m.triangle_count() > 0),
+            "clip produced no contact geometry"
+        );
+
+        // Every non-box open edge on a clipped contact must be BACKED by the wall (no see-through
+        // dash) — the same metric the snap tests use, so it's a like-for-like bar.
+        let cell = size / (1u32 << depth) as f64;
+        let unbacked = count_unbacked_contact_dashes(&contacts, &walls, size, cell);
+        assert_eq!(unbacked, 0, "Clip path left {unbacked} see-through dashes on the contact seam");
+    }
+
+    /// Step 2 — a VEIN (two-wall band) cut contact under `SeamMode::Clip`. The contact survives
+    /// OUTSIDE the band (`field < lo ∪ field > hi`), produced as the UNION of two single-side clips
+    /// (one per wall). Assert: it IS the two-wall case (so the band-union path runs), the contact
+    /// survives on BOTH sides of the band (the half-erasing one-sided bug stays dead), and every
+    /// non-box contact open edge is backed by a wall (no see-through dashes).
+    #[test]
+    fn clip_seam_vein_band_is_watertight() {
+        let (stack, _vf) = vertical_vein_over_column();
+        let min = [0.0, 0.0, 0.0];
+        let size = 1000.0;
+        let ext = [size, size, size];
+        let depth = 6u32;
+        let cfg = OctreeConfig { max_depth: depth, min_depth: 2, qef_threshold: 1e-6, cap: false };
+
+        let (walls, contacts) = stack
+            .mesh_cross_cut_shared(0, min, size, ext, cfg, SeamMode::Clip)
+            .expect("shared cross-cut meshing");
+        assert_eq!(walls.len(), 2, "vein must be the two-wall band case");
+        assert!(!contacts.is_empty(), "vein did not cut any column contact");
+
+        // Both band-exterior sides survive (foot side small x, hanging side large x) — the band
+        // [400,600]-ish in x at column mid, so left < 350 and right > 650 must both be populated.
+        for (_, _, m) in &contacts {
+            let (mut has_left, mut has_right) = (false, false);
+            for v in m.positions.chunks_exact(3) {
+                let x = v[0] as f64;
+                has_left |= x < 350.0;
+                has_right |= x > 650.0;
+            }
+            assert!(has_left && has_right, "band-union erased a side: left={has_left} right={has_right}");
+        }
+
+        let cell = size / (1u32 << depth) as f64;
+        let unbacked = count_unbacked_contact_dashes(&contacts, &walls, size, cell);
+        assert_eq!(unbacked, 0, "vein Clip path left {unbacked} see-through dashes on the contact seam");
+    }
+
+    /// Thread-1 NON-REGRESSION guard: the band-complement single-call clip must leave each cut bed a
+    /// CLEAN 2 connected components (foot side + hanging side) with NO orphan slivers. Faithful repro
+    /// of web3 `cross-cutting-vein-dipping`: a 3-FLAT-bed floor (z=300/500/700) cross-cut by a DIPPING
+    /// vein (dxdz=0.5, walls at x0=400/600, the 2-point under-constrained — y-wavy — fit), at the web
+    /// default depth 6.
+    ///
+    /// CAVEAT (documented in `docs/mesh_clip_band_complement.md`): the parked sliver symptom is
+    /// WASM-ONLY — it never reproduced in native tests (the two-call concat was ALSO a clean 2
+    /// components here). So this test guards against a NATIVE regression and pins the post-fix
+    /// component count; it does NOT prove the wasm symptom fixed. Real verification is the web
+    /// "clip seam" A/B toggle.
+    #[test]
+    fn band_complement_keeps_two_clean_components_per_bed() {
+        // The dipping vein: dxdz=0.5, walls at x0=400/600, 2-point fit (matches `dippingWall`).
+        let dxdz = 0.5;
+        let build_vein = || {
+            let mut sps = Vec::new();
+            for (id, x0) in [(0u32, 400.0), (1u32, 600.0)] {
+                sps.push(SurfacePoint::new([x0 + dxdz * (200.0 - 500.0), 500.0, 200.0], id));
+                sps.push(SurfacePoint::new([x0 + dxdz * (800.0 - 500.0), 500.0, 800.0], id));
+            }
+            let oris = vec![Orientation::new([500.0, 500.0, 500.0], normalize([1.0, 0.0, -dxdz]))];
+            Model::fit(&Series::new(sps, oris), KernelOptions::default())
+        };
+        // 3 flat beds at z = 300/500/700 (ids 0,1,2), pole +z. Mirrors `threeContactFloor`.
+        let three_bed = {
+            let mut sps = Vec::new();
+            for (id, z) in [(0u32, 300.0), (1u32, 500.0), (2u32, 700.0)] {
+                for i in 0..4 {
+                    for j in 0..4 {
+                        sps.push(SurfacePoint::new([i as f64 * 300.0 + 50.0, j as f64 * 300.0 + 50.0, z], id));
+                    }
+                }
+            }
+            let oris = vec![Orientation::new([500.0, 500.0, 500.0], [0.0, 0.0, 1.0])];
+            Model::fit(&Series::new(sps, oris), KernelOptions::default())
+        };
+        let stack = Stack::new(vec![
+            StackElement::Vein(Vein::new(build_vein(), 0, 1)),
+            StackElement::Series(StackedSeries::floor(three_bed)),
+        ]);
+        let min = [0.0, 0.0, 0.0];
+        let size = 1000.0;
+        let ext = [size, size, size];
+        let depth = 6u32;
+        let cfg = OctreeConfig { max_depth: depth, min_depth: 2, qef_threshold: 1e-6, cap: false };
+        let cell = size / (1u32 << depth) as f64;
+
+        let (_walls, contacts) = stack
+            .mesh_cross_cut_shared(0, min, size, ext, cfg, SeamMode::Clip)
+            .expect("shared cross-cut meshing");
+
+        // Position-welded connected components (snap merges f32 round-off; the foot/hanging sides are
+        // genuinely separated by the band, so they stay 2 components — an orphan sliver would add one).
+        let component_sizes = |m: &Mesh| -> Vec<usize> {
+            let snap = cell * 0.05;
+            let pos = |vi: usize| {
+                [m.positions[vi * 3] as f64, m.positions[vi * 3 + 1] as f64, m.positions[vi * 3 + 2] as f64]
+            };
+            let mut node_of = vec![0usize; m.vertex_count()];
+            let mut bucket: HashMap<(i64, i64, i64), usize> = HashMap::new();
+            let mut nnodes = 0usize;
+            for vi in 0..m.vertex_count() {
+                let p = pos(vi);
+                let key = ((p[0] / snap).round() as i64, (p[1] / snap).round() as i64, (p[2] / snap).round() as i64);
+                node_of[vi] = *bucket.entry(key).or_insert_with(|| {
+                    let n = nnodes;
+                    nnodes += 1;
+                    n
+                });
+            }
+            let mut parent: Vec<usize> = (0..nnodes).collect();
+            fn find(parent: &mut [usize], mut x: usize) -> usize {
+                while parent[x] != x {
+                    parent[x] = parent[parent[x]];
+                    x = parent[x];
+                }
+                x
+            }
+            for t in m.indices.chunks_exact(3) {
+                let (a, b, c) = (node_of[t[0] as usize], node_of[t[1] as usize], node_of[t[2] as usize]);
+                let (ra, rb, rc) = (find(&mut parent, a), find(&mut parent, b), find(&mut parent, c));
+                parent[rb] = ra;
+                parent[rc] = ra;
+            }
+            let mut tris: HashMap<usize, usize> = HashMap::new();
+            for t in m.indices.chunks_exact(3) {
+                *tris.entry(find(&mut parent, node_of[t[0] as usize])).or_insert(0) += 1;
+            }
+            let mut sizes: Vec<usize> = tris.into_values().collect();
+            sizes.sort_unstable_by(|a, b| b.cmp(a));
+            sizes
+        };
+
+        assert_eq!(contacts.len(), 3, "the 3-bed floor must cut 3 contacts");
+        for (j, k, m) in &contacts {
+            let sizes = component_sizes(m);
+            assert_eq!(
+                sizes.len(),
+                2,
+                "bed (s{j},i{k}) has {} components {:?} — expected 2 (foot side + hanging side); a sliver orphaned",
+                sizes.len(),
+                sizes
+            );
+            assert!(
+                sizes.iter().all(|&n| n > 8),
+                "bed (s{j},i{k}) has a small (sliver) component: {sizes:?}"
+            );
+        }
+    }
+
     /// THE SHARED-CREASE FIX — co-contour the vein walls AND the cut contacts on ONE octree
     /// (`mesh_cross_cut_shared`) so their crease is the SAME discretization. Merge all the meshes
     /// and count non-box open edges: this should be DRAMATICALLY fewer than the independent meshes
@@ -2931,7 +3708,7 @@ mod tests {
         let cell = size / (1u32 << depth) as f64;
 
         let (walls, contacts) = stack
-            .mesh_cross_cut_shared(0, min, size, ext, cfg)
+            .mesh_cross_cut_shared(0, min, size, ext, cfg, SeamMode::Snap)
             .expect("shared cross-cut meshing");
 
         // REGRESSION: a vein clips the contacts to OUTSIDE its band — both the foot-wall side

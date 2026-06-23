@@ -19,6 +19,14 @@ serde_json = { version = "1", optional = true }
 # the wasm boundary; derive only. Used by both the `wasm` ABI layer and native DTO tests,
 # so it is a normal (non-optional) dep — it is tiny and pulls no platform-specific code.
 serde = { version = "1", features = ["derive"] }
+# Mesh–mesh seam corefinement (`src/mesh_clip.rs`): per-cut-face constrained Delaunay
+# re-triangulation. We use `spade` (not `cdt`): a corefinement seam vertex routinely lands
+# EXACTLY on a cut face's boundary edge (the seam enters/exits every face through an edge), and
+# `cdt` 0.1 silently drops whole sub-regions on that case, leaving holes. `spade`'s
+# `add_constraint_and_split` handles a constraint endpoint on an existing vertex/edge and tiles
+# the face completely. Its predicates come from the `robust` crate (adaptive-exact, pure-Rust,
+# wasm-clean) so the triangulation's sign decisions are stable native vs wasm.
+spade = "2"
 
 # NATIVE ONLY. The kernel is linked in-process for native tests + the CLI so they can
 # build a real Model and mesh it. This dependency is `cfg(not(wasm32))`, so it is NOT

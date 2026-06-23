@@ -778,6 +778,43 @@ impl WasmStack {
             .unwrap_or_else(EMPTY_MESH)
     }
 
+    /// Same as [`Self::mesh_series_block_interface`] but close the seam against younger ERODE
+    /// surfaces with the mesh–mesh COREFINER (`SeamMode::Clip`) instead of the field-half-space
+    /// masker — the A/B counterpart the "clip seam" toggle drives for stratigraphic erode scenes
+    /// (today that toggle only affects cross-cut bodies). Unfaulted erode series only; a faulted one
+    /// falls back to the masker path inside [`Stack::mesh_one_block_erode_clipped`].
+    ///
+    /// SEPARATE method (not a flag on the snap one) for the same reason as the cross-cut clip pair: a
+    /// trailing flag arg is silently dropped by this wasm-bindgen toolchain. No `cap` arg either —
+    /// the corefiner erode path contours the contact box-only itself. The worker picks this method
+    /// when the checkbox is on.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mesh_series_block_interface_erode_clip(
+        &self,
+        series: usize,
+        block: usize,
+        interface_idx: usize,
+        min_x: f64,
+        min_y: f64,
+        min_z: f64,
+        size: f64,
+        ext_x: f64,
+        ext_y: f64,
+        ext_z: f64,
+        max_depth: u32,
+        min_depth: u32,
+        qef_threshold: f64,
+    ) -> WasmMesh {
+        let cfg = octree_cfg(max_depth, min_depth, qef_threshold, false);
+        self.inner
+            .mesh_one_block_erode_clipped(
+                series, block, interface_idx, [min_x, min_y, min_z], size, [ext_x, ext_y, ext_z], cfg,
+                crate::stack::SeamMode::Clip,
+            )
+            .map(Into::into)
+            .unwrap_or_else(EMPTY_MESH)
+    }
+
     /// Mesh ONE wall of a CROSS-CUTTING body (vein/intrusion) at element `series` as an open
     /// contact sheet — the body's own surface, clipped to the extent box and any younger body
     /// above it. EMPTY mesh if `series` is a stratigraphic series or any index is out of range.
@@ -831,6 +868,58 @@ impl WasmStack {
         min_depth: u32,
         qef_threshold: f64,
     ) -> Vec<WasmTaggedMesh> {
+        self.cross_cut_shared(
+            series, min_x, min_y, min_z, size, ext_x, ext_y, ext_z, max_depth, min_depth,
+            qef_threshold, crate::stack::SeamMode::Snap,
+        )
+    }
+
+    /// Same as [`Self::mesh_cross_cut_shared_octree`] but closes the contact↔wall seam with the
+    /// mesh–mesh CLIP corefiner (shared seam, no see-through dashes) instead of the legacy snap.
+    ///
+    /// This is a SEPARATE method rather than a flag on the snap one ON PURPOSE: a trailing flag
+    /// argument (tried as both `bool` and `u32`) was silently arriving `0`/`false` in Rust across
+    /// this wasm-bindgen/wasm-pack toolchain — an ABI desync on the last arg. Two no-flag methods
+    /// avoid the marshalling entirely; the worker picks one by the checkbox.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mesh_cross_cut_shared_octree_clip(
+        &self,
+        series: usize,
+        min_x: f64,
+        min_y: f64,
+        min_z: f64,
+        size: f64,
+        ext_x: f64,
+        ext_y: f64,
+        ext_z: f64,
+        max_depth: u32,
+        min_depth: u32,
+        qef_threshold: f64,
+    ) -> Vec<WasmTaggedMesh> {
+        self.cross_cut_shared(
+            series, min_x, min_y, min_z, size, ext_x, ext_y, ext_z, max_depth, min_depth,
+            qef_threshold, crate::stack::SeamMode::Clip,
+        )
+    }
+
+    /// Shared body of the two `mesh_cross_cut_shared_octree*` bindings — contours the body's walls
+    /// and the contacts it cuts on one tree, closing the seam per `seam`. Not exported.
+    #[allow(clippy::too_many_arguments)]
+    fn cross_cut_shared(
+        &self,
+        series: usize,
+        min_x: f64,
+        min_y: f64,
+        min_z: f64,
+        size: f64,
+        ext_x: f64,
+        ext_y: f64,
+        ext_z: f64,
+        max_depth: u32,
+        min_depth: u32,
+        qef_threshold: f64,
+        seam: crate::stack::SeamMode,
+    ) -> Vec<WasmTaggedMesh> {
         let cfg = octree_cfg(max_depth, min_depth, qef_threshold, false);
         let Some((walls, contacts)) = self.inner.mesh_cross_cut_shared(
             series,
@@ -838,6 +927,7 @@ impl WasmStack {
             size,
             [ext_x, ext_y, ext_z],
             cfg,
+            seam,
         ) else {
             return Vec::new();
         };

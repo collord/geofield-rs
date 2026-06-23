@@ -2,6 +2,8 @@
 Cargo.lock
 # macOS Finder metadata
 .DS_Store
+# Claude Code scratch dir
+/.claude-tmp
 # wasm-pack build outputs
 /pkg
 /pkg-node
@@ -38,3 +40,5 @@ Cargo.lock
 /web3/test-results
 /web3/playwright-report
 /web3/.playwright
+
+/.wasm-target

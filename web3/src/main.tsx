@@ -63,6 +63,10 @@ function App() {
   const [renderMode, setRenderMode] = useState<RenderMode>("contact");
   // Debug view controls (visual diagnosis).
   const [wireframe, setWireframe] = useState(false);
+  // The cross-cut seam closer. DEFAULT (on) = mesh–mesh CLIP corefine: shared seam by index, no
+  // see-through dashes, no scalloping, no rim slivers. Off = the legacy snap, kept as an A/B escape
+  // hatch. Toggling re-meshes (it changes geometry), so it re-runs the stack.
+  const [seamClip, setSeamClip] = useState(true);
   const [hiddenKeys, setHiddenKeys] = useState<Set<string>>(new Set());
   const [status, setStatus] = useState<string>("idle");
   const [addMenuOpen, setAddMenuOpen] = useState(false);
@@ -76,7 +80,12 @@ function App() {
 
   // (Re)spawn the worker and post a run for a given compiled stack. Hard-terminate
   // supersedes any in-flight fit (unchanged from feature 001).
-  function runStack(p: Project, onDone?: () => void, mode: RenderMode = renderMode) {
+  function runStack(
+    p: Project,
+    onDone?: () => void,
+    mode: RenderMode = renderMode,
+    seamClipOverride?: boolean,
+  ) {
     workerRef.current?.terminate();
     const worker = new Worker(new URL("./worker.ts", import.meta.url), { type: "module" });
     workerRef.current = worker;
@@ -107,6 +116,10 @@ function App() {
       // T-junction weld is on by default; `window.__WELD_T_JUNCTIONS = false` (then re-Apply) A/Bs
       // the old independent-mesh behavior — a dev escape hatch, not a user-facing control.
       weldTJunctions: (window as { __WELD_T_JUNCTIONS?: boolean }).__WELD_T_JUNCTIONS ?? true,
+      // The cross-cut seam closer A/B (visible checkbox): snap (false) vs mesh–mesh clip (true).
+      // An explicit override avoids the stale-closure race when toggled from the checkbox (React
+      // state updates are async, so the freshly-set value is passed in directly).
+      seamClip: seamClipOverride ?? seamClip,
     };
     worker.postMessage(cmd);
   }
@@ -365,6 +378,26 @@ function App() {
                 onChange={(e) => setWireframe(e.target.checked)}
               />
               edges
+            </label>
+            <label
+              className="debug-toggle"
+              title="Cross-cut seam closer: off = legacy snap, on = mesh–mesh clip corefine (shared seam, no see-through dashes). Re-meshes on toggle."
+            >
+              <input
+                type="checkbox"
+                data-testid="seam-clip-toggle"
+                checked={seamClip}
+                onChange={(e) => {
+                  const on = e.target.checked;
+                  setSeamClip(on);
+                  // Re-mesh immediately so the change is visible (seam closer changes geometry).
+                  // Pass `on` explicitly — the state set above hasn't applied yet this tick.
+                  if (project.elements.length > 0 && validate(project).canApply) {
+                    runStack(project, undefined, renderMode, on);
+                  }
+                }}
+              />
+              clip seam
             </label>
           </div>
         </div>

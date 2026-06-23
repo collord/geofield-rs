@@ -35,6 +35,8 @@ pub mod surface;
 
 pub mod weld;
 
+pub mod mesh_clip;
+
 #[cfg(feature = "wasm")]
 pub mod wasm;
 
