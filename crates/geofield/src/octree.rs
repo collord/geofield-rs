@@ -800,6 +800,76 @@ impl Boundary for TriMesh {
     }
 }
 
+/// Distances at or below this (in mesh coordinates) count as "on the surface", where the
+/// closest-point direction degenerates and the gradient is taken from the nearest face normal.
+/// Corefiner-output vertices lie ON the wall, so their distance is float-noise (~1e-12); 1e-9 is
+/// comfortably above that and below any meaningful off-surface query.
+const MESH_SDF_SURFACE_EPS: f64 = 1e-9;
+
+/// A signed-distance [`ScalarField`] proxy for an imported [`TriMesh`].
+///
+/// The *caller-side convenience* decided on in `docs/imported_field_proxy.md`: an imported mesh has
+/// no defining implicit field, but `fill_normals_from_field` (reshade corefiner output from a
+/// gradient) and the `clip` `refine` hook want one LOCALLY. `MeshSdf` supplies exactly that — a
+/// field whose zero set IS the mesh surface and whose gradient near the surface IS the surface
+/// normal — while inventing NO global field away from the surface (the extrapolation the field-CSG
+/// comments warn about). It is deliberately NOT used by the corefiner; `mesh_clip.rs` stays
+/// field-agnostic (the Task 07 watch-out).
+///
+/// Convention matches the contourer's `b < 0 ⇔ inside`: negative inside the mesh, positive outside,
+/// zero on the surface, `|value|` = clamped nearest-triangle distance. The gradient is the outward
+/// unit normal of that signed-distance field.
+pub struct MeshSdf {
+    mesh: TriMesh,
+}
+
+impl MeshSdf {
+    pub fn new(mesh: TriMesh) -> Self {
+        Self { mesh }
+    }
+
+    /// The wrapped mesh (e.g. to contour or clip against it directly).
+    pub fn mesh(&self) -> &TriMesh {
+        &self.mesh
+    }
+}
+
+impl ScalarField for MeshSdf {
+    fn scalar_field(&self, p: [f64; 3]) -> f64 {
+        // Magnitude from the clamped nearest-triangle distance; sign from the generalized winding
+        // number (robust on non-convex imports). Empty mesh → 0 (no surface anywhere).
+        let d = match self.mesh.nearest_triangle_clamped(p) {
+            Some((_, d, _)) => d,
+            None => return 0.0,
+        };
+        if self.mesh.winding(p) > 0.5 {
+            -d
+        } else {
+            d
+        }
+    }
+
+    fn scalar_field_gradient(&self, p: [f64; 3]) -> [f64; 3] {
+        // ∇(signed distance) is the OUTWARD unit normal everywhere it is defined: away from the
+        // closest surface point when outside, toward it when inside. Right at the surface the
+        // (p − closest) direction degenerates AND winding sits at ~0.5 (a sign coin-flip), so there
+        // we take the nearest face's outward normal instead — exactly what a vertex lying ON the
+        // wall (the corefiner-output case) needs, with no dependence on the ambiguous inside test.
+        let (t, d, cl) = match self.mesh.nearest_triangle_clamped(p) {
+            Some(v) => v,
+            None => return [0.0, 0.0, 1.0], // empty mesh: arbitrary unit direction
+        };
+        if d <= MESH_SDF_SURFACE_EPS {
+            return self.mesh.tri_normal(t);
+        }
+        // `p − cl` points outward when p is outside, inward when inside; orient by winding so the
+        // result always points to increasing signed distance (outward).
+        let dir = sub(p, cl);
+        let s = if self.mesh.winding(p) > 0.5 { -1.0 } else { 1.0 };
+        [s * dir[0] / d, s * dir[1] / d, s * dir[2] / d]
+    }
+}
+
 // Small vector helpers for the TriMesh boundary (kept local — the rest of the
 // contourer works in raw [f64; 3] and doesn't need a vec type).
 fn sub(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
@@ -2351,6 +2421,48 @@ mod tests {
             m.edge_crossing([0.0, 0.0, 0.0], [0.1, 0.0, 0.0]).is_none(),
             "interior segment should not cross the boundary"
         );
+    }
+
+    #[test]
+    fn mesh_sdf_signed_distance_and_gradient() {
+        let sdf = MeshSdf::new(octahedron([0.0, 0.0, 0.0], 1.0));
+        let inv_sqrt3 = 1.0 / 3.0_f64.sqrt();
+
+        // SIGN: negative inside, positive outside, and magnitude is the true nearest-face distance.
+        // The nearest face to the centre is a plane like x+y+z=1, distance 1/√3 from the origin.
+        let c = sdf.scalar_field([0.0, 0.0, 0.0]);
+        assert!(c < 0.0, "centre must be inside (negative): {c}");
+        assert!((c.abs() - inv_sqrt3).abs() < 1e-9, "|value| at centre ≈ 1/√3, got {}", c.abs());
+
+        // A point on the +x axis, still inside: nearest face plane x+y+z=1, distance 0.5/√3.
+        let half = sdf.scalar_field([0.5, 0.0, 0.0]);
+        assert!(half < 0.0, "inside point must be negative: {half}");
+        assert!((half.abs() - 0.5 * inv_sqrt3).abs() < 1e-9, "|value| ≈ 0.5/√3, got {}", half.abs());
+
+        // Outside, beyond the +x vertex at (1,0,0): nearest point is that vertex, distance 1.0.
+        let out = sdf.scalar_field([2.0, 0.0, 0.0]);
+        assert!(out > 0.0, "far point must be outside (positive): {out}");
+        assert!((out - 1.0).abs() < 1e-9, "value beyond +x vertex ≈ 1.0, got {out}");
+
+        // GRADIENT near a face ≈ that face's outward normal, and is unit length. Take a point just
+        // outside the +++ face centroid along its outward normal (1,1,1)/√3.
+        let n = [inv_sqrt3, inv_sqrt3, inv_sqrt3];
+        let ctr = [1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0];
+        let p_out = [ctr[0] + 0.05 * n[0], ctr[1] + 0.05 * n[1], ctr[2] + 0.05 * n[2]];
+        let g = sdf.scalar_field_gradient(p_out);
+        let glen = (g[0] * g[0] + g[1] * g[1] + g[2] * g[2]).sqrt();
+        assert!((glen - 1.0).abs() < 1e-9, "gradient must be unit length: {glen}");
+        assert!(dot(g, n) > 0.999, "gradient ≈ outward face normal: g={g:?}");
+
+        // ON the surface (d ≈ 0) the gradient falls back to the nearest face normal, still outward.
+        let g_on = sdf.scalar_field_gradient(ctr);
+        assert!(dot(g_on, n) > 0.999, "on-surface gradient ≈ outward face normal: g={g_on:?}");
+
+        // INSIDE the gradient still points outward (toward +x here), not toward the surface.
+        let g_in = sdf.scalar_field_gradient([0.5, 0.0, 0.0]);
+        assert!(dot(g_in, [1.0, 0.0, 0.0]) > 0.0, "inside gradient must point outward: g={g_in:?}");
+        let g_in_len = (g_in[0] * g_in[0] + g_in[1] * g_in[1] + g_in[2] * g_in[2]).sqrt();
+        assert!((g_in_len - 1.0).abs() < 1e-9, "inside gradient must be unit length: {g_in_len}");
     }
 
     /// The `Boundary` trait generalizes off the box with ZERO contouring-code

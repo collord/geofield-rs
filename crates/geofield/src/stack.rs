@@ -1686,6 +1686,51 @@ mod tests {
     use crate::Model;
     use std::collections::HashMap;
 
+    /// An imported-mesh field proxy (`MeshSdf`) drops straight into `fill_normals_from_field`: an
+    /// imported clip with no defining field can still reshade its corefiner output from the SDF
+    /// gradient (the wiring half of `docs/imported_field_proxy.md`). Proves the call composes and
+    /// yields unit, outward, surface-aligned normals — i.e. shades instead of rendering flat/black.
+    #[test]
+    fn mesh_sdf_drives_fill_normals_from_field() {
+        use crate::octree::{MeshSdf, TriMesh};
+
+        // Unit octahedron centred at the origin (CCW/outward-wound faces).
+        let verts = vec![
+            [1.0, 0.0, 0.0],
+            [-1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, -1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [0.0, 0.0, -1.0],
+        ];
+        let tris = vec![
+            [0, 2, 4], [2, 1, 4], [1, 3, 4], [3, 0, 4],
+            [2, 0, 5], [1, 2, 5], [3, 1, 5], [0, 3, 5],
+        ];
+        let sdf = MeshSdf::new(TriMesh::new(verts, tris));
+
+        // Two output vertices ON the +++ face: its centroid and the +x vertex it shares. Their
+        // normals should match that face's outward normal (1,1,1)/√3 (the +x vertex is shared by
+        // four faces, so its nearest-face normal is one of them — still all-positive components).
+        let mut mesh = Mesh {
+            positions: vec![1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0, 1.0, 0.0, 0.0],
+            normals: Vec::new(),
+            indices: Vec::new(),
+        };
+        fill_normals_from_field(&mut mesh, &sdf);
+
+        assert_eq!(mesh.normals.len(), mesh.positions.len(), "one normal per position");
+        for v in 0..mesh.vertex_count() {
+            let n = [mesh.normals[3 * v], mesh.normals[3 * v + 1], mesh.normals[3 * v + 2]];
+            let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+            assert!((len - 1.0).abs() < 1e-5, "vertex {v} normal not unit: {n:?}");
+            assert!(
+                n[0] > 0.0 && n[1] > 0.0 && n[2] > 0.0,
+                "vertex {v} on the +++ face must shade with an all-positive outward normal: {n:?}"
+            );
+        }
+    }
+
     /// Fit a planar contact `z = z0 + sx*(x-500) + sy*(y-500)` over a [0,1000]² grid
     /// as a single-interface `Model` (field increases upward). Mirrors the octree
     /// tests' `dipping_plane` helper.
