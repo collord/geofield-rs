@@ -31,7 +31,7 @@
 //!   * **D** — emit C and W as two buffers plus a `shared` map pairing the seam vertices that are
 //!     the same point in each.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use geofield_types::ScalarField;
 
@@ -157,6 +157,11 @@ pub struct ClipResult {
     /// One pair per seam vertex: its index in `c.vertices` and in `w.vertices`. Empty when no seam
     /// was created (the empty-seam branches, or a true no-op).
     pub shared: Vec<(usize, usize)>,
+    /// How many (C-triangle, W-triangle) pairs were COPLANAR and handled by the 2D overlap-boundary
+    /// path (Part A) rather than the transversal segment path. Zero for the common transverse case;
+    /// nonzero flags that imported/locally-parallel geometry exercised the coplanar branch — kept
+    /// observable so a future regression there is visible, not silent (the old code dropped these).
+    pub coplanar_pairs: usize,
 }
 
 /// Corefine `c` against `w`, keeping the `keep` side of `w` for `c`. See module docs.
@@ -177,19 +182,12 @@ pub fn clip(
     let _ = refine; // Milestone 1: hook is accepted but the no-op default is the only path wired.
 
     // --- Step A: intersection segments per (C-tri, W-tri) crossing pair. ---------------------
-    // Milestone 1 uses the full O(|C|·|W|) sweep; an AABB grid is a perf-only follow-up.
-    let mut raw_segments: Vec<RawSegment> = Vec::new();
-    for tc in 0..c.triangles.len() {
-        let (ca, cb, cc) = c.tri(tc);
-        let nc = c.tri_normal_raw(tc);
-        for tw in 0..w.triangles.len() {
-            let (wa, wb, wc) = w.tri(tw);
-            let nw = w.tri_normal_raw(tw);
-            if let Some(seg) = tri_tri_segment((ca, cb, cc), nc, (wa, wb, wc), nw) {
-                raw_segments.push(RawSegment { tc, tw, a: seg.0, b: seg.1 });
-            }
-        }
-    }
+    // A transversal crossing yields one segment; a COPLANAR overlap yields the overlap polygon's
+    // boundary edges (Part A). For large inputs a uniform AABB grid over W replaces the O(|C|·|W|)
+    // sweep (Part B) with BYTE-IDENTICAL output. `coplanar_pairs` is the set of (tc, tw) pairs that
+    // were coplanar — the drop-C/keep-W fill rule needs it to tell a coincident C sub-triangle (drop)
+    // from one merely side-clipped (keep test).
+    let (raw_segments, coplanar_pairs) = intersection_segments(c, w);
 
     // No crossings: empty seam → branch on which side of W all of C lies (NOT a blanket no-op).
     if raw_segments.is_empty() {
@@ -257,7 +255,9 @@ pub fn clip(
             }
             Some(segs) => {
                 let segs: Vec<&SeamSeg> = segs.iter().map(|&i| &segments[i]).collect();
-                retriangulate_c_face(c, w, tc, &segs, &seam, keep, &mut out_c, &mut c_seam_index);
+                retriangulate_c_face(
+                    c, w, tc, &segs, &seam, keep, &coplanar_pairs, &mut out_c, &mut c_seam_index,
+                );
             }
         }
     }
@@ -293,7 +293,7 @@ pub fn clip(
         .filter_map(|(ci, wi)| Some((*c_remap.get(&ci)?, *w_remap.get(&wi)?)))
         .collect();
 
-    ClipResult { c: c_out, w: w_out, shared }
+    ClipResult { c: c_out, w: w_out, shared, coplanar_pairs: coplanar_pairs.len() }
 }
 
 /// A geometric keep predicate for clipping C against an IMPORTED, field-less SINGLE wall `w`: keep
@@ -373,23 +373,183 @@ fn compact(m: ClipMesh) -> (ClipMesh, HashMap<usize, usize>) {
 }
 
 // =============================================================================================
-// Step A — triangle–triangle intersection segment (Möller `compute_intervals_isectline` form).
+// Step A — triangle–triangle intersection (transversal segment + coplanar overlap), with an
+// optional uniform AABB grid over W so the sweep is not unconditionally O(|C|·|W|).
 // =============================================================================================
 
-/// The intersection segment of two triangles, or `None` if they don't cross in a segment (parallel,
-/// coplanar, disjoint, or touching at a point). `n_c`/`n_w` are the UNnormalized face normals.
+/// Pair count above which Step A builds a uniform AABB grid over W instead of the brute double loop.
+/// Below it, the grid's build cost isn't worth it and the simple sweep runs in microseconds. Output
+/// is byte-identical either way, so this only trades build overhead against query savings.
+const BRUTE_PAIR_THRESHOLD: usize = 1 << 18;
+
+/// Step A driver: every (C-tri, W-tri) intersection as [`RawSegment`]s — transversal crossings and
+/// coplanar overlap-boundary edges — plus the set of (tc, tw) pairs that were COPLANAR (the
+/// drop-C/keep-W fill rule needs it). For large inputs a uniform AABB grid over W's triangles
+/// supplies per-C candidates instead of scanning all of W; the result is BYTE-IDENTICAL to the brute
+/// sweep because (a) AABB overlap is a necessary condition for any intersection, so candidates are a
+/// superset of the pairs that actually produce segments, and (b) candidates are visited per-tc in
+/// ASCENDING tw order — exactly the brute loop's push order and positions.
+fn intersection_segments(c: &ClipMesh, w: &ClipMesh) -> (Vec<RawSegment>, HashSet<(usize, usize)>) {
+    let use_grid = c.triangles.len().saturating_mul(w.triangles.len()) > BRUTE_PAIR_THRESHOLD;
+    intersection_segments_inner(c, w, use_grid)
+}
+
+/// The body of [`intersection_segments`] with the grid choice forced — so a test can run both paths
+/// on identical input and assert byte-identical `RawSegment`s (the grid is a candidate filter only).
+fn intersection_segments_inner(
+    c: &ClipMesh,
+    w: &ClipMesh,
+    use_grid: bool,
+) -> (Vec<RawSegment>, HashSet<(usize, usize)>) {
+    let grid = use_grid.then(|| WGrid::build(w));
+    let mut raw = Vec::new();
+    let mut coplanar = HashSet::new();
+    let mut candidates = Vec::new();
+    for tc in 0..c.triangles.len() {
+        let ct = c.tri(tc);
+        let nc = c.tri_normal_raw(tc);
+        candidates.clear();
+        match &grid {
+            Some(g) => g.candidates(tri_aabb(ct), &mut candidates), // deduped + ascending
+            None => candidates.extend(0..w.triangles.len()),
+        }
+        for &tw in &candidates {
+            let wt = w.tri(tw);
+            let nw = w.tri_normal_raw(tw);
+            match tri_tri_intersection(ct, nc, wt, nw) {
+                TriTri::None => {}
+                TriTri::Crossing(a, b) => raw.push(RawSegment { tc, tw, a, b }),
+                TriTri::Coplanar(edges) => {
+                    coplanar.insert((tc, tw));
+                    for (a, b) in edges {
+                        raw.push(RawSegment { tc, tw, a, b });
+                    }
+                }
+            }
+        }
+    }
+    (raw, coplanar)
+}
+
+/// Axis-aligned bounding box of one triangle, as `(lo, hi)`.
+fn tri_aabb(t: ([f64; 3], [f64; 3], [f64; 3])) -> ([f64; 3], [f64; 3]) {
+    let mut lo = t.0;
+    let mut hi = t.0;
+    for p in [t.1, t.2] {
+        for d in 0..3 {
+            lo[d] = lo[d].min(p[d]);
+            hi[d] = hi[d].max(p[d]);
+        }
+    }
+    (lo, hi)
+}
+
+/// A uniform spatial hash over W's triangle AABBs: each triangle is bucketed into every integer cell
+/// its AABB overlaps, so a C triangle's AABB queries only the W triangles in nearby cells. Cell size
+/// is W's mean triangle extent, so a typical triangle spans ~1 cell and a query touches few buckets.
+/// Pure candidate filtering — never changes which pairs actually intersect, only which are tested.
+struct WGrid {
+    origin: [f64; 3],
+    inv_cell: f64,
+    cells: HashMap<[i64; 3], Vec<usize>>,
+}
+
+impl WGrid {
+    fn build(w: &ClipMesh) -> Self {
+        // Cell size = mean triangle extent (floored to the overall extent / a cap so a flat sheet
+        // with tiny extent on one axis can't make cells absurdly small). Guards against an all-zero
+        // mesh by falling back to 1.0.
+        let mut sum_ext = 0.0;
+        let mut origin = [f64::INFINITY; 3];
+        for t in 0..w.triangles.len() {
+            let (lo, _) = tri_aabb(w.tri(t));
+            for d in 0..3 {
+                origin[d] = origin[d].min(lo[d]);
+            }
+            sum_ext += bbox_extent(&[w.tri(t).0, w.tri(t).1, w.tri(t).2]);
+        }
+        if !origin[0].is_finite() {
+            origin = [0.0; 3];
+        }
+        let n = w.triangles.len().max(1) as f64;
+        let mean = sum_ext / n;
+        let cell = if mean > 0.0 { mean } else { 1.0 };
+        let mut cells: HashMap<[i64; 3], Vec<usize>> = HashMap::new();
+        let inv_cell = 1.0 / cell;
+        for t in 0..w.triangles.len() {
+            let (lo, hi) = tri_aabb(w.tri(t));
+            let (cl, ch) = (Self::cell_of(origin, inv_cell, lo), Self::cell_of(origin, inv_cell, hi));
+            for x in cl[0]..=ch[0] {
+                for y in cl[1]..=ch[1] {
+                    for z in cl[2]..=ch[2] {
+                        cells.entry([x, y, z]).or_default().push(t);
+                    }
+                }
+            }
+        }
+        Self { origin, inv_cell, cells }
+    }
+
+    #[inline]
+    fn cell_of(origin: [f64; 3], inv_cell: f64, p: [f64; 3]) -> [i64; 3] {
+        [
+            ((p[0] - origin[0]) * inv_cell).floor() as i64,
+            ((p[1] - origin[1]) * inv_cell).floor() as i64,
+            ((p[2] - origin[2]) * inv_cell).floor() as i64,
+        ]
+    }
+
+    /// Gather (into `out`) the W triangles whose buckets the query AABB touches, deduped and sorted
+    /// ASCENDING — so the caller tests them in the same order the brute loop would.
+    fn candidates(&self, aabb: ([f64; 3], [f64; 3]), out: &mut Vec<usize>) {
+        let (lo, hi) = aabb;
+        let (cl, ch) = (
+            Self::cell_of(self.origin, self.inv_cell, lo),
+            Self::cell_of(self.origin, self.inv_cell, hi),
+        );
+        for x in cl[0]..=ch[0] {
+            for y in cl[1]..=ch[1] {
+                for z in cl[2]..=ch[2] {
+                    if let Some(ts) = self.cells.get(&[x, y, z]) {
+                        out.extend_from_slice(ts);
+                    }
+                }
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+    }
+}
+
+/// What two triangles do where they meet. `n_c`/`n_w` are the UNnormalized face normals.
 ///
-/// Milestone 1 returns `None` for coplanar pairs (logged by the caller as a deferred case).
-fn tri_tri_segment(
+///   * `None` — disjoint, parallel-but-separated, or touching at a point/edge (no area to seam).
+///   * `Crossing(a, b)` — the transversal intersection segment (Möller interval-overlap form).
+///   * `Coplanar(edges)` — the pair lies in a shared plane and overlaps; the boundary edges of their
+///     2D overlap polygon (Part A). Each edge becomes a seam constraint on BOTH faces, so a contact
+///     coincident with a wall is split along the overlap rim instead of running silently through it.
+enum TriTri {
+    None,
+    Crossing([f64; 3], [f64; 3]),
+    Coplanar(Vec<([f64; 3], [f64; 3])>),
+}
+
+fn tri_tri_intersection(
     ct: ([f64; 3], [f64; 3], [f64; 3]),
     n_c: [f64; 3],
     wt: ([f64; 3], [f64; 3], [f64; 3]),
     n_w: [f64; 3],
-) -> Option<([f64; 3], [f64; 3])> {
+) -> TriTri {
     let (c0, c1, c2) = ct;
     let (w0, w1, w2) = wt;
 
-    // Plane of C: n_c·X + d_c = 0. Signed distances of W's verts to it.
+    // A degenerate (zero-area) triangle has no well-defined plane — can't classify it; bail.
+    let (nc2, nw2) = (dot(n_c, n_c), dot(n_w, n_w));
+    if nc2 == 0.0 || nw2 == 0.0 {
+        return TriTri::None;
+    }
+
+    // Plane of C: n_c·X + d_c = 0. Signed distances (× |n_c|) of W's verts to it.
     let d_c = -dot(n_c, c0);
     let (dw0, dw1, dw2) = (
         snap0(dot(n_c, w0) + d_c),
@@ -398,10 +558,10 @@ fn tri_tri_segment(
     );
     // All of W strictly on one side of C's plane → no intersection.
     if dw0 * dw1 > 0.0 && dw0 * dw2 > 0.0 {
-        return None;
+        return TriTri::None;
     }
 
-    // Plane of W. Signed distances of C's verts to it.
+    // Plane of W. Signed distances (× |n_w|) of C's verts to it.
     let d_w = -dot(n_w, w0);
     let (dc0, dc1, dc2) = (
         snap0(dot(n_w, c0) + d_w),
@@ -409,35 +569,146 @@ fn tri_tri_segment(
         snap0(dot(n_w, c2) + d_w),
     );
     if dc0 * dc1 > 0.0 && dc0 * dc2 > 0.0 {
-        return None;
+        return TriTri::None;
     }
 
-    // Intersection-line direction; near-zero ⇒ parallel/coplanar (deferred — skip).
+    // Parallel test, SCALE-INVARIANT: |n_c × n_w|² ≤ sin²ε · |n_c|²·|n_w|². The old absolute
+    // `dot(dir,dir) ≤ COPLANAR_EPS2` scaled with edge length² (the normals are unnormalized), so it
+    // called large genuinely-crossing pairs coplanar and tiny ones never; this ratio is dimensionless.
     let dir = cross(n_c, n_w);
-    if dot(dir, dir) <= COPLANAR_EPS2 {
-        return None;
+    if dot(dir, dir) <= COPLANAR_SIN2 * nc2 * nw2 {
+        // Parallel planes. COINCIDENT (→ coplanar overlap) iff W's verts lie in C's plane, tested
+        // scale-relative: |dw_i| (= |n_c| · perp-distance) ≤ |n_c| · ext · eps. Otherwise the planes
+        // are parallel but separated → genuinely no intersection.
+        let ext = bbox_extent(&[c0, c1, c2, w0, w1, w2]).max(f64::MIN_POSITIVE);
+        let tol2 = nc2 * (ext * COPLANAR_DIST_EPS).powi(2);
+        let coincident = dw0 * dw0 <= tol2 && dw1 * dw1 <= tol2 && dw2 * dw2 <= tol2;
+        if coincident {
+            let edges = coplanar_overlap_edges(ct, n_c, wt);
+            if !edges.is_empty() {
+                return TriTri::Coplanar(edges);
+            }
+        }
+        return TriTri::None;
     }
-    // Dominant axis of `dir`: projecting a point onto the line == taking that coordinate.
+
+    // --- transversal crossing: the overlap of the two triangles' intervals along the cross line. ---
     let axis = dominant_axis(dir);
-
-    // Interval of C along the line (where C straddles W's plane), with the 3D endpoints.
-    let ic = tri_interval(axis, (c0, c1, c2), (dc0, dc1, dc2))?;
-    // Interval of W (where W straddles C's plane).
-    let iw = tri_interval(axis, (w0, w1, w2), (dw0, dw1, dw2))?;
-
-    // Overlap of the two scalar intervals → segment endpoints are the inner bounds.
+    let (ic, iw) = match (
+        tri_interval(axis, (c0, c1, c2), (dc0, dc1, dc2)),
+        tri_interval(axis, (w0, w1, w2), (dw0, dw1, dw2)),
+    ) {
+        (Some(ic), Some(iw)) => (ic, iw),
+        _ => return TriTri::None,
+    };
     let lo = if ic.lo_s >= iw.lo_s { ic.lo_p } else { iw.lo_p };
     let lo_s = ic.lo_s.max(iw.lo_s);
     let hi = if ic.hi_s <= iw.hi_s { ic.hi_p } else { iw.hi_p };
     let hi_s = ic.hi_s.min(iw.hi_s);
-
     if hi_s < lo_s {
-        return None; // intervals don't overlap: planes cross but triangles don't
+        return TriTri::None; // intervals don't overlap: planes cross but triangles don't
     }
     if (hi_s - lo_s) <= seg_len_eps(&[c0, c1, c2, w0, w1, w2]) {
-        return None; // a touch/graze, not a segment — no zero-length constraint
+        return TriTri::None; // a touch/graze, not a segment — no zero-length constraint
     }
-    Some((lo, hi))
+    TriTri::Crossing(lo, hi)
+}
+
+/// The boundary edges of the 2D overlap polygon of two COINCIDENT (coplanar) triangles, as 3D
+/// segments lying in the shared plane (Part A). Project both triangles to 2D by dropping the shared
+/// normal's dominant axis, clip C (subject) against W (convex clip) with a 2D Sutherland–Hodgman
+/// pass, and lift each resulting polygon vertex back onto C's plane. Returns the consecutive vertex
+/// pairs (a closed loop); empty when the overlap is empty or degenerate (a touch/sliver, no area).
+///
+/// Each output vertex is a retained C vertex, a contained W vertex, or a C-edge×W-edge crossing — so
+/// it lands on an edge/vertex feature of at least one side and the combinatorial seam key
+/// ([`classify_in_triangle`]) interns it exactly, never hitting the `Face`/`Face` quantum fallback.
+fn coplanar_overlap_edges(
+    ct: ([f64; 3], [f64; 3], [f64; 3]),
+    n: [f64; 3],
+    wt: ([f64; 3], [f64; 3], [f64; 3]),
+) -> Vec<([f64; 3], [f64; 3])> {
+    let drop = dominant_axis(n);
+    let (u, v) = other_axes(drop);
+    let to2 = |p: [f64; 3]| (p[u], p[v]);
+    let subject = vec![to2(ct.0), to2(ct.1), to2(ct.2)];
+    let mut clip = vec![to2(wt.0), to2(wt.1), to2(wt.2)];
+    // The half-plane "inside" test needs the clip triangle wound CCW in this projection; dropping an
+    // axis can mirror it, so orient by signed area.
+    if signed_area2(clip[0], clip[1], clip[2]) < 0.0 {
+        clip.reverse();
+    }
+    let poly = clip_convex_2d(&subject, &clip);
+    if poly.len() < 3 {
+        return Vec::new();
+    }
+    // Reject a degenerate (zero-area) overlap — a touch along an edge, not a real coincident region.
+    let mut area2 = 0.0;
+    for i in 1..poly.len() - 1 {
+        area2 += signed_area2(poly[0], poly[i], poly[i + 1]);
+    }
+    let scale = bbox_extent(&[ct.0, ct.1, ct.2, wt.0, wt.1, wt.2]).max(f64::MIN_POSITIVE);
+    if area2.abs() <= (scale * COPLANAR_DIST_EPS).powi(2) {
+        return Vec::new();
+    }
+    // Lift a 2D point back onto C's plane n·X = n·c0 (the dropped axis solved from the plane eqn;
+    // n[drop] is the dominant component, hence nonzero).
+    let plane_d = dot(n, ct.0);
+    let lift = |(uu, vv): (f64, f64)| -> [f64; 3] {
+        let mut p = [0.0; 3];
+        p[u] = uu;
+        p[v] = vv;
+        p[drop] = (plane_d - n[u] * uu - n[v] * vv) / n[drop];
+        p
+    };
+    let pts3: Vec<[f64; 3]> = poly.iter().map(|&q| lift(q)).collect();
+    let mut edges = Vec::with_capacity(pts3.len());
+    for i in 0..pts3.len() {
+        let a = pts3[i];
+        let b = pts3[(i + 1) % pts3.len()];
+        if sub(b, a) != [0.0, 0.0, 0.0] {
+            edges.push((a, b));
+        }
+    }
+    edges
+}
+
+/// Clip convex polygon `subject` against convex polygon `clip` (both 2D, `clip` wound CCW) — the
+/// Sutherland–Hodgman algorithm, the 2D analog of the per-triangle half-space clip in `lib.rs`.
+/// Returns the convex intersection polygon's vertices in order (empty if they don't overlap).
+fn clip_convex_2d(subject: &[(f64, f64)], clip: &[(f64, f64)]) -> Vec<(f64, f64)> {
+    let mut output = subject.to_vec();
+    for i in 0..clip.len() {
+        if output.is_empty() {
+            break;
+        }
+        let (ax, ay) = clip[i];
+        let (bx, by) = clip[(i + 1) % clip.len()];
+        // Inside = left of the directed clip edge a→b (CCW clip ⇒ interior is on the left).
+        let inside = |p: (f64, f64)| (bx - ax) * (p.1 - ay) - (by - ay) * (p.0 - ax) >= 0.0;
+        let intersect = |p: (f64, f64), q: (f64, f64)| -> (f64, f64) {
+            let dp = (q.0 - p.0, q.1 - p.1);
+            let num = (bx - ax) * (p.1 - ay) - (by - ay) * (p.0 - ax);
+            let den = (by - ay) * dp.0 - (bx - ax) * dp.1;
+            let t = if den != 0.0 { num / den } else { 0.0 };
+            (p.0 + dp.0 * t, p.1 + dp.1 * t)
+        };
+        let input = std::mem::take(&mut output);
+        for j in 0..input.len() {
+            let cur = input[j];
+            let prev = input[(j + input.len() - 1) % input.len()];
+            let (cur_in, prev_in) = (inside(cur), inside(prev));
+            if cur_in {
+                if !prev_in {
+                    output.push(intersect(prev, cur));
+                }
+                output.push(cur);
+            } else if prev_in {
+                output.push(intersect(prev, cur));
+            }
+        }
+    }
+    output
 }
 
 /// A triangle's intersection interval with the other plane: the parametric extent along the line's
@@ -506,6 +777,7 @@ fn edge_cross(a: [f64; 3], b: [f64; 3], da: f64, db: f64) -> [f64; 3] {
 // Step B — canonical seam vertices.
 // =============================================================================================
 
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct RawSegment {
     tc: usize,
     tw: usize,
@@ -684,7 +956,8 @@ impl SideBuilder {
 
 /// Re-triangulate C's cut triangle `tc`, keeping only the sub-triangles on the `keep` side of W.
 /// Original corners reuse their input indices (bit-exact); seam endpoints are looked up / appended
-/// once per seam-id into `c_seam_index`.
+/// once per seam-id into `c_seam_index`. `coplanar_pairs` are the (tc, tw) pairs found COPLANAR — a
+/// sub-triangle COINCIDENT with such a cutter is dropped (W is authoritative there; see `clip` docs).
 fn retriangulate_c_face(
     c: &ClipMesh,
     w: &ClipMesh,
@@ -692,6 +965,7 @@ fn retriangulate_c_face(
     segs: &[&SeamSeg],
     seam: &SeamBuilder,
     keep: Keep,
+    coplanar_pairs: &HashSet<(usize, usize)>,
     out: &mut SideBuilder,
     c_seam_index: &mut HashMap<usize, usize>,
 ) {
@@ -699,14 +973,27 @@ fn retriangulate_c_face(
     let normal = c.tri_normal_raw(tc);
     let sub = cdt_face(&pts3, &constraints, normal);
 
-    // For `Keep::Side`: the W triangles that actually cut THIS face. A sub-triangle is signed by the
-    // NEAREST of these (clamped closest point), NOT `.all()` of their infinite planes — see
-    // `nearest_w_signed_among` for why the `.all()` form carved a wedge against a curved/bent W.
-    // `Keep::Predicate` ignores these — it classifies each sub-triangle's centroid directly.
-    let cut_tw: Vec<usize> = {
-        let mut seen = std::collections::HashSet::new();
-        segs.iter().filter(|s| seen.insert(s.tw)).map(|s| s.tw).collect()
-    };
+    // The W triangles that cut THIS face, split by HOW they cut it. TRANSVERSAL cutters sign the
+    // keep side (a sub-triangle is signed by the NEAREST of these — clamped closest point, NOT
+    // `.all()` of their infinite planes, which carved a wedge against a curved W; see
+    // `nearest_w_signed_among`). COPLANAR cutters instead mark a coincident region: a sub-triangle
+    // whose centroid projects inside one is dropped, because that part of C lies exactly on W and W
+    // is kept whole — keeping C too would double the surface (the "drop C, keep W" rule).
+    // `Keep::Predicate` ignores the transversal set — it classifies each centroid directly — but the
+    // coincident drop still applies (W owns the shared plane regardless of the keep rule).
+    let mut transversal_cut: Vec<usize> = Vec::new();
+    let mut coplanar_cut: Vec<usize> = Vec::new();
+    let mut seen = HashSet::new();
+    for s in segs {
+        if !seen.insert(s.tw) {
+            continue;
+        }
+        if coplanar_pairs.contains(&(tc, s.tw)) {
+            coplanar_cut.push(s.tw);
+        } else {
+            transversal_cut.push(s.tw);
+        }
+    }
 
     // Emit only kept sub-triangles; allocate a seam vertex's out-index LAZILY, the first time a
     // KEPT sub-triangle references it — so a seam vertex whose sub-triangles all fell on the discard
@@ -717,9 +1004,21 @@ fn retriangulate_c_face(
             (pts3[i][1] + pts3[j][1] + pts3[k][1]) / 3.0,
             (pts3[i][2] + pts3[j][2] + pts3[k][2]) / 3.0,
         ];
+        // Coincident with a coplanar cutter (centroid projects inside it) → drop (W authoritative).
+        if coplanar_cut.iter().any(|&tw| point_in_tri_2d(centroid, w.tri(tw), normal)) {
+            continue;
+        }
         let kept = match keep {
+            // Side: nearest TRANSVERSAL cutter; if this face has only coplanar cutters (a fully
+            // coincident face), the surviving ring lies past W's extent — fall back to global nearest
+            // W, where an in-plane outer-ring centroid signs ≈0 and the inclusive ≥/≤ test keeps it.
             Keep::Side(ks) => {
-                side_kept(nearest_w_signed_among(w, cut_tw.iter().copied(), centroid), ks)
+                let signed = if transversal_cut.is_empty() {
+                    nearest_w_signed(w, centroid)
+                } else {
+                    nearest_w_signed_among(w, transversal_cut.iter().copied(), centroid)
+                };
+                side_kept(signed, ks)
             }
             Keep::Predicate(p) => p(centroid),
         };
@@ -962,6 +1261,19 @@ fn cdt_face(
 fn signed_area2(a: (f64, f64), b: (f64, f64), c: (f64, f64)) -> f64 {
     (b.0 - a.0) * (c.1 - a.1) - (b.1 - a.1) * (c.0 - a.0)
 }
+/// Is `p` inside (or on the boundary of) triangle `tri`, projected to 2D by dropping `n`'s dominant
+/// axis? Sign-consistency of the three edge cross products — robust and tolerance-free. Used by the
+/// coplanar drop rule to test whether a C sub-triangle's centroid lies on a coincident W cutter.
+fn point_in_tri_2d(p: [f64; 3], tri: ([f64; 3], [f64; 3], [f64; 3]), n: [f64; 3]) -> bool {
+    let drop = dominant_axis(n);
+    let (u, v) = other_axes(drop);
+    let to2 = |q: [f64; 3]| (q[u], q[v]);
+    let (q, a, b, c) = (to2(p), to2(tri.0), to2(tri.1), to2(tri.2));
+    let (d1, d2, d3) = (signed_area2(a, b, q), signed_area2(b, c, q), signed_area2(c, a, q));
+    let has_neg = d1 < 0.0 || d2 < 0.0 || d3 < 0.0;
+    let has_pos = d1 > 0.0 || d2 > 0.0 || d3 > 0.0;
+    !(has_neg && has_pos)
+}
 /// Twice the area of the face's first triangle (its 3 corners are pts2[0..3]) — the area scale used
 /// to make the degenerate-sliver threshold dimension-independent.
 #[inline]
@@ -980,7 +1292,7 @@ fn face_area2(pts2: &[(f64, f64)]) -> f64 {
 fn empty_seam_result(c: &ClipMesh, w: &ClipMesh, keep: Keep) -> ClipResult {
     let w_unchanged = w.clone();
     if c.vertices.is_empty() || w.triangles.is_empty() {
-        return ClipResult { c: c.clone(), w: w_unchanged, shared: Vec::new() };
+        return ClipResult { c: c.clone(), w: w_unchanged, shared: Vec::new(), coplanar_pairs: 0 };
     }
     // Representative point: a C triangle centroid (interior, robust to a vertex sitting on W).
     let rep = if let Some(&[i, j, k]) = c.triangles.first() {
@@ -999,9 +1311,9 @@ fn empty_seam_result(c: &ClipMesh, w: &ClipMesh, keep: Keep) -> ClipResult {
         Keep::Predicate(p) => p(rep),
     };
     if kept {
-        ClipResult { c: c.clone(), w: w_unchanged, shared: Vec::new() } // C on keep side → unchanged
+        ClipResult { c: c.clone(), w: w_unchanged, shared: Vec::new(), coplanar_pairs: 0 } // C on keep side → unchanged
     } else {
-        ClipResult { c: ClipMesh::default(), w: w_unchanged, shared: Vec::new() } // discard side → emptied
+        ClipResult { c: ClipMesh::default(), w: w_unchanged, shared: Vec::new(), coplanar_pairs: 0 } // discard side → emptied
     }
 }
 
@@ -1034,8 +1346,21 @@ fn w_is_consistently_wound(w: &ClipMesh) -> bool {
 // Small local vector helpers (kept local, matching octree.rs / weld.rs convention).
 // =============================================================================================
 
-/// Squared-magnitude threshold below which `n_c × n_w` is treated as parallel/coplanar.
+/// Absolute squared-magnitude floor for a DEGENERATE Gram determinant in [`classify_in_triangle`]
+/// (a near-zero-area triangle the barycentric solve can't invert). NOT the parallel test anymore —
+/// that is now the scale-invariant [`COPLANAR_SIN2`].
 const COPLANAR_EPS2: f64 = 1e-18;
+
+/// sin²ε for the SCALE-INVARIANT parallel/coplanar test in [`tri_tri_intersection`]: two faces are
+/// parallel iff `|n_c × n_w|² ≤ COPLANAR_SIN2 · |n_c|² · |n_w|²`. A dimensionless ratio (ε ≈ 1e-6 rad),
+/// so unlike an absolute threshold on the unnormalized cross product it is immune to edge length and
+/// scene scale — a large genuinely-crossing pair is no longer mislabeled coplanar.
+const COPLANAR_SIN2: f64 = 1e-12;
+
+/// Relative perpendicular-distance tolerance for "lies IN the plane" (coincident faces) and for the
+/// degenerate-overlap area floor — scaled by the triangle pair's bounding extent, so it tracks the
+/// scene scale rather than an absolute epsilon.
+const COPLANAR_DIST_EPS: f64 = 1e-9;
 
 /// Barycentric tolerance for snapping a seam endpoint onto a triangle edge/vertex feature in
 /// [`classify_in_triangle`]. Dimensionless (a ratio), so — unlike the position quantum — it is
@@ -1091,9 +1416,9 @@ fn other_axes(drop: usize) -> (usize, usize) {
         _ => (0, 1),
     }
 }
-/// A length scale for "a segment too short to be a real seam piece" — a tiny fraction of the
-/// triangles' extent, so a graze becomes a touch, not a degenerate constraint.
-fn seg_len_eps(pts: &[[f64; 3]]) -> f64 {
+/// Largest axis-aligned extent of a point set (max over axes of `hi − lo`); the length scale the
+/// scale-relative epsilons key off. Zero for a single point or fully-degenerate set.
+fn bbox_extent(pts: &[[f64; 3]]) -> f64 {
     let mut lo = [f64::INFINITY; 3];
     let mut hi = [f64::NEG_INFINITY; 3];
     for p in pts {
@@ -1102,8 +1427,12 @@ fn seg_len_eps(pts: &[[f64; 3]]) -> f64 {
             hi[d] = hi[d].max(p[d]);
         }
     }
-    let ext = ((hi[0] - lo[0]).max(hi[1] - lo[1]).max(hi[2] - lo[2])).max(1.0);
-    ext * 1e-9
+    (hi[0] - lo[0]).max(hi[1] - lo[1]).max(hi[2] - lo[2])
+}
+/// A length scale for "a segment too short to be a real seam piece" — a tiny fraction of the
+/// triangles' extent, so a graze becomes a touch, not a degenerate constraint.
+fn seg_len_eps(pts: &[[f64; 3]]) -> f64 {
+    bbox_extent(pts).max(1.0) * 1e-9
 }
 /// The quantization grid for the seam-weld FALLBACK only (Step B keys combinatorially now — see
 /// [`SeamBuilder`]). Small relative to the meshes' extent, but far below any real feature size;
@@ -1907,5 +2236,151 @@ mod tests {
             let strictly_inside = nearest_w_signed(&lo, v) > 1e-6 && nearest_w_signed(&hi, v) < -1e-6;
             assert!(!strictly_inside, "kept C vertex {v:?} is strictly inside the band");
         }
+    }
+
+    // ------------------------- Task 05: coplanar handling + sweep acceleration -------------------
+
+    /// Area of a triangle given as a corner tuple.
+    fn tri_area(t: ([f64; 3], [f64; 3], [f64; 3])) -> f64 {
+        let n = cross(sub(t.1, t.0), sub(t.2, t.0));
+        0.5 * dot(n, n).sqrt()
+    }
+    /// Centroid of triangle `t` of mesh `m`.
+    fn centroid3(m: &ClipMesh, t: [usize; 3]) -> [f64; 3] {
+        let (a, b, c) = (m.vertices[t[0]], m.vertices[t[1]], m.vertices[t[2]]);
+        [(a[0] + b[0] + c[0]) / 3.0, (a[1] + b[1] + c[1]) / 3.0, (a[2] + b[2] + c[2]) / 3.0]
+    }
+
+    /// Part A acceptance: a COPLANAR overlap is detected, reported, and produces a watertight join —
+    /// C's coincident patch dropped, W kept whole, the overlap boundary a shared seam. Star-of-David:
+    /// two coplanar (z=0) triangles, C apex-down and W apex-up, overlapping in a hexagon. Every
+    /// overlap-boundary vertex is a clean C-edge × W-edge crossing (no shared corner), so the
+    /// combinatorial key interns each as (Edge, Edge) and shares it across both faces — no quantum
+    /// fallback. The old code dropped coplanar pairs entirely, leaving C running silently through W.
+    #[test]
+    fn coplanar_overlap_reported_and_watertight() {
+        let c = ClipMesh::new(
+            vec![[-50.0, 30.0, 0.0], [50.0, 30.0, 0.0], [0.0, -60.0, 0.0]],
+            vec![[0, 1, 2]],
+        );
+        let w = ClipMesh::new(
+            vec![[-50.0, -30.0, 0.0], [50.0, -30.0, 0.0], [0.0, 60.0, 0.0]],
+            vec![[0, 1, 2]],
+        );
+        let res = clip(&c, &w, Keep::Side(KeepSide::Above), None);
+
+        // (a) Reported and (b) a real shared seam exists (C meets W at shared vertices).
+        assert_eq!(res.coplanar_pairs, 1, "the coplanar pair must be detected and reported");
+        assert!(!res.shared.is_empty(), "coplanar overlap produced no shared seam");
+
+        // (c) Drop C, keep W: no surviving C sub-triangle's centroid lies inside the overlap (= inside
+        // W's footprint, since every C sub-triangle is within C). W owns the coincident region.
+        let (wtri, wn) = (w.tri(0), w.tri_normal_raw(0));
+        for t in &res.c.triangles {
+            let ctr = centroid3(&res.c, *t);
+            assert!(!point_in_tri_2d(ctr, wtri, wn), "a coincident C sub-triangle survived: {ctr:?}");
+        }
+        // (d) W kept whole: its total area is preserved (subdivided, never clipped).
+        let w_area_out: f64 = (0..res.w.triangles.len()).map(|i| tri_area(res.w.tri(i))).sum();
+        assert!((w_area_out - tri_area(w.tri(0))).abs() < 1e-6 * 4500.0, "W was clipped: {w_area_out}");
+
+        // (e) Watertight flat join: no non-manifold/doubled edge (drop-C means no coincident double
+        // surface), and every seam edge is shared at incidence 2 — C terminated ON the seam, no tear.
+        // A coplanar join is a flat 2-manifold, so (unlike a transversal seam) there is no incidence-3.
+        let (_, tris) = merge(&res);
+        let inc = incidence(&tris);
+        assert_eq!(inc.values().copied().max().unwrap_or(0), 2, "non-manifold/doubled edge in join");
+        let seam: std::collections::HashSet<usize> = res.shared.iter().map(|&(ci, _)| ci).collect();
+        let torn = inc
+            .iter()
+            .filter(|((a, b), _)| seam.contains(a) && seam.contains(b))
+            .filter(|(_, &cnt)| cnt != 2)
+            .count();
+        assert_eq!(torn, 0, "a seam edge is not a shared incidence-2 join (torn coplanar seam)");
+    }
+
+    /// Part A acceptance (the `docs/05` watch-out): the coplanarity test must be SCALE-INVARIANT. Two
+    /// genuinely PERPENDICULAR (90°) triangles at small scale (edge ≈ 4e-3) have an UNnormalized
+    /// `|n_c × n_w|² ≈ 6.6e-20` that falls below the old absolute `COPLANAR_EPS2 = 1e-18`, so the
+    /// pre-fix code mislabeled this hard crossing as coplanar and DROPPED it. The dimensionless ratio
+    /// test sees the right angle and returns the crossing. (The absolute threshold's effective angle
+    /// scales with edge length² — wrong at both extremes; a dropped 90° crossing is the clean pin.)
+    #[test]
+    fn small_crossing_triangles_not_called_coplanar() {
+        let s = 1.0e-3;
+        let cm = ClipMesh::new(
+            vec![[-s, -s, 0.0], [3.0 * s, -s, 0.0], [-s, 3.0 * s, 0.0]],
+            vec![[0, 1, 2]],
+        );
+        let wm = ClipMesh::new(
+            vec![[s, -s, -2.0 * s], [s, 3.0 * s, -2.0 * s], [s, -s, 2.0 * s]],
+            vec![[0, 1, 2]],
+        );
+        let (ct, wt) = (cm.tri(0), wm.tri(0));
+        let (nc, nw) = (cm.tri_normal_raw(0), wm.tri_normal_raw(0));
+
+        // The fixture must actually trip the OLD absolute threshold, else it proves nothing.
+        let dir = cross(nc, nw);
+        assert!(dot(dir, dir) <= COPLANAR_EPS2, "fixture no longer trips the old absolute threshold");
+        // The fix: the scale-invariant test classifies it as a transversal crossing, not coplanar.
+        assert!(
+            matches!(tri_tri_intersection(ct, nc, wt, nw), TriTri::Crossing(..)),
+            "scale-invariant test wrongly dropped a 90° crossing of small triangles",
+        );
+    }
+
+    /// Part B acceptance: the uniform AABB grid is a pure candidate FILTER, so forcing it on must
+    /// produce BYTE-IDENTICAL `RawSegment`s to the brute O(|C|·|W|) sweep — same pairs, same order,
+    /// same positions — not merely the same count. Two independently-tessellated crossing grids (the
+    /// import-like case). Asserts equality, not "faster"; a wrongly-filtered candidate would diverge.
+    #[test]
+    fn accelerated_sweep_byte_identical_to_brute() {
+        let cu = normalize_t([1.0, 0.0, 0.1]);
+        let cv = [0.0, 1.0, 0.0];
+        let c = jittered_grid(31, 19, 0xC0FFEE, 3.0, cu, cv, |s, t| {
+            let x = -100.0 + s * 200.0;
+            [x, t * 100.0, 5.0 + 0.1 * x]
+        });
+        let wu = [0.0, 1.0, 0.0];
+        let wv = normalize_t([0.2, 0.0, 1.0]);
+        let w = jittered_grid(23, 29, 0xBEEF, 3.0, wu, wv, |s, t| {
+            let z = -60.0 + t * 120.0;
+            [0.2 * z, s * 100.0, z]
+        });
+
+        let (brute, brute_cop) = intersection_segments_inner(&c, &w, false);
+        let (grid, grid_cop) = intersection_segments_inner(&c, &w, true);
+        assert!(!brute.is_empty(), "fixture should produce a seam");
+        assert_eq!(brute, grid, "grid sweep diverged from brute — a candidate was wrongly filtered");
+        assert_eq!(brute_cop, grid_cop, "coplanar-pair set diverged between the two paths");
+    }
+
+    /// Part B perf smoke at import scale (200×200 grids ≈ 80k triangles each). Ignored by default —
+    /// the brute baseline at this size is infeasible in CI; the grid path is what we exercise. Run
+    /// with `--ignored --nocapture` to eyeball the segment count / wall time.
+    #[test]
+    #[ignore = "perf smoke: import-scale grids; brute baseline at this size is infeasible in CI"]
+    fn accelerated_sweep_large_grid() {
+        let cu = normalize_t([1.0, 0.0, 0.1]);
+        let cv = [0.0, 1.0, 0.0];
+        let c = jittered_grid(200, 200, 0xC0FFEE, 1.0, cu, cv, |s, t| {
+            let x = -100.0 + s * 200.0;
+            [x, t * 100.0, 5.0 + 0.1 * x]
+        });
+        let wu = [0.0, 1.0, 0.0];
+        let wv = normalize_t([0.2, 0.0, 1.0]);
+        let w = jittered_grid(200, 200, 0xBEEF, 1.0, wu, wv, |s, t| {
+            let z = -60.0 + t * 120.0;
+            [0.2 * z, s * 100.0, z]
+        });
+        // Auto-selects the grid (pairs ≫ threshold); just needs to complete and produce a seam.
+        let (segs, _) = intersection_segments(&c, &w);
+        assert!(!segs.is_empty(), "expected a seam on the large crossing grids");
+        eprintln!(
+            "[perf] {} C tris × {} W tris → {} raw segments",
+            c.triangles.len(),
+            w.triangles.len(),
+            segs.len()
+        );
     }
 }

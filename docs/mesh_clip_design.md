@@ -131,11 +131,20 @@ so step C knows which C-triangle and which W-triangle to cut. We reuse `octree.r
 helpers (`sub`/`dot`/`cross`/`norm`) and the Möller–Trumbore `ray_triangle` math as the
 crib for the projections (it already lives in the crate).
 
-**Coplanar C/W triangles** (`d ≈ 0`, `|n_c × n_w|` below an angle epsilon): handled
-separately — a coplanar pair contributes a *polygon* overlap, not a segment. For our C-vs-W
-case (low-angle contact vs high-angle wall) coplanar pairs are degenerate/rare; the first
-milestone treats a coplanar pair as "no constraint" and logs it, and we decide on full
-coplanar handling only if a real fixture needs it (see §6 honesty checkpoint).
+**Coplanar C/W triangles — BUILT (Task 05).** The parallel test is now SCALE-INVARIANT —
+`|n_c × n_w|² ≤ sin²ε · |n_c|²·|n_w|²` (a dimensionless ratio, `COPLANAR_SIN2`), replacing the old
+absolute `|n_c × n_w|² ≤ 1e-18` whose effective angle scaled with edge length² and mislabeled large
+(or, at small scale, *any*) genuinely-crossing pairs as coplanar. A coplanar pair contributes a
+*polygon* overlap, not a segment: `coplanar_overlap_edges` projects both triangles to the shared
+plane, clips C against W with a 2D Sutherland–Hodgman pass, and emits the overlap polygon's boundary
+edges (lifted back to 3D) as `RawSegment`s on both faces — so they flow through the same combinatorial
+keying and per-face CDT as transversal seams (each boundary vertex is `(Edge,Edge)` or `(Vertex,Face)`,
+never the quantum fallback). **Keep rule = drop-C/keep-W:** a C sub-triangle whose centroid projects
+inside a coplanar cutter is dropped (W is authoritative over the coincident region — no doubled
+surface); the coplanar-but-outside ring is kept. `ClipResult.coplanar_pairs` counts the pairs so the
+branch stays observable. The all-pairs sweep is also no longer unconditionally `O(|C|·|W|)`: above a
+pair-count threshold a uniform AABB grid over W supplies per-C candidates (`WGrid`), byte-identical to
+the brute sweep (a candidate filter only). See `docs/05_coplanar_and_perf.md`.
 
 ### Step B — build the seam polyline with canonical shared vertices
 
@@ -283,7 +292,7 @@ edge-length-scaled tolerance.
 
 | Case | Guard |
 |---|---|
-| **Coplanar C/W triangle pair** (`|n_c×n_w|` < angle eps) | Milestone-1: treat as no constraint, `log` it. Full polygon-overlap handling deferred until a fixture needs it. |
+| **Coplanar C/W triangle pair** (scale-invariant `|n_c×n_w|² ≤ sin²ε·\|n_c\|²·\|n_w\|²`) | **BUILT (Task 05):** 2D polygon-overlap boundary → `RawSegment`s on both faces (same keying/CDT as transversal); keep rule drops C's coincident patch, keeps W; `ClipResult.coplanar_pairs` counts it. |
 | **C vertex lands exactly on a W edge** | Detected as `SeamKey::CEdge`/`WEdge` coincidence; welded via the spatial-hash fallback to one shared index. |
 | **Seam crosses a C edge into the next C triangle** | Both C triangles produce the same `SeamKey::CEdge(a,b,t)` for the crossing → one shared vertex; the seam is continuous across the C-edge. |
 | **Seam exits the mesh boundary (open rim)** | The seam polyline simply terminates; the terminal C triangle is cut only partially. The open rim there is *expected* and excluded from the "no open edges except true rim" assertion (mirrors the `on_box` filter in `octree.rs`'s `contact_*` tests). |
@@ -355,18 +364,19 @@ see dead vertices.
    `clip`'s contract: it **asserts** W is consistently wound (debug assert on a sampled set of
    adjacent-triangle normal agreements) and trusts it; it does not repair winding. *(Tracked
    in MEMORY + below.)*
-2. **Coplanar C/W triangle-pair handling → DEFERRED past Milestone 1, but DO build it.** For
-   Milestone 1 a coplanar pair (`|n_c×n_w|` < angle eps) is logged + skipped (no constraint).
-   This is understood and not hard: the fix is the standard coplanar branch — project both
-   triangles to 2D (drop W's dominant axis), compute the 2D polygon overlap (edge–edge
-   crossings + point-in-triangle), and feed the overlap boundary as constraint edges to the
-   same per-face CDT. Schedule it as the first follow-up after Milestones 1–2 pass. *(Tracked
-   below — this is a "get to it", not a "maybe".)*
+2. **Coplanar C/W triangle-pair handling → BUILT (Task 05).** The standard coplanar branch as
+   planned: scale-invariant parallel test, project both triangles to 2D (drop the shared normal's
+   dominant axis), compute the 2D polygon overlap (Sutherland–Hodgman of C against W), feed the
+   overlap boundary as constraint edges to the same per-face CDT. Keep rule = drop C's coincident
+   patch / keep W (W authoritative; no doubled surface). Reported via `ClipResult.coplanar_pairs`.
+   See §2 Step A and `docs/05_coplanar_and_perf.md`.
 
 **Deferred-work checklist (so these don't evaporate):**
 - [ ] Import-side winding normalization, per-connected-component with a reference sense
       (multi-part meshes with mixed normal senses). Precondition `clip` asserts.
-- [ ] Coplanar C/W pair handling via 2D polygon-overlap → CDT constraints. First follow-up.
+- [x] Coplanar C/W pair handling via 2D polygon-overlap → CDT constraints. **BUILT (Task 05)**,
+      with a scale-invariant parallel test and the drop-C/keep-W fill rule; sweep accelerated by a
+      uniform AABB grid (byte-identical to brute).
 
 ---
 
