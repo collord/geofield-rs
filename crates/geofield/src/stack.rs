@@ -1476,10 +1476,16 @@ impl<M: SeriesModel + BlockModel> Stack<M> {
 
     /// SHARED-SEAM volume path (`docs/volume_mesh_seam.md`, Strategy A): mesh the cross-cutting
     /// body `ib`'s interior solid AND every rock UNIT solid it cuts on ONE shared octree, so the
-    /// body and the surrounding rock land on IDENTICAL wall vertices (same leaves → same field
-    /// crossing → same QEF) instead of contouring the wall independently. Returns the body solid
-    /// plus the rock units tagged `(series, block, unit)`; `None` for a stratigraphic series /
-    /// topography / out-of-range / wall-less body.
+    /// body and the surrounding rock land on IDENTICAL wall vertices instead of contouring the wall
+    /// independently. The sharing is EXACT, not merely within a merge tolerance: a pure-wall leaf
+    /// has a single QEF crossing, and `qef_vertex` minimises squared normal-distance — which is
+    /// invariant to the wall masker's `n → −n` flip — so the body scene (wall as primary, `+∇`) and
+    /// a rock scene (wall as a `SlabComplement` masker, `−∇`) place the vertex BIT-FOR-BIT equal.
+    /// (At a wall∩bed/cap crease the two solids place DIFFERENT vertices; watertightness there is
+    /// each solid's own `cap = true` closure — see below — NOT vertex sharing, so it does not rest
+    /// on the seam being exact.) Returns the body solid plus the rock units tagged
+    /// `(series, block, unit)`; `None` for a stratigraphic series / topography / out-of-range /
+    /// wall-less body.
     ///
     /// This is the `Clip` counterpart to the independent `Snap` path
     /// ([`Self::mesh_cross_cut_solid`] + [`Self::mesh_one_block_unit_solid`]), which is left
@@ -4265,6 +4271,22 @@ mod tests {
         eprintln!("SHARED: merged verts={} tris={} | see-through={open} fused(inc≥3)={shared}", pos.len(), tris.len());
         assert_eq!(open, 0, "shared-tree body∪rock left {open} see-through edges off the box rim");
         assert!(shared > 0, "body and rock did not fuse on the wall (no incidence-≥3 edges)");
+
+        // The seam is NOT propped up by the merge tolerance. Re-merge at a near-exact `q` and assert
+        // the metrics are UNCHANGED: the shared wall vertices coincide bit-for-bit (a pure-wall
+        // leaf's single-constraint QEF is invariant to the masker's `n → −n` flip), so shrinking `q`
+        // by ~6 orders cannot reveal a hidden sub-q crack. Guards the doc claim that the seam is
+        // exact, not within-q — and that watertightness rests on per-solid `cap=true` closure, not
+        // on this dedup. (Without exact sharing, `shared` would collapse and/or `open` would jump.)
+        let q_exact = 1e-9;
+        let (pos_x, tris_x) = merge_dedup(&all, q_exact);
+        let (open_x, shared_x) = seam_incidence_stats(&pos_x, &tris_x, size);
+        assert_eq!(open_x, 0, "seam opened at near-exact q={q_exact:.0e}: wall verts are NOT bit-identical");
+        assert_eq!(
+            (open_x, shared_x),
+            (open, shared),
+            "seam metrics changed between q={q:.1e} and q={q_exact:.0e}: fusion depends on the merge tolerance"
+        );
 
         // --- Snap path (independent calls) — watertight + deterministic (acceptance #3) ---
         let body_snap = stack.mesh_cross_cut_solid(0, min, size, ext, cfg).expect("snap body");

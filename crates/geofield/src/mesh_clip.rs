@@ -981,6 +981,16 @@ fn retriangulate_c_face(
     // is kept whole — keeping C too would double the surface (the "drop C, keep W" rule).
     // `Keep::Predicate` ignores the transversal set — it classifies each centroid directly — but the
     // coincident drop still applies (W owns the shared plane regardless of the keep rule).
+    //
+    // SEMANTIC ASSUMPTION (not a geometric necessity): "drop C, keep W" treats W as authoritative —
+    // it assumes a C region coincident with W is REDUNDANT with it (the SAME surface). That holds
+    // for the implicit-field path (two distinct smooth level sets coinciding over a positive area is
+    // measure-zero), where the choice of W over C is then arbitrary. It is NOT guaranteed for
+    // IMPORTED meshes, where two genuinely-distinct surfaces could share a coplanar patch; there,
+    // C's surface in that patch is silently discarded. Orientation does not affect the test itself
+    // (`point_in_tri_2d` drops `n`'s DOMINANT axis — sign-agnostic — and point-in-triangle is
+    // winding-independent, so an anti-parallel C/W coincidence still classifies correctly). Revisit
+    // only if a real import needs BOTH coplanar sheets kept.
     let mut transversal_cut: Vec<usize> = Vec::new();
     let mut coplanar_cut: Vec<usize> = Vec::new();
     let mut seen = HashSet::new();
