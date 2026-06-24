@@ -197,21 +197,29 @@ pub fn clip(
     }
 
     // --- Step B: canonical seam vertices (shared by combinatorial key). ----------------------
-    // Milestone 1 keys seam endpoints by quantized position (an edge-length-scaled grid), which is
-    // the backstop weld; the combinatorial WEdge/CEdge keying is the planned refinement. Quantizing
-    // makes two triangles computing the *same* crossing agree on one index without moving the
-    // stored point. We build a per-side vertex table so C and W share by the `shared` pairing.
-    let quantum = seam_quantum(c, w);
-    let mut seam = SeamBuilder::new(quantum);
+    // Each seam endpoint is an edge–face crossing: one mesh's edge pierces the other mesh's face, so
+    // it lies on a definite COMBINATORIAL feature of each side (a vertex, an edge, or — for the side
+    // it passes through — that face). Keying on the pair `(C-feature, W-feature)` of GLOBAL indices
+    // makes two triangles that compute the *same* crossing agree on one id EXACTLY — no tolerance —
+    // so it is immune to the import-extent fragility a position quantum has: a large bounding box
+    // makes `extent · 1e-7` coarse relative to a fine local seam feature, merging genuinely distinct
+    // crossings (the `combinatorial_key_watertight_under_coarse_extent` test pins this — and note it
+    // is EXTENT, not a translation, that coarsens the quantum). The features come from classifying
+    // each endpoint within both its C-triangle and its W-triangle (`classify_in_triangle`) —
+    // barycentric, hence scale- and translation-invariant, unlike the quantum. The quantum survives
+    // ONLY as a guarded fallback for an endpoint interior to BOTH faces (never produced by a real
+    // tri–tri segment endpoint, which lies on the piercing edge of at least one side — guard + log).
+    let mut seam = SeamBuilder::new(seam_quantum(c, w));
     let segments: Vec<SeamSeg> = raw_segments
         .iter()
         .map(|r| SeamSeg {
             tc: r.tc,
             tw: r.tw,
-            a: seam.intern(r.a),
-            b: seam.intern(r.b),
+            a: seam.intern(r.a, classify_in_triangle(c, r.tc, r.a), classify_in_triangle(w, r.tw, r.a)),
+            b: seam.intern(r.b, classify_in_triangle(c, r.tc, r.b), classify_in_triangle(w, r.tw, r.b)),
         })
         .collect();
+    seam.warn_if_fallback_fired();
 
     // --- Step C+D: re-triangulate the cut faces and assemble the two output buffers. ---------
     let mut out_c = SideBuilder::from_mesh(c);
@@ -513,38 +521,129 @@ struct SeamSeg {
     b: usize,
 }
 
-/// Interns seam endpoints to a stable id, deduping points that quantize to the same grid cell. The
-/// STORED position is the first (unquantized) point seen for that cell — so two triangles computing
-/// the same crossing share one id and one position without either point being moved.
+/// The lowest-dimensional feature of one mesh that a seam endpoint lies on, in that mesh's GLOBAL
+/// indices: a corner `Vertex`, an `Edge` (canonical unordered vertex-index pair), or the `Face`
+/// interior. A tri–tri segment endpoint is an edge–face crossing, so it is `Edge`/`Vertex` on the
+/// piercing side and (generically) `Face` on the side it passes through. The combinatorial seam key
+/// is the pair `(C-feature, W-feature)`: two computations of the SAME crossing — e.g. the two
+/// triangles sharing the piercing edge — derive the same pair and thus one shared id, exactly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Feature {
+    Vertex(usize),
+    Edge(usize, usize),
+    Face(usize),
+}
+
+impl Feature {
+    /// An edge feature with its endpoints ordered canonically, so two triangles sharing the edge key
+    /// it identically regardless of their local winding.
+    fn edge(a: usize, b: usize) -> Self {
+        Feature::Edge(a.min(b), a.max(b))
+    }
+}
+
+/// Classify seam endpoint `p` against triangle `t` of mesh `m`: the [`Feature`] of `t` it lies on,
+/// in `m`'s global indices. `p` is a seam endpoint, so it lies in `t`'s plane within `t`. Uses
+/// NORMALIZED barycentric coordinates — dimensionless ratios of coordinate *differences*, hence
+/// invariant to a large scene offset or scale (the property the position quantum lacked, and the
+/// whole point of combinatorial keying). The `Edge`/`Vertex` collapse near a boundary is what makes
+/// a point on a shared edge or at a shared vertex key identically from either incident triangle; an
+/// interior point is `Face(t)`. The canonicalization lives here and is reused on the C and W sides.
+fn classify_in_triangle(m: &ClipMesh, t: usize, p: [f64; 3]) -> Feature {
+    let [ia, ib, ic] = m.triangles[t];
+    let (a, b, c) = (m.vertices[ia], m.vertices[ib], m.vertices[ic]);
+    // Barycentric weights of `p` w.r.t. (a, b, c) — Ericson's projected form, robust in the
+    // triangle's own plane. A near-degenerate triangle (≈0 denominator) can't be classified → treat
+    // `p` as interior (`Face`), letting the OTHER side's edge/vertex feature carry the key.
+    let (e0, e1, e2) = (sub(b, a), sub(c, a), sub(p, a));
+    let (d00, d01, d11) = (dot(e0, e0), dot(e0, e1), dot(e1, e1));
+    let (d20, d21) = (dot(e2, e0), dot(e2, e1));
+    let den = d00 * d11 - d01 * d01;
+    if den.abs() <= COPLANAR_EPS2 {
+        return Feature::Face(t);
+    }
+    let lb = (d11 * d20 - d01 * d21) / den;
+    let lc = (d00 * d21 - d01 * d20) / den;
+    let la = 1.0 - lb - lc;
+    let near = |x: f64| x.abs() < SEAM_BARY_EPS;
+    // Two weights ≈ 0 → at the third vertex; one weight ≈ 0 → on the edge opposite that vertex.
+    match (near(la), near(lb), near(lc)) {
+        (false, true, true) => Feature::Vertex(ia),
+        (true, false, true) => Feature::Vertex(ib),
+        (true, true, false) => Feature::Vertex(ic),
+        (true, _, _) => Feature::edge(ib, ic),
+        (_, true, _) => Feature::edge(ia, ic),
+        (_, _, true) => Feature::edge(ia, ib),
+        _ => Feature::Face(t),
+    }
+}
+
+/// Interns seam endpoints to a stable id keyed by their COMBINATORIAL incidence — the `(C-feature,
+/// W-feature)` pair of GLOBAL indices, exact and tolerance-free. The STORED position is the first
+/// one seen for that key; two computations of the same crossing share its id and may differ in the
+/// last ulp without consequence (the key, not the position, decides identity). The quantized weld is
+/// retained ONLY as a guarded fallback for the degenerate endpoint interior to BOTH faces — which a
+/// real tri–tri segment endpoint never is, since it lies on a piercing edge — and `fallback_hits`
+/// records whether it ever fired, so the combinatorial key's completeness stays observable.
 struct SeamBuilder {
     quantum: f64,
-    map: HashMap<[i64; 3], usize>,
+    map: HashMap<(Feature, Feature), usize>,
+    fallback: HashMap<[i64; 3], usize>,
+    fallback_hits: usize,
     points: Vec<[f64; 3]>,
 }
 
 impl SeamBuilder {
     fn new(quantum: f64) -> Self {
-        Self { quantum, map: HashMap::new(), points: Vec::new() }
+        Self {
+            quantum,
+            map: HashMap::new(),
+            fallback: HashMap::new(),
+            fallback_hits: 0,
+            points: Vec::new(),
+        }
     }
-    fn key(&self, p: [f64; 3]) -> [i64; 3] {
-        [
-            (p[0] / self.quantum).round() as i64,
-            (p[1] / self.quantum).round() as i64,
-            (p[2] / self.quantum).round() as i64,
-        ]
-    }
-    fn intern(&mut self, p: [f64; 3]) -> usize {
-        let k = self.key(p);
-        if let Some(&id) = self.map.get(&k) {
+    fn intern(&mut self, p: [f64; 3], c_feat: Feature, w_feat: Feature) -> usize {
+        // Interior to BOTH faces: no edge/vertex to key on, so fall back to the quantized weld. A
+        // real tri–tri segment endpoint is always on the piercing edge of one side, so this is a
+        // guard, not an expected path; `warn_if_fallback_fired` surfaces it if that ever breaks.
+        if let (Feature::Face(_), Feature::Face(_)) = (c_feat, w_feat) {
+            self.fallback_hits += 1;
+            let k = [
+                (p[0] / self.quantum).round() as i64,
+                (p[1] / self.quantum).round() as i64,
+                (p[2] / self.quantum).round() as i64,
+            ];
+            if let Some(&id) = self.fallback.get(&k) {
+                return id;
+            }
+            let id = self.points.len();
+            self.points.push(p);
+            self.fallback.insert(k, id);
+            return id;
+        }
+        let key = (c_feat, w_feat);
+        if let Some(&id) = self.map.get(&key) {
             return id;
         }
         let id = self.points.len();
         self.points.push(p);
-        self.map.insert(k, id);
+        self.map.insert(key, id);
         id
     }
     fn pos(&self, id: usize) -> [f64; 3] {
         self.points[id]
+    }
+    /// Log once if any endpoint fell back to the quantized weld — a signal that the combinatorial key
+    /// missed a case (a real seam endpoint should always be on a piercing edge). Quiet otherwise.
+    fn warn_if_fallback_fired(&self) {
+        if self.fallback_hits > 0 {
+            eprintln!(
+                "[mesh_clip] seam keying fell back to the quantized weld for {} endpoint(s) \
+                 interior to both faces — combinatorial key incomplete for this input",
+                self.fallback_hits
+            );
+        }
     }
 }
 
@@ -938,6 +1037,13 @@ fn w_is_consistently_wound(w: &ClipMesh) -> bool {
 /// Squared-magnitude threshold below which `n_c × n_w` is treated as parallel/coplanar.
 const COPLANAR_EPS2: f64 = 1e-18;
 
+/// Barycentric tolerance for snapping a seam endpoint onto a triangle edge/vertex feature in
+/// [`classify_in_triangle`]. Dimensionless (a ratio), so — unlike the position quantum — it is
+/// immune to the scene's absolute scale and offset. Loose enough to catch a point that is on an edge
+/// by construction (whose off-edge weight is ulp-scale, even at million-scale coordinates) yet far
+/// tighter than any real seam feature's barycentric separation, so distinct seam points never merge.
+const SEAM_BARY_EPS: f64 = 1e-9;
+
 #[inline]
 fn sub(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
     [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
@@ -999,8 +1105,10 @@ fn seg_len_eps(pts: &[[f64; 3]]) -> f64 {
     let ext = ((hi[0] - lo[0]).max(hi[1] - lo[1]).max(hi[2] - lo[2])).max(1.0);
     ext * 1e-9
 }
-/// The quantization grid for seam-vertex deduping: small relative to the meshes' extent so two
-/// computations of the same crossing collapse, but far below any real feature size.
+/// The quantization grid for the seam-weld FALLBACK only (Step B keys combinatorially now — see
+/// [`SeamBuilder`]). Small relative to the meshes' extent, but far below any real feature size;
+/// retained solely to weld the degenerate endpoint interior to both faces. Its scale-relative
+/// coarseness is exactly why it is no longer the primary path for imported meshes.
 fn seam_quantum(c: &ClipMesh, w: &ClipMesh) -> f64 {
     let mut lo = [f64::INFINITY; 3];
     let mut hi = [f64::NEG_INFINITY; 3];
@@ -1394,6 +1502,61 @@ mod tests {
         // C is an exact plane; the only deviation is float noise. A tight bound (1e-6 of the 200-unit
         // extent) catches any real scalloping (which would be a fraction of a cell ≈ several units).
         assert!(off_max < 1e-3, "C vertices strayed off C's plane: {off_max:.4} (scalloping)");
+    }
+
+    /// Task 04 acceptance: the SAME independently-tessellated seam as
+    /// `m2_staircase_watertight_and_no_scallop_field_agnostic` (feature spacing ≈ 8 units near the
+    /// origin), but a CLOSED far-away tetrahedron is welded onto W to balloon the scene EXTENT to
+    /// ≈ 1e9 without adding any crossing. The position quantum is `extent · 1e-7` ≈ 100 units — now
+    /// COARSER than the seam's crossing spacing — so the old quantized weld merges genuinely distinct
+    /// crossings into a handful of ids and the seam tears apart (it collapses to ~2 shared vertices,
+    /// 26 torn edges). This is the "large bounding box, fine local features" import case from the
+    /// module docs. Note it is EXTENT, not pure translation, that coarsens the quantum: a translation
+    /// leaves `extent = hi − lo` unchanged, and every crossing is computed bit-identically by the two
+    /// triangles sharing its piercing edge, so the weld survives any offset — the discriminating
+    /// stress is a wide box with a fine seam. Combinatorial keying is by integer index pairs,
+    /// independent of extent, so the seam keeps all of its vertices and stays watertight: FAILS on the
+    /// quantized weld, PASSES here — and (integer keys) is strictly more native==wasm-deterministic.
+    #[test]
+    fn combinatorial_key_watertight_under_coarse_extent() {
+        // Seam scene near the origin, identical to the m2 field-agnostic test.
+        let cu = normalize_t([1.0, 0.0, 0.1]);
+        let cv = [0.0, 1.0, 0.0];
+        let c = jittered_grid(23, 11, 0xC0FFEE, 3.0, cu, cv, |s, t| {
+            let x = -100.0 + s * 200.0;
+            [x, t * 100.0, 5.0 + 0.1 * x]
+        });
+        let wu = [0.0, 1.0, 0.0];
+        let wv = normalize_t([0.2, 0.0, 1.0]);
+        let mut w = jittered_grid(13, 17, 0xBEEF, 3.0, wu, wv, |s, t| {
+            let z = -60.0 + t * 120.0;
+            [0.2 * z, s * 100.0, z]
+        });
+        // A CLOSED, outward-wound tetrahedron 1e9 away: it intersects nothing (no extra seam) and has
+        // no open edges of its own (so it adds no spurious torn edges to the watertight check), but it
+        // stretches the combined bounding box to ≈ 1e9, coarsening `seam_quantum` to ≈ 100 units. It
+        // is a disconnected component, so W stays consistently wound (no shared directed edge).
+        let f = 1.0e9;
+        let base = w.vertices.len();
+        w.vertices.extend_from_slice(&[[f, f, f], [f + 1.0, f, f], [f, f + 1.0, f], [f, f, f + 1.0]]);
+        for tri in [[0, 2, 1], [0, 1, 3], [0, 3, 2], [1, 2, 3]] {
+            w.triangles.push([base + tri[0], base + tri[1], base + tri[2]]);
+        }
+        debug_assert!(w_is_consistently_wound(&w), "far tetra broke W winding");
+
+        let res = clip(&c, &w, Keep::Side(KeepSide::Above), None);
+
+        // Same rim frame as the unballooned test: C's kept rim (y=0/100, x=+100) and W's rim
+        // (y=0/100, z=±60). The far tetra is closed, so it contributes no incidence-1 edges.
+        let eps = 1.0;
+        let on_frame = move |p: [f64; 3]| {
+            p[1].abs() < eps
+                || (p[1] - 100.0).abs() < eps
+                || (p[0] - 100.0).abs() < eps
+                || (p[2] + 60.0).abs() < eps
+                || (p[2] - 60.0).abs() < eps
+        };
+        assert_seam_watertight(&res, &on_frame);
     }
 
     /// Milestone 2 (real contoured meshes): contour two dipping-plane fields with the OCTREE (the
