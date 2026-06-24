@@ -37,6 +37,11 @@ pub mod weld;
 
 pub mod mesh_clip;
 
+// Shared mesh-invariant assertions (watertight-volume, watertight-seam, edge-incidence) used by
+// both the `mesh_clip` and `stack` test suites so the criteria are defined once. Test-only.
+#[cfg(test)]
+mod mesh_test_util;
+
 #[cfg(feature = "wasm")]
 pub mod wasm;
 

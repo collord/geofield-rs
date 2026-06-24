@@ -1683,6 +1683,7 @@ mod tests {
     use crate::assemble::KernelOptions;
     use crate::data::{Orientation, Series, SurfacePoint};
     use crate::mesh::normalize;
+    use crate::mesh_test_util::{assert_mesh_watertight, assert_volume_watertight, incidence};
     use crate::Model;
     use std::collections::HashMap;
 
@@ -1757,18 +1758,16 @@ mod tests {
         }
     }
 
-    /// `(nonmanifold, open, total)` undirected-edge incidence counts for a mesh.
+    /// `(nonmanifold, open, total)` undirected-edge incidence counts for a mesh — built on the shared
+    /// [`incidence`] primitive. For the strict CLOSED-solid criterion prefer [`assert_mesh_watertight`];
+    /// this stays for the callers that need a NON-closed criterion (e.g. "no non-manifold edges" on an
+    /// open eroded bed) or to report raw counts.
     fn edge_stats(mesh: &Mesh) -> (usize, usize, usize) {
-        let mut undirected: HashMap<(u32, u32), u32> = HashMap::new();
-        for t in mesh.indices.chunks_exact(3) {
-            for &(a, b) in &[(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
-                let e = if a < b { (a, b) } else { (b, a) };
-                *undirected.entry(e).or_insert(0) += 1;
-            }
-        }
-        let nm = undirected.values().filter(|&&c| c > 2).count();
-        let open = undirected.values().filter(|&&c| c == 1).count();
-        (nm, open, undirected.len())
+        let (_, tris) = crate::mesh_test_util::mesh_soup(mesh);
+        let inc = incidence(&tris);
+        let nm = inc.values().filter(|&&c| c > 2).count();
+        let open = inc.values().filter(|&&c| c == 1).count();
+        (nm, open, inc.len())
     }
 
     /// Assert every interface mesh of every series is strictly watertight
@@ -1783,17 +1782,10 @@ mod tests {
                     if mesh.triangle_count() == 0 {
                         continue; // a fully-clipped-away interface emits nothing — fine
                     }
-                    let (nm, open, total) = edge_stats(mesh);
-                    assert_eq!(
-                        nm, 0,
-                        "{label} d{depth} series {} iface {iid}: non-manifold {nm}/{total}",
-                        sm.series
-                    );
-                    assert_eq!(
-                        open, 0,
-                        "{label} d{depth} series {} iface {iid}: open {open}/{total}",
-                        sm.series
-                    );
+                    // Closed-solid criterion (shared helper): incidence exactly 2 everywhere, no rim.
+                    // The combined per-series Scene is one sign field, so every interface closes.
+                    eprintln!("{label} d{depth} series {} iface {iid}: checking watertight", sm.series);
+                    assert_mesh_watertight(mesh, &|_| false);
                 }
             }
         }
@@ -2456,9 +2448,8 @@ mod tests {
                 continue; // a unit with no volume in the visible region
             }
             total_solid_tris += mesh.triangle_count();
-            let (nm, open, _total) = edge_stats(&mesh);
-            assert_eq!(nm, 0, "unit {u} closed solid non-manifold: {nm}");
-            assert_eq!(open, 0, "unit {u} closed solid not watertight: open {open}");
+            eprintln!("unit {u}: checking closed solid watertight");
+            assert_mesh_watertight(&mesh, &|_| false); // closed solid (cap=true), no open rim
         }
         assert!(total_solid_tris > 0, "closed solids produced no geometry");
 
@@ -3072,9 +3063,10 @@ mod tests {
                 continue; // a unit fully clipped away in the visible region
             }
             total_tris += mesh.triangle_count();
-            let (nm, open, total) = edge_stats(&mesh);
-            assert_eq!(nm, 0, "unit {u}: non-manifold {nm}/{total} (multi-clip CSG cracked)");
-            assert_eq!(open, 0, "unit {u}: not watertight, open {open}/{total} (a hole)");
+            // Topography-capped + intrusion-punched + floor-bounded — the multi-clip CSG must stay
+            // crack-free (no non-manifold edge) and hole-free (no open edge). Closed solid, no rim.
+            eprintln!("unit {u}: checking multi-clip closed solid watertight");
+            assert_mesh_watertight(&mesh, &|_| false);
         }
         assert!(total_tris > 0, "the multi-clip floor units produced no geometry");
     }
@@ -3113,9 +3105,8 @@ mod tests {
             .mesh_cross_cut_solid(0, [0.0, 0.0, 0.0], 1000.0, [1000.0, 1000.0, 1000.0], cfg)
             .expect("vein interior solid");
         assert!(solid.triangle_count() > 0, "the vein interior produced no geometry");
-        let (nm, open, total) = edge_stats(&solid);
-        assert_eq!(nm, 0, "vein interior non-manifold {nm}/{total}");
-        assert_eq!(open, 0, "vein interior not watertight, open {open}/{total}");
+        // The vein's interior band is a closed, manifold, hole-free solid (clipped by the box). No rim.
+        assert_mesh_watertight(&solid, &|_| false);
     }
 
     /// A DIPPING vein cross-cutting a TWO-contact column (contacts at z=350 and z=650 ⇒ three
@@ -4205,24 +4196,15 @@ mod tests {
         (pos, tris)
     }
 
-    /// Undirected-edge incidence over a triangle soup.
-    fn edge_incidence(tris: &[[usize; 3]]) -> std::collections::HashMap<(usize, usize), u32> {
-        let mut inc: std::collections::HashMap<(usize, usize), u32> = std::collections::HashMap::new();
-        for t in tris {
-            for &(a, b) in &[(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
-                let e = if a < b { (a, b) } else { (b, a) };
-                *inc.entry(e).or_insert(0) += 1;
-            }
-        }
-        inc
-    }
-
     /// `(open_off_box, shared_off_box)` for a merged soup: count of incidence-1 edges whose
     /// endpoints are NOT both on the domain box rim (genuine see-through tears), and incidence-≥3
-    /// edges off the rim (where two solids' wall caps fused — positive evidence of sharing).
+    /// edges off the rim (where two solids' wall caps fused — positive evidence of sharing). This is
+    /// a genuinely DIFFERENT criterion from [`assert_volume_watertight`]: a fused body∪rock wall is
+    /// legitimately incidence-≥3 (two solids meeting), so it cannot use the manifold assertion — it
+    /// shares only the underlying [`incidence`] primitive.
     fn seam_incidence_stats(pos: &[[f64; 3]], tris: &[[usize; 3]], size: f64) -> (usize, usize) {
         let on_box = |p: [f64; 3]| (0..3).any(|d| p[d] < 1.0 || p[d] > size - 1.0);
-        let inc = edge_incidence(tris);
+        let inc = incidence(tris);
         let mut open = 0usize;
         let mut shared = 0usize;
         for (&(a, b), &c) in &inc {
@@ -4255,15 +4237,20 @@ mod tests {
         // --- Shared path (Strategy A) ---
         let (body, rocks) =
             stack.mesh_cross_cut_solids_shared(0, min, size, ext, cfg).expect("shared solids mesh");
-        // Each solid individually watertight (closed, cap=true → no tears off the box rim).
-        let solo_open = |m: &Mesh| {
+        // Each solid individually watertight (closed, cap=true → incidence exactly 2, the only open
+        // edges allowed are on the domain box rim). Routed through the SAME shared closed-solid
+        // invariant as the surface path (Task 08 Part C) — `merge_dedup` first so coincident wall
+        // verts collapse, then `assert_volume_watertight` with the box rim as the open boundary.
+        let on_box = move |p: [f64; 3]| (0..3).any(|d| p[d] < 1.0 || p[d] > size - 1.0);
+        let assert_solo = |m: &Mesh| {
             let (p, t) = merge_dedup(&[m], q);
-            seam_incidence_stats(&p, &t, size).0
+            assert_volume_watertight(&p, &t, &on_box);
         };
-        assert_eq!(solo_open(&body), 0, "body solid has see-through edges");
+        assert_solo(&body);
         for (j, b, u, m) in &rocks {
             if m.triangle_count() > 0 {
-                assert_eq!(solo_open(m), 0, "rock unit ({j},{b},{u}) solid has see-through edges");
+                eprintln!("rock unit ({j},{b},{u}): checking solo solid watertight");
+                assert_solo(m);
             }
         }
         // Merge body ∪ all rock units and check the seam fuses watertight.

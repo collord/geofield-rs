@@ -1454,7 +1454,7 @@ fn seam_quantum(c: &ClipMesh, w: &ClipMesh) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
+    use crate::mesh_test_util::{assert_seam_watertight, incidence, merge};
 
     /// A planar grid mesh: `nx × ny` quads over parameters (s, t) ∈ [0,1]², each corner placed by
     /// `f(s, t) -> [x,y,z]`. Triangulated with a consistent diagonal and CCW winding as seen from
@@ -1476,83 +1476,6 @@ mod tests {
             }
         }
         ClipMesh::new(verts, tris)
-    }
-
-    /// Undirected edge incidence of a triangle list.
-    fn incidence(tris: &[[usize; 3]]) -> HashMap<(usize, usize), u32> {
-        let mut inc: HashMap<(usize, usize), u32> = HashMap::new();
-        for t in tris {
-            for &(a, b) in &[(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
-                let e = if a < b { (a, b) } else { (b, a) };
-                *inc.entry(e).or_insert(0) += 1;
-            }
-        }
-        inc
-    }
-
-    /// Merge C and W into ONE index space, collapsing each `shared` seam pair to a single vertex,
-    /// so cross-surface watertightness can be checked by edge incidence. Returns (positions, tris).
-    fn merge(res: &ClipResult) -> (Vec<[f64; 3]>, Vec<[usize; 3]>) {
-        let cn = res.c.vertices.len();
-        // W vertices are offset by cn; then each shared (ci, wi) is unified by remapping wi→ci.
-        let mut remap: HashMap<usize, usize> = HashMap::new();
-        for &(ci, wi) in &res.shared {
-            remap.insert(cn + wi, ci);
-        }
-        let mut positions = res.c.vertices.clone();
-        positions.extend(res.w.vertices.iter().copied());
-        let resolve = |v: usize| *remap.get(&v).unwrap_or(&v);
-        let mut tris = Vec::new();
-        for t in &res.c.triangles {
-            tris.push([t[0], t[1], t[2]]);
-        }
-        for t in &res.w.triangles {
-            tris.push([resolve(cn + t[0]), resolve(cn + t[1]), resolve(cn + t[2])]);
-        }
-        (positions, tris)
-    }
-
-    /// Shared watertightness assertion for a clipped C∪W, parameterized by the fixture's true outer
-    /// rim (`on_frame`). Asserts: (1) no torn seam — incidence-1 edges live only on the rim; (2) no
-    /// non-manifold edge OFF the seam; (3) the seam is a real 3-way junction (≥1 incidence-3 edge),
-    /// and no seam edge exceeds incidence 3. This is the correct criterion for a contact terminating
-    /// against a through-wall (NOT "incidence 2 everywhere", which is for a closed manifold).
-    fn assert_seam_watertight(res: &ClipResult, on_frame: &dyn Fn([f64; 3]) -> bool) {
-        assert!(!res.shared.is_empty(), "expected a non-empty seam");
-        assert!(!res.c.triangles.is_empty() && !res.w.triangles.is_empty(), "empty output");
-        let (pos, tris) = merge(res);
-        let inc = incidence(&tris);
-
-        let torn = inc
-            .iter()
-            .filter(|(_, &c)| c == 1)
-            .filter(|((a, b), _)| !(on_frame(pos[*a]) && on_frame(pos[*b])))
-            .count();
-        assert_eq!(torn, 0, "torn seam edges off the rim: {torn}");
-
-        let seam_verts: std::collections::HashSet<usize> =
-            res.shared.iter().map(|&(ci, _)| ci).collect();
-        let is_seam_edge = |a: usize, b: usize| seam_verts.contains(&a) && seam_verts.contains(&b);
-
-        let bad_nm = inc
-            .iter()
-            .filter(|(_, &c)| c > 2)
-            .filter(|((a, b), _)| !is_seam_edge(*a, *b))
-            .count();
-        assert_eq!(bad_nm, 0, "non-manifold edges off the seam: {bad_nm}");
-
-        let over = inc
-            .iter()
-            .filter(|((a, b), _)| is_seam_edge(*a, *b))
-            .filter(|(_, &c)| c > 3)
-            .count();
-        assert_eq!(over, 0, "a seam edge has incidence > 3 (self-overlap): {over}");
-        let three = inc
-            .iter()
-            .filter(|((a, b), _)| is_seam_edge(*a, *b))
-            .filter(|(_, &c)| c == 3)
-            .count();
-        assert!(three > 0, "no 3-way seam junction edges — C did not terminate on the seam");
     }
 
     /// Best-fit plane of a point set: returns `(point_on_plane, unit_normal)` from the centroid and
@@ -2381,6 +2304,325 @@ mod tests {
             c.triangles.len(),
             w.triangles.len(),
             segs.len()
+        );
+    }
+
+    // ───────────────────────── Task 08: property/fuzz + determinism ─────────────────────────
+
+    /// A deterministic `splitmix64` stream — reproducible, no `Math.random` (banned). Each `next`
+    /// advances the state and returns a well-mixed `u64`; `unit` maps it to `[0,1)`.
+    struct Rng(u64);
+    impl Rng {
+        fn new(seed: u64) -> Self {
+            Rng(seed.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(0xD1B54A32D192ED03))
+        }
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E3779B97F4A7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+            z ^ (z >> 31)
+        }
+        /// Uniform in `[0,1)`.
+        fn unit(&mut self) -> f64 {
+            (self.next() >> 11) as f64 / (1u64 << 53) as f64
+        }
+        /// Uniform in `[lo,hi)`.
+        fn range(&mut self, lo: f64, hi: f64) -> f64 {
+            lo + (hi - lo) * self.unit()
+        }
+        /// Uniform integer in `[lo,hi]`.
+        fn int(&mut self, lo: usize, hi: usize) -> usize {
+            lo + (self.next() as usize) % (hi - lo + 1)
+        }
+    }
+
+    /// A rigid transform `p ↦ R·p + t` and its exact inverse `q ↦ Rᵀ·(q − t)`. `R` is a proper
+    /// rotation (det +1, so it PRESERVES winding — no need to re-normalize the transformed W) built
+    /// from yaw/pitch/roll; `t` is a large translation. The inverse subtracts `t` FIRST, which
+    /// cancels the large common offset to ~1 ULP of `|t|`, so frame/scallop checks stay sharp at any
+    /// translation magnitude (this is why we measure invariants in the LOCAL frame, not world).
+    struct Rigid {
+        r: [[f64; 3]; 3],
+        t: [f64; 3],
+    }
+    impl Rigid {
+        fn from_rng(rng: &mut Rng) -> Self {
+            let (a, b, g) = (
+                rng.range(0.0, std::f64::consts::TAU),
+                rng.range(0.0, std::f64::consts::TAU),
+                rng.range(0.0, std::f64::consts::TAU),
+            );
+            let (ca, sa) = (a.cos(), a.sin());
+            let (cb, sb) = (b.cos(), b.sin());
+            let (cg, sg) = (g.cos(), g.sin());
+            // Rz(a)·Ry(b)·Rx(g).
+            let r = [
+                [ca * cb, ca * sb * sg - sa * cg, ca * sb * cg + sa * sg],
+                [sa * cb, sa * sb * sg + ca * cg, sa * sb * cg - ca * sg],
+                [-sb, cb * sg, cb * cg],
+            ];
+            // Translation magnitude spread over ~[1, 1e6] (log-uniform): exercises both modest and
+            // genuinely large placements without pushing float noise past the invariants' tolerances.
+            let mag = 10f64.powf(rng.range(0.0, 6.0));
+            let t = [
+                rng.range(-mag, mag),
+                rng.range(-mag, mag),
+                rng.range(-mag, mag),
+            ];
+            Rigid { r, t }
+        }
+        fn fwd(&self, p: [f64; 3]) -> [f64; 3] {
+            [
+                self.r[0][0] * p[0] + self.r[0][1] * p[1] + self.r[0][2] * p[2] + self.t[0],
+                self.r[1][0] * p[0] + self.r[1][1] * p[1] + self.r[1][2] * p[2] + self.t[1],
+                self.r[2][0] * p[0] + self.r[2][1] * p[1] + self.r[2][2] * p[2] + self.t[2],
+            ]
+        }
+        fn inv(&self, q: [f64; 3]) -> [f64; 3] {
+            let d = [q[0] - self.t[0], q[1] - self.t[1], q[2] - self.t[2]];
+            // Rᵀ·d (R orthonormal).
+            [
+                self.r[0][0] * d[0] + self.r[1][0] * d[1] + self.r[2][0] * d[2],
+                self.r[0][1] * d[0] + self.r[1][1] * d[1] + self.r[2][1] * d[2],
+                self.r[0][2] * d[0] + self.r[1][2] * d[1] + self.r[2][2] * d[2],
+            ]
+        }
+        fn apply(&self, m: &mut ClipMesh) {
+            for v in &mut m.vertices {
+                *v = self.fwd(*v);
+            }
+        }
+    }
+
+    /// Every vertex index referenced by `tris` is in `0..n_verts` AND every index in that range is
+    /// referenced — i.e. no orphan vertices and no dangling index (the `compact` pass guarantees
+    /// this; we assert it as a `clip` post-condition).
+    fn assert_no_orphans(n_verts: usize, tris: &[[usize; 3]], side: &str) {
+        let mut used = vec![false; n_verts];
+        for t in tris {
+            for &i in t {
+                assert!(i < n_verts, "{side}: triangle index {i} out of range {n_verts}");
+                used[i] = true;
+            }
+        }
+        let orphans = used.iter().filter(|&&u| !u).count();
+        assert_eq!(orphans, 0, "{side}: {orphans} orphan vertices left in the buffer");
+    }
+
+    /// Task 08 (B) — seeded property/fuzz test. Each seed builds two INDEPENDENTLY-tessellated
+    /// jittered planes (a gently-dipping contact C overrunning a steeper wall W), applies ONE rigid
+    /// transform (rotation + large translation) to the WHOLE scene, and clips. The transform leaves
+    /// the topology identical (same `Keep::Above` side per centroid, normals rotate with W) but
+    /// exercises arbitrary placement and large coordinate magnitudes — the import condition. Every
+    /// seed must satisfy the `clip` post-conditions; the seed is in each assert message for repro.
+    ///
+    /// Both branches are exercised: a crossing seam (the 4 post-conditions below) and the empty-seam
+    /// pass-through/removal (W placed clear of C). The generator is GATED to the validated domain
+    /// (jitter < ¼ cell ⇒ no inverted/zero-area triangles; clearly transversal dips ⇒ no coplanar);
+    /// degenerate inputs are covered by the explicit Task-05 tests, not folded in here (the watch-out).
+    #[test]
+    fn clip_fuzz_postconditions_hold() {
+        const X: f64 = 100.0; // C spans x∈[−X,X]
+        const Y: f64 = 100.0; // both span y∈[0,Y]
+        const ZH: f64 = 60.0; // W spans z∈[−ZH,ZH]
+        const ZC: f64 = 5.0; //  C height at x=0
+
+        for seed in 0u64..40 {
+            let mut rng = Rng::new(seed);
+
+            // Independently-tessellated resolutions (kept coprime-ish and ≥8 so the seam has teeth).
+            let (cnx, cny) = (rng.int(12, 28) | 1, rng.int(9, 21) | 1);
+            let (wny, wnz) = (rng.int(11, 27) | 1, rng.int(9, 23) | 1);
+            // Clearly transversal dips: C nearly flat, W nearly vertical.
+            let sx = rng.range(0.04, 0.16); // C dip
+            let tw = rng.range(0.10, 0.35); // W tilt (x = x0 + tw·z)
+
+            // Crossing location. 1 in 4 seeds places W clear of C (empty-seam branch), alternating
+            // side; the rest cross C's interior (x0 well inside [−X,X], away from the rim).
+            let empty = seed % 4 == 0;
+            let x0 = if empty {
+                let side = if seed % 8 == 0 { 1.0 } else { -1.0 };
+                side * (X + tw * ZH + 20.0) // nearest W edge ≥ X+20 ⇒ no crossing
+            } else {
+                rng.range(-0.5 * X, 0.5 * X)
+            };
+
+            // Jitter amplitude gated to ¼ of the smaller cell (no triangle inversion/zero-area).
+            let cell = (2.0 * X / cnx as f64).min(Y / cny as f64).min(2.0 * ZH / wnz as f64);
+            let amp = cell * 0.25 * rng.unit();
+
+            let cu = normalize_t([1.0, 0.0, sx]); // C in-plane dip direction
+            let cv = [0.0, 1.0, 0.0];
+            let mut c = jittered_grid(cnx, cny, seed ^ 0xC0FFEE, amp, cu, cv, |s, t| {
+                let x = -X + s * 2.0 * X;
+                [x, t * Y, ZC + sx * x]
+            });
+            let wu = [0.0, 1.0, 0.0];
+            let wv = normalize_t([tw, 0.0, 1.0]); // W in-plane dip
+            let mut w = jittered_grid(wny, wnz, seed ^ 0xBEEF, amp, wu, wv, |s, t| {
+                let z = -ZH + t * 2.0 * ZH;
+                [x0 + tw * z, s * Y, z]
+            });
+
+            // Half the seeds balloon the scene EXTENT with a far, CLOSED tetrahedron welded onto W
+            // (the `combinatorial_key_watertight_under_coarse_extent` device, randomized): it crosses
+            // nothing, has no open edges, and stays a disjoint consistently-wound component, but it
+            // stretches the bounding box to ~1e6–1e9 — coarsening any extent-derived position quantum
+            // past the fine local seam spacing. Combinatorial keying is extent-independent, so the
+            // seam survives; this is the stress that catches the pre-Task-04 quantized weld (the
+            // acceptance: point this fuzzer at pre-Task-04 code and the wide-extent seeds tear).
+            if seed % 2 == 1 {
+                let f = 10f64.powf(rng.range(6.0, 9.0));
+                let base = w.vertices.len();
+                w.vertices
+                    .extend_from_slice(&[[f, f, f], [f + 1.0, f, f], [f, f + 1.0, f], [f, f, f + 1.0]]);
+                for tri in [[0, 2, 1], [0, 1, 3], [0, 3, 2], [1, 2, 3]] {
+                    w.triangles.push([base + tri[0], base + tri[1], base + tri[2]]);
+                }
+            }
+            debug_assert!(w_is_consistently_wound(&w), "seed {seed}: W mis-wound before transform");
+
+            // One rigid transform on the WHOLE scene (rotation preserves winding; large translation).
+            let xf = Rigid::from_rng(&mut rng);
+            xf.apply(&mut c);
+            xf.apply(&mut w);
+            debug_assert!(w_is_consistently_wound(&w), "seed {seed}: rotation broke W winding");
+
+            let res = clip(&c, &w, Keep::Side(KeepSide::Above), None);
+
+            // Post-condition (4) — no orphan / dangling vertices, ALWAYS (both branches).
+            assert_no_orphans(res.c.vertices.len(), &res.c.triangles, &format!("seed {seed} C"));
+            assert_no_orphans(res.w.vertices.len(), &res.w.triangles, &format!("seed {seed} W"));
+
+            if res.shared.is_empty() {
+                // Empty-seam branch: W unchanged; C either passed through whole or removed entirely.
+                assert!(empty, "seed {seed}: interior crossing produced no seam");
+                assert_eq!(res.w.vertices, w.vertices, "seed {seed}: W changed with no seam");
+                assert_eq!(res.w.triangles, w.triangles, "seed {seed}: W changed with no seam");
+                let c_passed = res.c.vertices == c.vertices && res.c.triangles == c.triangles;
+                let c_removed = res.c.triangles.is_empty();
+                assert!(c_passed || c_removed, "seed {seed}: empty-seam C neither passed nor removed");
+                continue;
+            }
+            assert!(!empty, "seed {seed}: W placed clear of C but a seam appeared");
+
+            // Inverse-transform to the LOCAL frame so the rim/scallop checks are translation-proof.
+            let on_frame = |v: [f64; 3]| {
+                let q = xf.inv(v);
+                let e = 1.0;
+                q[1].abs() < e
+                    || (q[1] - Y).abs() < e
+                    || (q[0] - X).abs() < e // C's kept +x rim
+                    || (q[2] - ZH).abs() < e
+                    || (q[2] + ZH).abs() < e // W's z rims
+            };
+
+            // (1) Watertight seam.
+            assert_seam_watertight(&res, &on_frame);
+
+            // (3) shared pairs are consistent: each referenced seam vertex on C coincides (within
+            // float noise) with its partner on W, and both are actually used by their side.
+            let c_refs: std::collections::HashSet<usize> =
+                res.c.triangles.iter().flatten().copied().collect();
+            let w_refs: std::collections::HashSet<usize> =
+                res.w.triangles.iter().flatten().copied().collect();
+            for &(ci, wi) in &res.shared {
+                let d = sub(res.c.vertices[ci], res.w.vertices[wi]);
+                assert!(
+                    dot(d, d).sqrt() < 1e-6,
+                    "seed {seed}: shared seam pair positions differ by {}",
+                    dot(d, d).sqrt()
+                );
+                assert!(c_refs.contains(&ci), "seed {seed}: shared C vertex {ci} unreferenced");
+                assert!(w_refs.contains(&wi), "seed {seed}: shared W vertex {wi} unreferenced");
+            }
+
+            // (2) Anti-scallop: no kept C vertex strays off C's OWN plane (z = ZC + sx·x in the
+            // local frame). C is exactly planar pre-jitter (jitter is in-plane), so only float noise
+            // deviates; a clip that pulled C onto W to close the seam would show a fraction-of-a-cell
+            // (≫ 1e-3) deflection.
+            let mut off_max = 0.0_f64;
+            for &v in &res.c.vertices {
+                let q = xf.inv(v);
+                off_max = off_max.max((q[2] - ZC - sx * q[0]).abs());
+            }
+            assert!(off_max < 1e-3, "seed {seed}: C strayed off its plane by {off_max:.2e} (scallop)");
+        }
+    }
+
+    /// Canonical, order-stable byte encoding of a `ClipResult` (f64 via `to_bits`, indices as u64 LE,
+    /// length-prefixed) — for the determinism check. NOT a public serialization format.
+    fn encode_clip(res: &ClipResult) -> Vec<u8> {
+        let mut out = Vec::new();
+        let push_u64 = |o: &mut Vec<u8>, x: u64| o.extend_from_slice(&x.to_le_bytes());
+        let push_mesh = |o: &mut Vec<u8>, m: &ClipMesh| {
+            push_u64(o, m.vertices.len() as u64);
+            for v in &m.vertices {
+                for c in v {
+                    push_u64(o, c.to_bits());
+                }
+            }
+            push_u64(o, m.triangles.len() as u64);
+            for t in &m.triangles {
+                for &i in t {
+                    push_u64(o, i as u64);
+                }
+            }
+        };
+        push_mesh(&mut out, &res.c);
+        push_mesh(&mut out, &res.w);
+        push_u64(&mut out, res.shared.len() as u64);
+        for &(a, b) in &res.shared {
+            push_u64(&mut out, a as u64);
+            push_u64(&mut out, b as u64);
+        }
+        push_u64(&mut out, res.coplanar_pairs as u64);
+        out
+    }
+
+    /// FNV-1a 64-bit digest — a tiny dependency-free checksum to pin the golden output value.
+    fn fnv1a(bytes: &[u8]) -> u64 {
+        let mut h = 0xCBF29CE484222325u64;
+        for &b in bytes {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100000001B3);
+        }
+        h
+    }
+
+    /// Task 08 (D) — `clip` output is DETERMINISTIC across runs, and its byte-exact value is pinned.
+    ///
+    /// The PRIMARY lock is run-twice byte-identity: Rust seeds each `HashMap` with an advancing
+    /// `RandomState`, so two `clip` calls build their internal maps under DIFFERENT seeds — any
+    /// output ordering that leaked `HashMap` iteration order would diverge between the two runs (the
+    /// audit in `docs/08` found none; this catches a regression that reintroduces one).
+    ///
+    /// The golden FNV-1a digest pins the exact bytes. `clip` is DESIGNED to be native↔wasm-identical
+    /// (`cdt`/`spade` exact Shewchuk predicates + strict IEEE-754 f64), so the same fixture should
+    /// produce this same digest on `wasm32`. NOTE the honest gap: this crate has no
+    /// `wasm-bindgen-test` harness, so `#[cfg(test)]` only compiles natively — the cross-target half
+    /// is an *asserted design invariant*, not an executed check here. Verifying it on wasm would
+    /// require adding that harness (a logged, un-closed gap per the constitution, not a silent
+    /// "verified"). On native, the digest still guards every future change to `clip`'s output.
+    #[test]
+    fn clip_output_is_deterministic() {
+        // Golden FNV-1a digest of the canonical encoding (computed natively). `clip` is designed so
+        // the wasm32 build produces the same value; see the gap note above.
+        const GOLDEN: u64 = 0xE8B1_5AB9_14FD_A1AB;
+
+        let (c, w) = contact_and_wall();
+        let r1 = clip(&c, &w, Keep::Side(KeepSide::Above), None);
+        let r2 = clip(&c, &w, Keep::Side(KeepSide::Above), None);
+        let (b1, b2) = (encode_clip(&r1), encode_clip(&r2));
+        assert_eq!(b1, b2, "clip output differs between two runs — HashMap order leaked into output");
+
+        let digest = fnv1a(&b1);
+        eprintln!("[determinism] clip golden FNV-1a = 0x{digest:016X} ({} bytes)", b1.len());
+        assert_eq!(
+            digest, GOLDEN,
+            "clip output digest changed: 0x{digest:016X} != golden 0x{GOLDEN:016X} \
+             (a native change, OR a native↔wasm divergence if seen only on wasm)"
         );
     }
 }
