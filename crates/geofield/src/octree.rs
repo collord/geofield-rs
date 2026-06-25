@@ -535,6 +535,45 @@ impl<'a> Scene<'a> {
         }
         count >= 2
     }
+
+    /// Do TWO OR MORE distinct surfaces of the scene (primary contact + any contributor,
+    /// INCLUDING the domain box) straddle the cell `[min, min+size]³` — a surface's sign
+    /// not being uniform over the 8 corners, inclusively?
+    ///
+    /// Drives the SHARED-path force-refinement ([`refine_shared_contacts`]); the
+    /// single-scene path never calls it, so it is unaffected. The body-primary `build`
+    /// never refines a cut rock unit's bed region (its primary, the vein field, does not
+    /// cross out there, and its `contributors_inside` AND is poisoned false beyond the
+    /// vein walls), so a unit slab THINNER than a coarse cell — bounded by two contacts —
+    /// has no corner strictly inside it and collapses to one dual vertex (the dropped
+    /// "teal" block). Forcing subdivision until each cell holds at most one surface lands a
+    /// corner inside the slab.
+    ///
+    /// Counting INCLUSIVELY (`inside`/`<= 0` puts an exactly-on-contact corner on one fixed
+    /// side) is the WHOLE-CELL companion to the per-edge [`edge_double_crossed`], catching
+    /// the case where one bounding contact grazes a cell FACE (no strict edge sign-change).
+    /// The domain box COUNTS: a far-left cell touches the `x = 0` face, so box + bed = two
+    /// surfaces robustly — a clean, build-independent trigger (the box plane and a
+    /// non-grid-aligned bed both cross cell interiors), unlike relying on the grid-aligned
+    /// bed's own graze, whose sign is unstable across builds (native↔wasm). It does not
+    /// over-refine: a boundary cell with ONLY the box is one surface, not two.
+    fn cell_double_surface(&self, min: [f64; 3], size: f64) -> bool {
+        let pts: [[f64; 3]; 8] = std::array::from_fn(|c| corner_pos(min, size, c));
+        let mut count = 0usize;
+        if pts.iter().any(|&p| self.primary(p) <= 0.0) && pts.iter().any(|&p| self.primary(p) > 0.0)
+        {
+            count += 1;
+        }
+        for c in &self.contributors {
+            if pts.iter().any(|&p| c.inside(p)) && pts.iter().any(|&p| !c.inside(p)) {
+                count += 1;
+                if count >= 2 {
+                    return true;
+                }
+            }
+        }
+        false
+    }
 }
 
 /// Axis-aligned box boundary: the domain is the cube `[min, min+size]³` (an
@@ -1100,15 +1139,28 @@ fn resample_leaves(tree: &mut Octree, scene: &Scene) {
     }
 }
 
-/// Contour `scene` on an already-built `tree` (its leaves re-sampled for `scene`), returning the
-/// mesh. Mirrors the tail of [`octree_dual_contour_scene`] but takes the tree as given — no
-/// build/refine/balance, so the subdivision is whatever the caller built.
-fn contour_on_tree(tree: &mut Octree, scene: &Scene, cfg: &OctreeConfig) -> Mesh {
+/// Contour `scene` on an already-built `tree` as a CLOSED solid (`cap=true` semantics), returning
+/// the mesh AND its per-triangle `contact_face` tag: `true` where the scene's PRIMARY field crosses
+/// the face (a contact face), `false` where a contributor crosses (a cap face — box, fault plane,
+/// or a vein/erosion masker). The tag is aligned with the returned triangles: `orient_closed_outward`
+/// only flips winding (swaps indices within a triangle), never reordering or dropping triangles, so
+/// `contact_face[t]` indexes `mesh.indices[3t..3t+3]`. Used by the corefined-solid path to separate
+/// wall-cap faces (to replace with the smooth seam) from box/bed faces (to keep).
+fn contour_on_tree_tagged(tree: &mut Octree, scene: &Scene) -> (Mesh, Vec<bool>) {
     let mut mesh = Mesh::default();
     let mut contact_face: Vec<bool> = Vec::new();
     assign_vertices(tree, scene, &mut mesh, true);
     contour_edges(tree, scene, &mut mesh, &mut contact_face);
     orient_closed_outward(&mut mesh);
+    (mesh, contact_face)
+}
+
+/// Contour `scene` on an already-built `tree` (its leaves re-sampled for `scene`), returning the
+/// mesh. Mirrors the tail of [`octree_dual_contour_scene`] but takes the tree as given — no
+/// build/refine/balance, so the subdivision is whatever the caller built. For the open-sheet view
+/// (`cfg.cap == false`) the cap faces are stripped, leaving the contact surface.
+fn contour_on_tree(tree: &mut Octree, scene: &Scene, cfg: &OctreeConfig) -> Mesh {
+    let (mut mesh, contact_face) = contour_on_tree_tagged(tree, scene);
     if !cfg.cap {
         keep_contact_faces(&mut mesh, &contact_face);
     }
@@ -1138,6 +1190,9 @@ pub fn octree_dual_contour_shared(
     };
     tree.root = build(&mut tree, build_scene, min, size, 0, &cfg);
     refine_double_crossed(&mut tree, build_scene, &cfg);
+    // Force-refine contacts the body-primary build scene under-resolves: thin units it would
+    // drop, and binary-aligned beds whose caps would float (inter-unit gap). SHARED-path only.
+    refine_shared_contacts(&mut tree, build_scene, &cfg);
     balance(&mut tree, build_scene, &cfg);
 
     scenes
@@ -1145,6 +1200,39 @@ pub fn octree_dual_contour_shared(
         .map(|s| {
             resample_leaves(&mut tree, s);
             contour_on_tree(&mut tree, s, &cfg)
+        })
+        .collect()
+}
+
+/// Like [`octree_dual_contour_shared`] but also returns, per scene, the per-triangle `contact_face`
+/// tag (see [`contour_on_tree_tagged`]) — so the caller can tell each CLOSED solid's contact faces
+/// (primary field) from its cap faces (box / fault plane / vein masker). Always contours as a closed
+/// solid (the tag is meaningful only with caps present); `cfg.cap` is ignored for the strip. Used by
+/// the corefined cross-cut SOLID path to locate the wall-cap faces it replaces with the shared seam.
+pub fn octree_dual_contour_shared_tagged(
+    build_scene: &Scene,
+    scenes: &[&Scene],
+    min: [f64; 3],
+    size: f64,
+    cfg: OctreeConfig,
+) -> Vec<(Mesh, Vec<bool>)> {
+    let mut tree = Octree {
+        nodes: Vec::new(),
+        bounds: Vec::new(),
+        root: 0,
+    };
+    tree.root = build(&mut tree, build_scene, min, size, 0, &cfg);
+    refine_double_crossed(&mut tree, build_scene, &cfg);
+    // Force-refine contacts the body-primary build scene under-resolves: thin units it would
+    // drop, and binary-aligned beds whose caps would float (inter-unit gap). SHARED-path only.
+    refine_shared_contacts(&mut tree, build_scene, &cfg);
+    balance(&mut tree, build_scene, &cfg);
+
+    scenes
+        .iter()
+        .map(|s| {
+            resample_leaves(&mut tree, s);
+            contour_on_tree_tagged(&mut tree, s)
         })
         .collect()
 }
@@ -1764,6 +1852,45 @@ fn refine_double_crossed(tree: &mut Octree, scene: &Scene, cfg: &OctreeConfig) {
         for (id, d) in to_split {
             // `id` is still a leaf (we only split leaves and split_leaf replaces in
             // place; new children are appended, not renumbering `id`).
+            if matches!(tree.nodes[id], Node::Leaf(_)) {
+                split_leaf(tree, scene, id, d, cfg);
+            }
+        }
+    }
+}
+
+/// Subdivide, to a fixpoint, every leaf below `max_depth` that
+/// [`Scene::cell_double_surface`] flags — a thin rock unit the body-primary build scene
+/// would otherwise drop (the "teal" block). The SHARED multi-scene companion to
+/// [`refine_double_crossed`]: the shared build scene's primary is the body field, which
+/// does not cross out where a cut rock unit's beds do, so `build`'s body-driven
+/// `is_surface` never refines that region and a thin unit there is dropped. Self-limiting —
+/// two surfaces stop sharing a cell once it is finer than their separation — so it refines
+/// just the near-seam / thin-slab cells, NOT a global floor, capped at `max_depth`. (The
+/// inter-unit bed GAP is closed separately, by the bed-cap projection in `stack.rs`, which
+/// is robust to whatever depth this reaches.)
+fn refine_shared_contacts(tree: &mut Octree, scene: &Scene, cfg: &OctreeConfig) {
+    loop {
+        let mut depths: std::collections::HashMap<NodeId, u32> =
+            std::collections::HashMap::new();
+        collect_leaf_depths(tree, tree.root, 0, &mut depths);
+
+        let mut to_split: Vec<(NodeId, u32)> = Vec::new();
+        for (&id, &d) in &depths {
+            if d >= cfg.max_depth {
+                continue;
+            }
+            let (min, size) = tree.bounds[id];
+            if scene.cell_double_surface(min, size) {
+                to_split.push((id, d));
+            }
+        }
+        if to_split.is_empty() {
+            break;
+        }
+        // Stable order so the arena indices we split are deterministic.
+        to_split.sort_unstable();
+        for (id, d) in to_split {
             if matches!(tree.nodes[id], Node::Leaf(_)) {
                 split_leaf(tree, scene, id, d, cfg);
             }
@@ -2706,6 +2833,34 @@ mod tests {
 
         check(0.7, "steep");
         check(0.08, "low-angle");
+    }
+
+    /// (b) STAGE 2 — `octree_dual_contour_shared_tagged` returns the SAME closed-solid mesh as
+    /// `octree_dual_contour_shared` (cap=true), plus a per-triangle `contact_face` tag aligned 1:1
+    /// with the triangles; and the open-sheet (cap=false) mesh equals exactly the tag's contact
+    /// faces. Guards the Stage-2 refactor as byte-identical for existing callers.
+    #[test]
+    fn shared_tagged_matches_untagged() {
+        let (m_primary, iso_p) = dipping_plane(600.0, 0.05, 0.0);
+        let (m_erosion, iso_e) = dipping_plane(600.0, -0.5, 0.0);
+        let box_b = AxisBox::new([0.0, 0.0, 0.0], 1000.0);
+        let erosion = ContactSurface::new(&m_erosion, iso_e);
+        let scene = Scene::new(&m_primary, iso_p, vec![&box_b, &erosion]);
+        let (min, size) = ([0.0, 0.0, 0.0], 1000.0);
+        let cfg = OctreeConfig { max_depth: 5, min_depth: 3, qef_threshold: 1e-6, cap: true };
+
+        // cap=true: tagged closed-solid mesh is byte-identical to untagged, tag is 1:1 with tris.
+        let solid = octree_dual_contour_shared(&scene, &[&scene], min, size, cfg);
+        let tagged = octree_dual_contour_shared_tagged(&scene, &[&scene], min, size, cfg);
+        assert_eq!(solid[0].indices, tagged[0].0.indices, "tagged closed-solid mesh diverged");
+        assert_eq!(solid[0].positions, tagged[0].0.positions, "tagged positions diverged");
+        assert_eq!(tagged[0].1.len() * 3, tagged[0].0.indices.len(), "tag not 1:1 with triangles");
+
+        // cap=false open sheet == the tagged closed solid's contact faces.
+        let cfg_open = OctreeConfig { cap: false, ..cfg };
+        let sheet = octree_dual_contour_shared(&scene, &[&scene], min, size, cfg_open);
+        let contact_tris = tagged[0].1.iter().filter(|&&c| c).count();
+        assert_eq!(sheet[0].indices.len(), contact_tris * 3, "open sheet != tagged contact faces");
     }
 
     /// Test alias for the public [`ContactHalfSpace`]: `inside` is below

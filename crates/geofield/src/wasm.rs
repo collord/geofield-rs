@@ -221,6 +221,51 @@ impl WasmTaggedMesh {
     }
 }
 
+/// A closed SOLID tagged with the `(series, block, unit)` it belongs to — the return shape of the
+/// COREFINED cross-cut solid meshing ([`WasmStack::mesh_cross_cut_solids_corefined_octree`]). The
+/// cross-cutting body's interior solid is tagged at its series with `block = 0, unit = 0`; each cut
+/// rock unit carries its own `(series, block, unit)`, so the worker can SKIP re-meshing those units
+/// on the per-series path. Empty Vec means the corefined path declined (pathological wall) and the
+/// worker should fall back to the independent path.
+#[wasm_bindgen]
+pub struct WasmTaggedSolid {
+    series: usize,
+    block: usize,
+    unit: usize,
+    positions: Vec<f32>,
+    normals: Vec<f32>,
+    indices: Vec<u32>,
+}
+
+#[wasm_bindgen]
+impl WasmTaggedSolid {
+    #[wasm_bindgen(getter)]
+    pub fn series(&self) -> usize {
+        self.series
+    }
+    #[wasm_bindgen(getter)]
+    pub fn block(&self) -> usize {
+        self.block
+    }
+    #[wasm_bindgen(getter)]
+    pub fn unit(&self) -> usize {
+        self.unit
+    }
+    pub fn positions(&self) -> Vec<f32> {
+        self.positions.clone()
+    }
+    pub fn normals(&self) -> Vec<f32> {
+        self.normals.clone()
+    }
+    pub fn indices(&self) -> Vec<u32> {
+        self.indices.clone()
+    }
+    #[wasm_bindgen(getter)]
+    pub fn triangle_count(&self) -> usize {
+        self.indices.len() / 3
+    }
+}
+
 /// A fitted model exposed to JS. Wraps a [`RemoteModel`] handle into the kernel module.
 #[wasm_bindgen]
 pub struct WasmModel {
@@ -978,6 +1023,84 @@ impl WasmStack {
             .mesh_cross_cut_solid(series, [min_x, min_y, min_z], size, [ext_x, ext_y, ext_z], cfg)
             .map(Into::into)
             .unwrap_or_else(EMPTY_MESH)
+    }
+
+    /// SHARED-TREE cross-cut SOLID meshing (Strategy A, `docs/volume_mesh_seam.md`): the body's
+    /// interior solid + every rock UNIT solid it cuts, co-contoured on ONE octree so they share the
+    /// wall vertex-for-vertex (REAL fusion, no daylight). Returns the body (tagged unit 0) + the cut
+    /// rock units tagged `(series, block, unit)`; the worker emits all and SKIPS re-meshing those
+    /// units on the per-series path. Empty for a stratigraphic series / topography / out-of-range /
+    /// wall-less body. This is the `Snap` (per-cell crease) variant.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mesh_cross_cut_solids_shared_octree(
+        &self,
+        series: usize,
+        min_x: f64,
+        min_y: f64,
+        min_z: f64,
+        size: f64,
+        ext_x: f64,
+        ext_y: f64,
+        ext_z: f64,
+        max_depth: u32,
+        min_depth: u32,
+        qef_threshold: f64,
+    ) -> Vec<WasmTaggedSolid> {
+        self.shared_solids(series, min_x, min_y, min_z, size, ext_x, ext_y, ext_z, max_depth, min_depth, qef_threshold, crate::stack::SeamMode::Snap)
+    }
+
+    /// Same as [`Self::mesh_cross_cut_solids_shared_octree`] but with the A.2 (`docs/09`) deterministic
+    /// crease-ring projection: the wall∩bed junction is SMOOTH (the analytic intersection curve)
+    /// instead of a per-cell staircase, with NO `clip` (so it's wasm-deterministic and keeps the
+    /// shared-tree fusion). SEPARATE no-flag method (the trailing-flag-arg ABI desync, see the
+    /// contact path); the worker picks one by the "clip seam" checkbox.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mesh_cross_cut_solids_shared_clip_octree(
+        &self,
+        series: usize,
+        min_x: f64,
+        min_y: f64,
+        min_z: f64,
+        size: f64,
+        ext_x: f64,
+        ext_y: f64,
+        ext_z: f64,
+        max_depth: u32,
+        min_depth: u32,
+        qef_threshold: f64,
+    ) -> Vec<WasmTaggedSolid> {
+        self.shared_solids(series, min_x, min_y, min_z, size, ext_x, ext_y, ext_z, max_depth, min_depth, qef_threshold, crate::stack::SeamMode::Clip)
+    }
+
+    /// Shared body of the two `mesh_cross_cut_solids_shared*` bindings. Not exported.
+    #[allow(clippy::too_many_arguments)]
+    fn shared_solids(
+        &self,
+        series: usize,
+        min_x: f64,
+        min_y: f64,
+        min_z: f64,
+        size: f64,
+        ext_x: f64,
+        ext_y: f64,
+        ext_z: f64,
+        max_depth: u32,
+        min_depth: u32,
+        qef_threshold: f64,
+        seam: crate::stack::SeamMode,
+    ) -> Vec<WasmTaggedSolid> {
+        let cfg = octree_cfg(max_depth, min_depth, qef_threshold, true);
+        let Some((body, rocks)) = self.inner.mesh_cross_cut_solids_shared(
+            series, [min_x, min_y, min_z], size, [ext_x, ext_y, ext_z], cfg, seam,
+        ) else {
+            return Vec::new();
+        };
+        let mut out: Vec<WasmTaggedSolid> = Vec::with_capacity(1 + rocks.len());
+        out.push(WasmTaggedSolid { series, block: 0, unit: 0, positions: body.positions, normals: body.normals, indices: body.indices });
+        for (j, b, u, m) in rocks {
+            out.push(WasmTaggedSolid { series: j, block: b, unit: u, positions: m.positions, normals: m.normals, indices: m.indices });
+        }
+        out
     }
 
     /// Number of lithology UNIT solids in `block` of `series` (`interfaces + 1`; 0 if out

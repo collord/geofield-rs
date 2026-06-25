@@ -180,19 +180,51 @@ function collectSolids(
   extent: [number, number, number, number, number, number],
   depth: number,
   assignment: Record<string, string>,
+  seamClip: boolean,
 ): SurfacePayload[] {
   const [x0, x1, y0, y1, z0, z1] = extent;
   const size = Math.max(x1 - x0, y1 - y0, z1 - z0);
   const minDepth = Math.min(2, depth);
   const out: SurfacePayload[] = [];
+  // (series,block,unit) rock solids already emitted by a cross-cut body's SHARED-TREE meshing — the
+  // per-series loop skips these so they aren't re-meshed independently (the shared mesh fuses the
+  // body's wall; the independent one would staircase + show daylight).
+  const sharedUnits = new Set<string>();
 
   for (let si = 0; si < stack.series_count; si++) {
     // Topography contributes no rock unit (Air above) — skip it (§5.2).
     if (series[si]?.topography) continue;
-    // A cross-cutting body (vein/intrusion) meshes its closed INTERIOR solid (its namesake
-    // lithology), tagged at unit index 0 (the body's interior — matches the inferred-litho
-    // auto-assignment in projectOps::syncInferredLithologies).
+    // A cross-cutting body (vein/intrusion): co-contour its interior solid AND the rock units it cuts
+    // on ONE shared tree so they fuse the wall vertex-for-vertex (no daylight). With "clip seam" ON
+    // (A.2, docs/09), the wall∩bed crease ring is projected onto the analytic intersection so the
+    // flat-bed-meets-curved-vein junction is SMOOTH (no clip → wasm-deterministic). The two no-flag
+    // bindings avoid the trailing-flag ABI desync; the worker picks one by the checkbox. An EMPTY
+    // result (wall-less body) falls back to the independent interior solid.
     if (series[si]?.crossCut) {
+      const tagged = seamClip
+        ? stack.mesh_cross_cut_solids_shared_clip_octree(si, x0, y0, z0, size, x1, y1, z1, depth, minDepth, QEF_EPS)
+        : stack.mesh_cross_cut_solids_shared_octree(si, x0, y0, z0, size, x1, y1, z1, depth, minDepth, QEF_EPS);
+      if (tagged.length > 0) {
+        for (const tm of tagged) {
+          if (tm.triangle_count > 0) {
+            out.push({
+              series: tm.series,
+              block: tm.block,
+              interface: tm.unit,
+              unit: tm.unit,
+              lithologyId: assignment[`${tm.series}:${tm.unit}`],
+              positions: tm.positions(),
+              normals: tm.normals(),
+              indices: tm.indices(),
+            });
+          }
+          sharedUnits.add(`${tm.series}:${tm.block}:${tm.unit}`);
+          tm.free();
+        }
+        continue;
+      }
+      // Fallback (corefined declined): the body's independent interior solid (today's path); the cut
+      // rock units fall through to the per-series loop below, meshed independently (welded).
       const m = stack.mesh_cross_cut_solid_octree(si, x0, y0, z0, size, x1, y1, z1, depth, minDepth, QEF_EPS);
       if (m.triangle_count > 0) {
         out.push({
@@ -213,6 +245,8 @@ function collectSolids(
     for (let b = 0; b < blocks; b++) {
       const units = stack.present_unit_count(si, b);
       for (let u = 0; u < units; u++) {
+        // Skip a unit already meshed (watertight, smooth) by a cross-cut body's corefined path.
+        if (sharedUnits.has(`${si}:${b}:${u}`)) continue;
         const m = stack.mesh_series_block_unit_solid(
           si, b, u, x0, y0, z0, size, x1, y1, z1, depth, minDepth, QEF_EPS,
         );
@@ -245,7 +279,7 @@ async function run(cmd: RunCommand) {
   const solid = cmd.renderMode === "solid";
   emit({ type: "status", phase: solid ? "meshing solids…" : "meshing surfaces…" });
   const surfaces = solid
-    ? collectSolids(stack, cmd.series, cmd.extent, cmd.maxDepth, cmd.assignment ?? {})
+    ? collectSolids(stack, cmd.series, cmd.extent, cmd.maxDepth, cmd.assignment ?? {}, cmd.seamClip ?? true)
     : collectSurfaces(stack, cmd.series, cmd.extent, cmd.maxDepth, cmd.weldTJunctions ?? true, cmd.seamClip ?? true);
 
   // The hierarchy round-trip payload (declared state + derived view) — parsed from the

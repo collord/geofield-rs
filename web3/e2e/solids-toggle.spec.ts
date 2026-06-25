@@ -8,11 +8,15 @@ import { test, expect } from "@playwright/test";
 /** Wait until the __surfaces test hook reflects solid payloads (each carries a `unit`). */
 async function waitForSolids(page: import("@playwright/test").Page) {
   await expect
-    .poll(() =>
-      page.evaluate(() => {
-        const s = (window as { __surfaces?: { unit?: number }[] }).__surfaces ?? [];
-        return s.length > 0 && s.every((x) => x.unit !== undefined && x.unit !== null);
-      }),
+    .poll(
+      () =>
+        page.evaluate(() => {
+          const s = (window as { __surfaces?: { unit?: number }[] }).__surfaces ?? [];
+          return s.length > 0 && s.every((x) => x.unit !== undefined && x.unit !== null);
+        }),
+      // The corefined cross-cut solid path (smooth body↔rock seam) is heavier than the independent
+      // path — a vein re-mesh can take several seconds in wasm — so allow more than the 5 s default.
+      { timeout: 25_000 },
     )
     .toBe(true);
 }
