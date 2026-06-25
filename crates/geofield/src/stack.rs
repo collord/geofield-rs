@@ -1687,8 +1687,12 @@ impl<M: SeriesModel + BlockModel> Stack<M> {
                     body_beds.push((rb_field[k].as_ref(), iso));
                 }
             }
+            // Snap the wall onto the analytic vein surface FIRST (de-staircase the oblique wall and
+            // collapse the body↔rock offset), THEN refine the wall∩bed ring onto the exact curve.
+            project_vein_walls(&mut body_solid, body_field.as_ref(), &body_isos, cell);
             project_crease_ring(&mut body_solid, body_field.as_ref(), &body_isos, &body_beds, cell);
         }
+        clamp_mesh_to_box(&mut body_solid, min, ext_max);
         let mut rock_solids: Vec<(usize, usize, usize, Mesh)> = Vec::with_capacity(unit_keys.len());
         for (&(k, u), mut m) in unit_keys.iter().zip(it) {
             let mut beds: Vec<(&dyn ScalarField, f64)> = Vec::new();
@@ -1700,8 +1704,16 @@ impl<M: SeriesModel + BlockModel> Stack<M> {
             // seam the Clip toggle controls. Move-only, so the wall∩bed crease is re-projected next.
             project_bed_caps(&mut m, body_field.as_ref(), &body_isos, &beds, cell);
             if seam == SeamMode::Clip {
+                // Wall onto the analytic vein surface (de-staircase + collapse the body↔rock offset),
+                // then the wall∩bed ring onto the exact curve.
+                project_vein_walls(&mut m, body_field.as_ref(), &body_isos, cell);
                 project_crease_ring(&mut m, body_field.as_ref(), &body_isos, &beds, cell);
             }
+            // A projection moves a vertex along a field gradient; the under-constrained vein field has
+            // a small out-of-plane (y) gradient near the data-free domain walls, so it can shove a
+            // wall/crease vertex just PAST the box. Clamp back — the box is the hard meshing bound and a
+            // boundary vertex belongs ON the wall (its depth from the projection is kept).
+            clamp_mesh_to_box(&mut m, min, ext_max);
             rock_solids.push((rb_j[k], rb_b[k], u, m));
         }
         Some((body_solid, rock_solids))
@@ -2016,12 +2028,6 @@ fn project_crease_ring(
         }
         let p0 = [mesh.positions[3 * vi] as f64, mesh.positions[3 * vi + 1] as f64, mesh.positions[3 * vi + 2] as f64];
         let mut p = p0;
-        // the vertex IS on a wall face → on a wall iso; pick the nearest.
-        let vf = vein_field.scalar_field(p);
-        let wall_iso = match wall_isos.iter().copied().min_by(|a, b| (vf - a).abs().total_cmp(&(vf - b).abs())) {
-            Some(w) => w,
-            None => continue,
-        };
         // nearest bed iso, gated by distance — only wall verts AT a bed level are crease verts.
         let bed = beds
             .iter()
@@ -2037,30 +2043,39 @@ fn project_crease_ring(
         if bd > tol {
             continue; // wall vertex not at a bed level → not on the crease
         }
-        // Newton: minimal-norm step onto the 1-D curve {vein=wall_iso, bed=bed_iso}.
-        // dp = -Jᵀ(JJᵀ)⁻¹ r with J = [∇vein; ∇bed] (2×3), r = [vein-wall_iso, bed-bed_iso].
-        for _ in 0..6 {
-            let r = [vein_field.scalar_field(p) - wall_iso, bf.scalar_field(p) - bed_iso];
-            let gv = vein_field.scalar_field_gradient(p);
-            let gb = bf.scalar_field_gradient(p);
-            let (a, b, c) = (dot(gv, gv), dot(gv, gb), dot(gb, gb));
-            let det = a * c - b * b;
-            if det <= 1e-12 * a * c {
-                break; // gradients near-parallel → ill-conditioned crease, leave it
-            }
-            let (m0, m1) = ((c * r[0] - b * r[1]) / det, (-b * r[0] + a * r[1]) / det);
-            let dp = [-(gv[0] * m0 + gb[0] * m1), -(gv[1] * m0 + gb[1] * m1), -(gv[2] * m0 + gb[2] * m1)];
-            p = [p[0] + dp[0], p[1] + dp[1], p[2] + dp[2]];
-            if dot(dp, dp) < 1e-14 {
-                break;
-            }
+        let vf0 = vein_field.scalar_field(p);
+        let wall_iso = *wall_isos
+            .iter()
+            .min_by(|a, b| (vf0 - **a).abs().total_cmp(&(vf0 - **b).abs()))
+            .unwrap();
+        // Land the vertex on the EXACT wall∩bed curve by ALTERNATING single-constraint projections —
+        // onto the bed (`bed == bed_iso`), then onto the wall (`vein == wall_iso`). Each step is a
+        // stable Newton; for the transversal wall/bed the alternation converges to their intersection
+        // even where the simultaneous 2-constraint Newton STALLED on the wavy under-constrained dipping
+        // field (which left a vertex spiking above the bed — the spike). Unlike a bed-only projection
+        // it keeps the vertex ON the oblique wall too, so the band edge doesn't drift laterally at the
+        // joint where the vein crosses a bed.
+        let project = |p: [f64; 3], f: &dyn ScalarField, iso: f64| -> [f64; 3] {
+            let r = f.scalar_field(p) - iso;
+            let g = f.scalar_field_gradient(p);
+            let g2 = dot(g, g).max(1e-12);
+            let s = r / g2;
+            [p[0] - s * g[0], p[1] - s * g[1], p[2] - s * g[2]]
+        };
+        for _ in 0..8 {
+            p = project(p, bf, bed_iso);
+            p = project(p, vein_field, wall_iso);
         }
-        // Safety net behind the structural (wall-face) gate: a legitimately-selected crease vertex is
-        // at most ~a cell-and-a-half off the curve (the octree staircase amplitude). A larger step
-        // means a mis-selected / Newton-diverged vertex (e.g. the old cap-collapse, disp > 1.5 cell) —
-        // LEAVE it in place rather than teleport it (which tore the cap into a cone).
+        // Keep only if it landed on BOTH surfaces (within a cell); a generous absolute cap backstops a
+        // wild step. The structural wall-face selection (not a tight distance cap) is what prevents the
+        // cap-collapse cone, so this cap can be loose enough for a steep wall's larger staircase.
         let disp = mag([p[0] - p0[0], p[1] - p0[1], p[2] - p0[2]]);
-        if disp > 1.5 * tol {
+        let gvn = mag(vein_field.scalar_field_gradient(p)).max(1e-12);
+        let gbn = mag(bf.scalar_field_gradient(p)).max(1e-12);
+        if disp > 6.0 * tol
+            || (vein_field.scalar_field(p) - wall_iso).abs() / gvn > tol
+            || (bf.scalar_field(p) - bed_iso).abs() / gbn > tol
+        {
             continue;
         }
         mesh.positions[3 * vi] = p[0] as f32;
@@ -2179,6 +2194,99 @@ fn project_bed_caps(
             if dot(dp, dp) < 1e-14 {
                 break;
             }
+        }
+        mesh.positions[3 * vi] = p[0] as f32;
+        mesh.positions[3 * vi + 1] = p[1] as f32;
+        mesh.positions[3 * vi + 2] = p[2] as f32;
+    }
+}
+
+/// Clamp every vertex of `mesh` into the domain box `[lo, hi]`. The post-contour projections move
+/// vertices along a field gradient; the under-constrained vein field has a small out-of-plane
+/// gradient near the data-free domain walls, which can push a wall/crease vertex just outside the
+/// box. A no-op for interior and correctly-placed boundary verts; deterministic (shared body/rock
+/// boundary verts clamp identically → stay fused) and connectivity-preserving (watertight).
+fn clamp_mesh_to_box(mesh: &mut Mesh, lo: [f64; 3], hi: [f64; 3]) {
+    for v in mesh.positions.chunks_exact_mut(3) {
+        v[0] = (v[0] as f64).clamp(lo[0], hi[0]) as f32;
+        v[1] = (v[1] as f64).clamp(lo[1], hi[1]) as f32;
+        v[2] = (v[2] as f64).clamp(lo[2], hi[2]) as f32;
+    }
+}
+
+/// Snap a Strategy-A solid's vein-WALL verts onto the analytic wall surface `vein_field == iso` (a
+/// band edge). For a CURVED/dipping wall the body and each rock unit contour it INDEPENDENTLY (body =
+/// vein primary; rock = vein `SlabComplement` masker), and their dual vertices land sub-cell apart →
+/// the wall interpenetrates (body↔rock z-fight) and staircases per cell. Projecting every wall vertex
+/// (of both solids) onto the SAME analytic surface makes the two walls COPLANAR — collapsing the
+/// offset and the staircase. Move-only (connectivity untouched → watertight + fusion preserved) and a
+/// pure function of position + the vein field → native==wasm deterministic, like [`project_crease_ring`]
+/// /[`project_bed_caps`]. For a VERTICAL wall the QEF is already exact, so this is a near-no-op.
+///
+/// Selection mirrors the crease's: a wall vertex is on a WALL FACE — normal ∥ ∇vein AND centroid
+/// within `tol` of a wall iso — which excludes the horizontal bed caps (normal ∥ ∇bed) and the box
+/// faces (not at a wall iso). Each selected vertex Newton-projects onto its NEAREST wall iso; the
+/// 1.5·`tol` guard leaves a larger (mis-selected / diverged) step in place. The wall∩bed RING is
+/// re-projected onto the exact 1-D curve afterwards by [`project_crease_ring`].
+fn project_vein_walls(mesh: &mut Mesh, vein_field: &dyn ScalarField, wall_isos: &[f64], tol: f64) {
+    if wall_isos.is_empty() {
+        return;
+    }
+    let dot = |a: [f64; 3], b: [f64; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+    let mag = |v: [f64; 3]| dot(v, v).sqrt();
+    let nverts = mesh.vertex_count();
+    let pos = |i: u32| [mesh.positions[i as usize * 3] as f64, mesh.positions[i as usize * 3 + 1] as f64, mesh.positions[i as usize * 3 + 2] as f64];
+
+    let mut on_wall = vec![false; nverts];
+    for t in mesh.indices.chunks_exact(3) {
+        let (a, b, c) = (pos(t[0]), pos(t[1]), pos(t[2]));
+        let e1 = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+        let e2 = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+        let nrm = [e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]];
+        let nm = mag(nrm).max(1e-12);
+        let n = [nrm[0] / nm, nrm[1] / nm, nrm[2] / nm];
+        let ctr = [(a[0] + b[0] + c[0]) / 3.0, (a[1] + b[1] + c[1]) / 3.0, (a[2] + b[2] + c[2]) / 3.0];
+        let vg = vein_field.scalar_field_gradient(ctr);
+        let vgm = mag(vg).max(1e-12);
+        let vf = vein_field.scalar_field(ctr);
+        if dot(n, [vg[0] / vgm, vg[1] / vgm, vg[2] / vgm]).abs() > 0.7
+            && wall_isos.iter().any(|&w| (vf - w).abs() / vgm <= tol)
+        {
+            for &v in t {
+                on_wall[v as usize] = true;
+            }
+        }
+    }
+
+    for vi in 0..nverts {
+        if !on_wall[vi] {
+            continue;
+        }
+        let p0 = [mesh.positions[3 * vi] as f64, mesh.positions[3 * vi + 1] as f64, mesh.positions[3 * vi + 2] as f64];
+        let vf0 = vein_field.scalar_field(p0);
+        let g0 = mag(vein_field.scalar_field_gradient(p0)).max(1e-12);
+        let iso = *wall_isos.iter().min_by(|&&a, &&b| (vf0 - a).abs().total_cmp(&(vf0 - b).abs())).unwrap();
+        if (vf0 - iso).abs() / g0 > tol {
+            continue; // not actually within a cell of a wall iso
+        }
+        // Newton onto `vein_field == iso` (single constraint): dp = -(field-iso)/|∇|² · ∇.
+        let mut p = p0;
+        for _ in 0..6 {
+            let r = vein_field.scalar_field(p) - iso;
+            let g = vein_field.scalar_field_gradient(p);
+            let g2 = dot(g, g);
+            if g2 < 1e-12 {
+                break;
+            }
+            let s = r / g2;
+            let dp = [-s * g[0], -s * g[1], -s * g[2]];
+            p = [p[0] + dp[0], p[1] + dp[1], p[2] + dp[2]];
+            if dot(dp, dp) < 1e-14 {
+                break;
+            }
+        }
+        if mag([p[0] - p0[0], p[1] - p0[1], p[2] - p0[2]]) > 1.5 * tol {
+            continue;
         }
         mesh.positions[3 * vi] = p[0] as f32;
         mesh.positions[3 * vi + 1] = p[1] as f32;
