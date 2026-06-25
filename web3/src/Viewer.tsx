@@ -13,6 +13,15 @@ const SERIES_COLORS = [0x4f83cc, 0xcc7a4f, 0x6aa84f, 0x9b59b6, 0xc0392b];
 /** Data bounding box `[x0, x1, y0, y1, z0, z1]`. */
 export type Extent = [number, number, number, number, number, number];
 
+/** Serializable camera/orbit state — exported with the project so a view round-trips
+ *  (and so an exact viewpoint can be shared for repro). */
+export interface ViewState {
+  camera: [number, number, number]; // camera world position
+  target: [number, number, number]; // orbit pivot
+  up: [number, number, number]; // camera up
+  fov: number; // vertical FOV (deg)
+}
+
 const AXIS_COLOR = { x: 0xd1453b, y: 0x3b8c3b, z: 0x3b5bd1 } as const;
 
 /** A billboard text label (canvas texture on a Sprite) placed at `pos`. */
@@ -88,6 +97,12 @@ export function Viewer(props: {
   wireframe?: boolean;
   /** Debug: surface keys (see `surfaceKey`) to HIDE. Absent/empty ⇒ show all. */
   hiddenKeys?: Set<string>;
+  /** Filled by the Viewer with a `getView()` so the parent can capture the current
+   *  camera on Export. */
+  viewApiRef?: { current: { getView: () => ViewState } | null };
+  /** When set (a NEW object), the Viewer applies this camera state — used on Import to
+   *  restore a saved view. Applied after the extent re-center so it wins. */
+  importedView?: ViewState;
 }) {
   const mountRef = useRef<HTMLDivElement | null>(null);
   const stateRef = useRef<{
@@ -126,6 +141,16 @@ export function Viewer(props: {
     controls.update();
 
     stateRef.current = { renderer, scene, camera, controls, group, axes: null };
+    if (props.viewApiRef) {
+      props.viewApiRef.current = {
+        getView: () => ({
+          camera: camera.position.toArray() as [number, number, number],
+          target: controls.target.toArray() as [number, number, number],
+          up: camera.up.toArray() as [number, number, number],
+          fov: camera.fov,
+        }),
+      };
+    }
     let raf = 0;
     const tick = () => {
       controls.update(); // damping only; no scene rotation
@@ -158,6 +183,30 @@ export function Viewer(props: {
     st.controls.target.set((x0 + x1) / 2, (y0 + y1) / 2, (z0 + z1) / 2);
     st.controls.update();
   }, [props.extent]);
+
+  // Apply an imported view (declared AFTER the extent re-center so it overrides the
+  // auto-centered target). Fires whenever `importedView` is a new object (each Import).
+  useEffect(() => {
+    const st = stateRef.current;
+    const v = props.importedView;
+    if (!st || !v) return;
+    // Toggle damping OFF around the set so OrbitControls FLUSHES any residual orbit delta
+    // (an un-settled drag would otherwise keep rotating the camera off the imported angle —
+    // visible headless, where rAF/damping barely advances). First update() zeros the delta;
+    // then we set the pose; the second update() syncs the internal spherical to it.
+    const damp = st.controls.enableDamping;
+    st.controls.enableDamping = false;
+    st.controls.update();
+    st.camera.position.set(...v.camera);
+    st.camera.up.set(...v.up);
+    if (v.fov) {
+      st.camera.fov = v.fov;
+      st.camera.updateProjectionMatrix();
+    }
+    st.controls.target.set(...v.target);
+    st.controls.update();
+    st.controls.enableDamping = damp;
+  }, [props.importedView]);
 
   // Rebuild meshes whenever the surfaces change.
   useEffect(() => {

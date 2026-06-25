@@ -12,7 +12,7 @@ import { createRoot } from "react-dom/client";
 import { HierarchyPanel, LithologyCatalog, VolumeVisibility, applyCoreUpdate, emptyState, type HierarchyState } from "./HierarchyPanel";
 import type { RelationDto } from "./HierarchyPanel/dto";
 import "./HierarchyPanel/hierarchy.css";
-import { Viewer } from "./Viewer";
+import { Viewer, type ViewState } from "./Viewer";
 import { exportObj } from "./exportObj";
 import { TEMPLATES, templateById, blankProject } from "./scenarios";
 import {
@@ -68,6 +68,10 @@ function App() {
   // hatch. Toggling re-meshes (it changes geometry), so it re-runs the stack.
   const [seamClip, setSeamClip] = useState(true);
   const [hiddenKeys, setHiddenKeys] = useState<Set<string>>(new Set());
+  // Camera round-trip: the Viewer fills `viewApiRef` with a getter (read on Export);
+  // `importedView` (a new object per Import) is pushed back to re-apply a saved view.
+  const viewApiRef = useRef<{ getView: () => ViewState } | null>(null);
+  const [importedView, setImportedView] = useState<ViewState | undefined>(undefined);
   const [status, setStatus] = useState<string>("idle");
   const [addMenuOpen, setAddMenuOpen] = useState(false);
   // Which interface the data modal is editing: { elementId, interfaceId } | null.
@@ -245,14 +249,17 @@ function App() {
       __moveSurface?: () => void;
       __loadProject?: (p: Project) => void;
       __surfaces?: SurfacePayload[];
+      __getView?: () => ViewState | undefined;
     };
     w.__reorderContainers = onReorderContainers;
     w.__moveSurface = onMoveSurface;
     // Test hooks (harmless in the demo): inject a Project directly (skips the file picker)
     // and expose the rendered surfaces for geometric assertions. Used by the flipped-erosion
-    // QEF-spike regression spec (e2e/qef-spike.spec.ts).
+    // QEF-spike regression spec (e2e/qef-spike.spec.ts). `__getView` reads the current camera
+    // (so a viewpoint can be grabbed/asserted, and shared for repro).
     w.__loadProject = loadFreshProject;
     w.__surfaces = surfaces;
+    w.__getView = () => viewApiRef.current?.getView();
   });
 
   // --- project bar actions (US5) --------------------------------------------------------
@@ -268,7 +275,18 @@ function App() {
     setDirty(false);
     saveProject(p);
     lastApplied.current = p;
-    if (p.elements.length > 0 && validate(p).canApply) runStack(p);
+    // Restore a saved view (camera + render toggles) if present, so an imported scenario
+    // reproduces "what I was looking at" — Solids vs Surfaces, clip seam, edges, and angle.
+    // Pass mode/clip EXPLICITLY to runStack (state setters are async, would be stale).
+    const mode = p.view?.renderMode ?? renderMode;
+    const clip = p.view?.seamClip ?? seamClip;
+    if (p.view) {
+      setRenderMode(mode);
+      setSeamClip(clip);
+      if (p.view.edges !== undefined) setWireframe(p.view.edges);
+      setImportedView({ camera: p.view.camera, target: p.view.target, up: p.view.up, fov: p.view.fov });
+    }
+    if (p.elements.length > 0 && validate(p).canApply) runStack(p, undefined, mode, clip);
     else {
       setSurfaces([]);
       setState(emptyState());
@@ -281,11 +299,15 @@ function App() {
       const t = templateById(templateId);
       if (t) loadFreshProject(t.build());
     });
-  const onExport = () => exportProjectJson(project);
+  const onExport = () => {
+    const cam = viewApiRef.current?.getView();
+    const view = cam && { ...cam, renderMode, seamClip, edges: wireframe };
+    exportProjectJson(view ? { ...project, view } : project);
+  };
   const onImportFile = async (file: File) => {
     confirmIfDirty(async () => {
       try {
-        loadFreshProject(await importProjectJson(file));
+        loadFreshProject(await importProjectJson(file)); // restores the view (camera + toggles)
       } catch (err) {
         setStatus("import failed: " + (err instanceof Error ? err.message : String(err)));
       }
@@ -497,6 +519,8 @@ function App() {
           lithoColors={Object.fromEntries(catalogOf(project).lithologies.map((l) => [l.id, l.color]))}
           wireframe={wireframe}
           hiddenKeys={hiddenKeys}
+          viewApiRef={viewApiRef}
+          importedView={importedView}
         />
       </main>
 

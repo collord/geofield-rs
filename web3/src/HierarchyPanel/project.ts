@@ -121,6 +121,22 @@ export interface Project {
   /** The lithology catalog + per-unit assignment (feature 003 §4). Optional so older saved
    *  projects load; a fresh/loaded project without one gets the default catalog (US3). */
   catalog?: LithologyCatalog;
+  /** Optional saved VIEW state — captured on Export and re-applied on Import so a viewpoint
+   *  round-trips and an exact view can be shared for repro. UI-only (never sent to the
+   *  worker as geology). Covers the camera AND the render toggles, so "what I'm looking at"
+   *  (Solids vs Surfaces, clip seam, edges) reproduces, not just the angle. */
+  view?: {
+    camera: [number, number, number];
+    target: [number, number, number];
+    up: [number, number, number];
+    fov: number;
+    /** Render mode: "contact" = Surfaces, "solid" = Solids. */
+    renderMode?: "contact" | "solid";
+    /** The "clip seam" toggle (cross-cut seam closer). */
+    seamClip?: boolean;
+    /** The "edges" (wireframe) toggle. */
+    edges?: boolean;
+  };
 }
 
 /** Author-time validation (computed, never stored). DISTINCT from `CoreUpdate.derived.
