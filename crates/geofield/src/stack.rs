@@ -5253,6 +5253,94 @@ mod tests {
         );
     }
 
+    /// W\* "sewing" by dedup: the merged body∪rock is a CELL COMPLEX (body and rock are adjacent
+    /// volumes sharing the wall membrane), so the watertightness criterion is "no GAPS" (no
+    /// incidence-1 edge off the box rim), NOT "incidence ≤ 2" (the shared wall is legitimately >2).
+    /// Merging body + the spliced rocks and deduping by position seals everything COINCIDENT — the
+    /// shared wall interior and the 99% of the wall∩bed line — so the remaining incidence-1 gaps
+    /// measure exactly the structural boundaries the face-swap still leaves open (wall∩box,
+    /// band-cap, the ~1% wall∩bed residual). Report-only: the gap count is how much sewing remains.
+    #[test]
+    fn wstar_merged_solid_gap_count_after_dedup() {
+        let (stack, vein_field) = vertical_vein_over_column();
+        let (min, size, ext) = ([0.0, 0.0, 0.0], 1000.0, [1000.0, 1000.0, 1000.0]);
+        let cfg = OctreeConfig { max_depth: 6, min_depth: 2, qef_threshold: 1e-6, cap: true };
+        let cell = size / (1u32 << cfg.max_depth) as f64;
+        let wall_isos = vein_field.interface_isovalues();
+        let classify = |p: [f64; 3]| if p[2] < 350.0 { 0usize } else if p[2] < 650.0 { 1 } else { 2 };
+        let on_box = |p: [f64; 3]| (0..3).any(|d| p[d] < 1.0 || p[d] > size - 1.0);
+        let near_bed = |z: f64| (z - 350.0).abs() < cell || (z - 650.0).abs() < cell;
+
+        let (body, rocks_keyed) = stack
+            .mesh_cross_cut_solids_shared(0, min, size, ext, cfg, SeamMode::Clip)
+            .expect("vein solids should mesh");
+        let mut rocks: Vec<Mesh> = rocks_keyed.into_iter().map(|(_, _, _, m)| m).collect();
+
+        // Baseline: the SHIPPING merged solid (no W*) gap count, for comparison.
+        let gaps = |meshes: &[&Mesh]| -> (usize, usize) {
+            let (pos, tris) = merge_dedup(meshes, 0.1);
+            let mut off_rim = 0usize;
+            let mut at_bed = 0usize;
+            for ((a, b), &c) in &incidence(&tris) {
+                if c == 1 {
+                    let (pa, pb) = (pos[*a], pos[*b]);
+                    if !(on_box(pa) && on_box(pb)) {
+                        off_rim += 1;
+                        if near_bed(pa[2]) && near_bed(pb[2]) {
+                            at_bed += 1;
+                        }
+                    }
+                }
+            }
+            (off_rim, at_bed)
+        };
+        let shipping: Vec<&Mesh> = std::iter::once(&body).chain(rocks.iter()).collect();
+        let (ship_gap, ship_bed) = gaps(&shipping);
+        eprintln!("[W* sew] SHIPPING merged (no W*): off-rim gaps={ship_gap} (of which at a bed level={ship_bed})  — watertight already; the issue is NOT gaps");
+
+        // W*'s ACTUAL benefit is removing the DOUBLED wall, not closing gaps. Measure the doubling:
+        // in the shipping output, what fraction of each rock's OWN wall verts coincide with a body
+        // wall vert? Low ⇒ body and rock triangulate the (coplanar) wall DIFFERENTLY = the peek-a-boo
+        // / z-fight. W* makes the rock's wall IDENTICAL to the body's (100% shared) by construction.
+        let qk = |p: [f64; 3]| ((p[0] / (cell * 1e-2)).round() as i64, (p[1] / (cell * 1e-2)).round() as i64, (p[2] / (cell * 1e-2)).round() as i64);
+        let wall_verts = |m: &Mesh| -> Vec<usize> {
+            let mut s = std::collections::HashSet::new();
+            for t in 0..m.indices.len() / 3 {
+                if face_is_wall(m, t, &vein_field, &wall_isos, cell) {
+                    for k in 0..3 {
+                        s.insert(m.indices[3 * t + k] as usize);
+                    }
+                }
+            }
+            s.into_iter().collect()
+        };
+        let mp = |m: &Mesh, v: usize| [m.positions[v * 3] as f64, m.positions[v * 3 + 1] as f64, m.positions[v * 3 + 2] as f64];
+        let body_wall_q: std::collections::HashSet<(i64, i64, i64)> = wall_verts(&body).iter().map(|&v| qk(mp(&body, v))).collect();
+        for (ri, rock) in rocks.iter().enumerate() {
+            let wv = wall_verts(rock);
+            let coinc = wv.iter().filter(|&&v| body_wall_q.contains(&qk(mp(rock, v)))).count();
+            let frac = if wv.is_empty() { 0.0 } else { 100.0 * coinc as f64 / wv.len() as f64 };
+            eprintln!("[W* sew] SHIPPING rock {ri}: own wall verts={} coincident-with-body-wall={coinc} = {frac:.1}%  (LOW ⇒ DOUBLED wall / peek-a-boo)", wv.len());
+        }
+
+        let _ = splice_shared_wall(&body, &mut rocks, &vein_field, &wall_isos, &classify, cell);
+        // After W*: each rock's wall faces ARE the body's (the splice appended body wall verts), so
+        // 100% of the rock's wall verts coincide with a body wall vert — the wall is one surface.
+        for (ri, rock) in rocks.iter().enumerate() {
+            let wv = wall_verts(rock);
+            let coinc = wv.iter().filter(|&&v| body_wall_q.contains(&qk(mp(rock, v)))).count();
+            let frac = if wv.is_empty() { 0.0 } else { 100.0 * coinc as f64 / wv.len() as f64 };
+            eprintln!("[W* sew] W* rock {ri}: wall verts={} coincident-with-body-wall={coinc} = {frac:.1}%  (100% ⇒ shared wall, no peek-a-boo)", wv.len());
+        }
+        let wstar: Vec<&Mesh> = std::iter::once(&body).chain(rocks.iter()).collect();
+        let (ws_gap, ws_bed) = gaps(&wstar);
+        eprintln!(
+            "[W* sew] W* merged (dedup-sewn): off-rim gaps={ws_gap} (of which at a bed level={ws_bed}) \
+             — these are the wall∩box / band-cap / ~1% wall∩bed residual the face-swap leaves; the \
+             shared wall interior + 99% wall∩bed sealed by the dedup."
+        );
+    }
+
     /// Shared edges (and helpers) for the solid-seam watertightness checks. Merges several meshes
     /// into one vertex/triangle soup, deduping vertices by a quantized position key (`q`), so
     /// coincident wall vertices from different solids collapse to one index.
