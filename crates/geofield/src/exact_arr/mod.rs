@@ -27,4 +27,9 @@
 mod scalar;
 mod tri_tri;
 
+// Layer-2 input-divergence robustness characterization (docs/12 §2.2). Test-only: it compares
+// original vs 1-ULP-perturbed inputs on one target, pinning where exactness is / isn't sufficient.
+#[cfg(test)]
+mod robustness;
+
 pub use tri_tri::{exact_tri_tri_segment, spike_digest, ExactSeg};

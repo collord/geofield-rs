@@ -17,13 +17,48 @@
 >   runnable via `npm run test:e2e:exact`; skips cleanly on the default build. The node/V8 run above is
 >   the executed proof; Playwright is its permanent form (browser and node share V8).
 >
-> **Still open in Stage 0 (next increments):** the lazy interval filter + rational-fallback-rate
-> benchmark (§3); the **Layer-2** perturbation test (1-ULP divergent inputs, §2.2) — the genuinely
-> hard determinism question, which points at Track B; the CGAL golden corpus (§4, sequenced last).
-> **Net:** the corefiner-internal determinism premise holds, exactly as §5 predicted — which re-points
-> the program's hard risk at Track B (cross-target-deterministic field eval at feature depth), not the
-> corefiner math. Do not touch `mesh_cross_cut_solids_*` until the full §5 gate (fallback rate + Layer 2)
-> closes.
+> ## Determinism root MEASURED END-TO-END (2026-06-26) — supersedes the Layer-2 framing below
+>
+> The determinism question was then settled by direct cross-target measurement at **every link**
+> (native x86-64 vs the real `wasm32-unknown-unknown` in V8), not argument:
+> - **The kriging field diverges ~1e-16 (~104 ULP) native↔wasm.** Isolated to the **fit solve**
+>   (faer/gemm): `assemble` (K,b) is 0 ULP across 16,003 entries; the eval matvec is 0 ULP given
+>   identical weights; a plain scalar-LU solve on the same K,b is 0 ULP. Mechanism is **SIMD
+>   reduction-order + fma fusion**, **conditioning-independent** (well-conditioned gives the same
+>   ~100 ULP) — *not* the condition number. The 2-point vein measured 0 ULP only because it is
+>   sub-threshold for faer's SIMD path.
+> - **Nothing downstream diverges.** The **octree contour** is **bit-identical** native↔wasm, and so is
+>   the **full `mesh_cross_cut_solids_shared` solid pipeline** (body + rock-unit solids, **both** seam
+>   modes incl. the `mesh_clip` corefiner) — measured by digest. `CONTACT_GRAZE_EPS` (1e-9 ≫ 1e-16)
+>   snaps the only sign-flippable corners (grazes); f32 vertex truncation (~6e-5 ULP) hides the generic
+>   ~1e-13 vertex divergence. So the ~1e-16 field divergence is **absorbed before any output**.
+> - **Net (measured):** the determinism cascade does **not reach any output** of the shipping kriging
+>   pipeline. **The determinism leg of the exact-corefiner justification is removed** — it stands or
+>   falls *only* on certified geometric exactness. `CONTACT_GRAZE_EPS` is **load-bearing** (the
+>   absorber); do not remove it without a deterministic field. Determinism is a **per-field** property
+>   established by measurement — the `atan2` imported-mesh winding path still diverges 1 ULP (untested
+>   through a contour) and has *not* earned it.
+> - **Corrections this supersedes:** the Layer-2 block below claimed "exact arithmetic makes the graze
+>   *detectable* (`sign==0`)" — **wrong**: a real graze yields a *certain nonzero* sign (the field eval
+>   essentially never returns exactly 0.0), so detecting a graze still needs a tolerance; exactness
+>   removes ambiguity from the *decision*, not the tolerance from the *classification*. And the "cheap
+>   determinism fix needed (deterministic solve, Track B)" framing is moot for the shipping pipeline:
+>   the scalar-solve fix *works* (0-ULP field, verified) but is **unnecessary** — the contour and full
+>   solid pipeline are already bit-identical. It would matter only for a *certified f64* pipeline, where
+>   the ~1e-13 (sub-nanometer, below any geological tolerance) divergence would re-appear.
+>
+> **Still open in Stage 0 (next increments, if the program proceeds):** the lazy interval filter +
+> rational-fallback-rate benchmark (§3); the CGAL golden corpus (§4). But the go/no-go's **determinism
+> input is now settled by measurement**: it does not justify the exact corefiner.
+>
+> ---
+>
+> *(Superseded — kept for the reasoning trail.)* **Layer-2 (input-divergence robustness) CHARACTERIZED**
+> (`exact_arr::robustness`, native-only): generic position → graceful (1-ULP input → 0.0 output drift,
+> same combinatorics); grid-aligned graze → a modelled 1-ULP input flips the sign `[0,1,-1]→[1,1,-1]`,
+> changing combinatorics. The conclusion drawn here — "exactness alone insufficient → Track B" — was
+> *overturned* by the end-to-end measurement above: the pipeline absorbs the field divergence, so the
+> hypothetical never reaches output.
 
 Scopes the **Stage 0** gate of [`docs/11_exact_corefiner_spec.md`](11_exact_corefiner_spec.md)
 against the actual repo. Stage 0 exists to **cheaply validate or kill** the exact-corefiner program
