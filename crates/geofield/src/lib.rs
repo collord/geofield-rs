@@ -37,6 +37,12 @@ pub mod weld;
 
 pub mod mesh_clip;
 
+// Exact-arithmetic corefiner — Stage 0 de-risk spike (docs/12). Default-off, additive sibling of
+// `mesh_clip`; NEVER replaces `mesh_clip::clip`. Gated so the default build is byte-for-byte
+// unchanged until the path is proven.
+#[cfg(feature = "exact_arr")]
+pub mod exact_arr;
+
 // Shared mesh-invariant assertions (watertight-volume, watertight-seam, edge-incidence) used by
 // both the `mesh_clip` and `stack` test suites so the criteria are defined once. Test-only.
 #[cfg(test)]

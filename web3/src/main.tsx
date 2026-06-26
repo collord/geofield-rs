@@ -250,6 +250,7 @@ function App() {
       __loadProject?: (p: Project) => void;
       __surfaces?: SurfacePayload[];
       __getView?: () => ViewState | undefined;
+      __exactSpikeDigest?: () => Promise<string | undefined>;
     };
     w.__reorderContainers = onReorderContainers;
     w.__moveSurface = onMoveSurface;
@@ -260,6 +261,19 @@ function App() {
     w.__loadProject = loadFreshProject;
     w.__surfaces = surfaces;
     w.__getView = () => viewApiRef.current?.getView();
+    // Stage 0 exact-corefiner determinism gate (e2e/exact-determinism.spec.ts, docs/12 §2.3). Runs
+    // the exact tri-tri spike in the browser's wasm and returns its digest hex. `spike_digest` is
+    // pure compute (no field/kernel), so we init the engine module standalone. The export only
+    // exists when the engine is built `--features exact_arr` (see `npm run wasm:engine:exact`);
+    // returns undefined otherwise, and the spec skips. Default bundle is unchanged.
+    w.__exactSpikeDigest = async () => {
+      const mod = (await import("./wasm/geofield.js")) as unknown as {
+        default: () => Promise<unknown>;
+        exact_spike_digest_hex?: () => string;
+      };
+      await mod.default();
+      return mod.exact_spike_digest_hex?.();
+    };
   });
 
   // --- project bar actions (US5) --------------------------------------------------------

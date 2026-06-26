@@ -28,6 +28,14 @@ serde = { version = "1", features = ["derive"] }
 # wasm-clean) so the triangulation's sign decisions are stable native vs wasm.
 spade = "2"
 
+# Exact-arithmetic corefiner — Stage 0 de-risk spike (docs/12). OPTIONAL + default-off: pulled in
+# only by `feature = "exact_arr"`, so the default `geofield.wasm` artifact does not grow until the
+# path is real. `dashu` is pure-Rust big rational/bigint (MIT/Apache, zero FFI, builds clean for
+# wasm32 — verified), the EXACT leg of the eventual lazy kernel. `geometry-predicates` (the
+# expansion/interval fast leg) is added with the lazy filter in a later increment; increment 1 is
+# the all-exact-rational determinism kill-test and needs only `dashu`.
+dashu = { version = "0.4", optional = true }
+
 # NATIVE ONLY. The kernel is linked in-process for native tests + the CLI so they can
 # build a real Model and mesh it. This dependency is `cfg(not(wasm32))`, so it is NOT
 # part of the wasm32 build graph — `geofield.wasm` never links the EUPL kernel; the
@@ -40,6 +48,9 @@ default = []
 # Native parallel BLAS (via the kernel, native only).
 native-parallel = []
 wasm = ["dep:wasm-bindgen", "dep:serde_json"]
+# Exact-arithmetic corefiner spike (docs/12). Default-off; gates the `exact_arr` module and its
+# exact-rational deps. NEVER replaces `mesh_clip::clip` — it is an additive, parallel path.
+exact_arr = ["dep:dashu"]
 # The validation CLI (geofield-cli) reads/writes .npy + .json fixtures (native).
 cli = ["dep:npyz", "dep:serde_json"]
 

@@ -32,6 +32,18 @@ extern "C" {
     fn error(msg: &str);
 }
 
+/// Stage 0 determinism gate (docs/12 §2.3). Runs the exact tri-tri spike in the browser's wasm and
+/// returns its FNV-1a digest as hex. The native golden test pins the same value
+/// (`exact_arr::tri_tri::spike_digest_is_deterministic_and_pinned`); `web3/e2e/exact-determinism.spec.ts`
+/// asserts this browser value equals that constant — the cross-target half the `#[cfg(test)]` suite
+/// cannot run here (no `wasm-bindgen-test` harness; see memory `geofield-no-wasm-cargo-test-harness`).
+/// Inert unless built with `--features exact_arr`; never wired into production meshing.
+#[cfg(feature = "exact_arr")]
+#[wasm_bindgen]
+pub fn exact_spike_digest_hex() -> String {
+    format!("{:016X}", crate::exact_arr::spike_digest())
+}
+
 /// Install a panic hook (once) that forwards Rust panic messages to JS
 /// `console.error`. Without this a Rust panic surfaces to JS only as the opaque
 /// `RuntimeError: unreachable` trap with no message; with it the actual panic
