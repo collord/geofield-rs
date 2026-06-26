@@ -2228,6 +2228,69 @@ fn clamp_mesh_to_box(mesh: &mut Mesh, lo: [f64; 3], hi: [f64; 3]) {
 /// faces (not at a wall iso). Each selected vertex Newton-projects onto its NEAREST wall iso; the
 /// 1.5·`tol` guard leaves a larger (mis-selected / diverged) step in place. The wall∩bed RING is
 /// re-projected onto the exact 1-D curve afterwards by [`project_crease_ring`].
+/// W\* step 1 ([`docs/volume_mesh_wstar.md`]): select the body solid's WALL faces — BOTH vein walls,
+/// identified GEOMETRICALLY (face normal ∥ `∇vein` and centroid within `tol` of a wall iso — the same
+/// test [`project_crease_ring`] uses, because the `contact_face` tag only marks the PRIMARY wall) —
+/// and classify, per wall face, the rock region bordering its OUTWARD (rock) side via `classify_back`.
+///
+/// The band is `[lo, hi] = (min, max)` of `wall_isos`; the body is the band INTERIOR. The rock is
+/// OUTSIDE the band, so the outward direction flips per wall: a face near `lo` (vein < band centre)
+/// faces rock at `−∇vein`; a face near `hi` faces rock at `+∇vein`. (A single-iso body — intrusion —
+/// is below its iso, so outward is `+∇`.) The body borders the inward side of every wall face.
+///
+/// Returns `(faces, back)`, parallel: `faces[i]` indexes `body.indices[3·faces[i] ..]`; `back[i]` is
+/// the region id `classify_back` returns at the outward probe point. Pure function of position +
+/// fields — output order is `body`'s triangle order, no map-iteration nondeterminism (the W\*
+/// determinism gate).
+// Foundational W* primitive; consumed by the body/rock assembly splice (the next increment). Tested
+// standalone by `partition_wall_selects_both_walls_and_classifies_back`.
+#[allow(dead_code)]
+fn partition_wall(
+    body: &Mesh,
+    vein_field: &dyn ScalarField,
+    wall_isos: &[f64],
+    classify_back: &dyn Fn([f64; 3]) -> usize,
+    tol: f64,
+) -> (Vec<usize>, Vec<usize>) {
+    let dot = |a: [f64; 3], b: [f64; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+    let mag = |v: [f64; 3]| dot(v, v).sqrt();
+    let pos = |i: u32| [body.positions[i as usize * 3] as f64, body.positions[i as usize * 3 + 1] as f64, body.positions[i as usize * 3 + 2] as f64];
+    let (mut faces, mut back) = (Vec::new(), Vec::new());
+    if wall_isos.is_empty() {
+        return (faces, back);
+    }
+    let lo = wall_isos.iter().cloned().fold(f64::INFINITY, f64::min);
+    let hi = wall_isos.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    // Band centre when there are two walls; for a single-iso body, treat the body as below the iso
+    // so outward is always `+∇` (centre below every wall ⇒ `vf > centre` ⇒ +∇).
+    let centre = if wall_isos.len() >= 2 { 0.5 * (lo + hi) } else { f64::NEG_INFINITY };
+    let step = tol.max(1e-6);
+    for t in 0..body.indices.len() / 3 {
+        let tri = [body.indices[3 * t], body.indices[3 * t + 1], body.indices[3 * t + 2]];
+        let (a, b, c) = (pos(tri[0]), pos(tri[1]), pos(tri[2]));
+        let e1 = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+        let e2 = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+        let nrm = [e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]];
+        let nm = mag(nrm).max(1e-12);
+        let n = [nrm[0] / nm, nrm[1] / nm, nrm[2] / nm];
+        let ctr = [(a[0] + b[0] + c[0]) / 3.0, (a[1] + b[1] + c[1]) / 3.0, (a[2] + b[2] + c[2]) / 3.0];
+        let vg = vein_field.scalar_field_gradient(ctr);
+        let vgm = mag(vg).max(1e-12);
+        let vgh = [vg[0] / vgm, vg[1] / vgm, vg[2] / vgm];
+        let vf = vein_field.scalar_field(ctr);
+        let is_wall = dot(n, vgh).abs() > 0.7 && wall_isos.iter().any(|&w| (vf - w).abs() / vgm <= tol);
+        if !is_wall {
+            continue;
+        }
+        // Outward (rock) = away from the band centre: `−∇` below centre, `+∇` above.
+        let s = if vf < centre { -1.0 } else { 1.0 };
+        let pb = [ctr[0] + s * vgh[0] * step, ctr[1] + s * vgh[1] * step, ctr[2] + s * vgh[2] * step];
+        faces.push(t);
+        back.push(classify_back(pb));
+    }
+    (faces, back)
+}
+
 fn project_vein_walls(mesh: &mut Mesh, vein_field: &dyn ScalarField, wall_isos: &[f64], tol: f64) {
     if wall_isos.is_empty() {
         return;
@@ -4915,6 +4978,58 @@ mod tests {
             worst <= tol,
             "vein body and cross-cut rock disagree on the foot-wall by {worst} (> {tol:.5}); they contour it independently → the visible see-through channel"
         );
+    }
+
+    /// W\* step 1 ([`docs/volume_mesh_wstar.md`]): `partition_wall` selects BOTH vein walls of the
+    /// body solid geometrically and classifies each wall face's rock (outward) side. Validates the
+    /// foundational primitive before any assembly change — both walls are found, the outward-side
+    /// classification is spatially coherent across the cross-cut units, and the result is a
+    /// deterministic pure function of position + fields (the W\* determinism gate).
+    #[test]
+    fn partition_wall_selects_both_walls_and_classifies_back() {
+        let (stack, vein_field) = vertical_vein_over_column();
+        let (min, size, ext) = ([0.0, 0.0, 0.0], 1000.0, [1000.0, 1000.0, 1000.0]);
+        let cfg = OctreeConfig { max_depth: 6, min_depth: 2, qef_threshold: 1e-6, cap: true };
+        let cell = size / (1u32 << cfg.max_depth) as f64;
+        let wall_isos = vein_field.interface_isovalues();
+        let (lo, hi) = (wall_isos[0].min(wall_isos[1]), wall_isos[0].max(wall_isos[1]));
+
+        let (body, _rocks) = stack
+            .mesh_cross_cut_solids_shared(0, min, size, ext, cfg, SeamMode::Snap)
+            .expect("vein body should mesh");
+
+        // Outward-side classifier: the cross-cut column's flat beds at z=350,650 → 3 z-bands.
+        let classify = |p: [f64; 3]| -> usize {
+            if p[2] < 350.0 { 0 } else if p[2] < 650.0 { 1 } else { 2 }
+        };
+        let (faces, back) = partition_wall(&body, &vein_field, &wall_isos, &classify, cell);
+        assert!(!faces.is_empty(), "no wall faces selected on the vein body");
+        let nf = faces.len();
+
+        // BOTH walls present (each selected face's centroid sits nearer lo or hi).
+        let pos = |i: u32| [body.positions[i as usize * 3] as f64, body.positions[i as usize * 3 + 1] as f64, body.positions[i as usize * 3 + 2] as f64];
+        let (mut near_lo, mut near_hi) = (0, 0);
+        for &t in &faces {
+            let tri = [body.indices[3 * t], body.indices[3 * t + 1], body.indices[3 * t + 2]];
+            let (a, b, c) = (pos(tri[0]), pos(tri[1]), pos(tri[2]));
+            let ctr = [(a[0] + b[0] + c[0]) / 3.0, (a[1] + b[1] + c[1]) / 3.0, (a[2] + b[2] + c[2]) / 3.0];
+            let vf = vein_field.scalar_field(ctr);
+            if (vf - lo).abs() < (vf - hi).abs() { near_lo += 1 } else { near_hi += 1 }
+        }
+        assert!(near_lo > 0 && near_hi > 0, "expected BOTH walls (lo={near_lo}, hi={near_hi})");
+
+        // Outward classification spans the cross-cut units (the ~vertical wall crosses the z-bands).
+        let mut seen = [false; 3];
+        for &u in &back {
+            if u < 3 { seen[u] = true }
+        }
+        assert!(seen.iter().filter(|&&s| s).count() >= 2, "outward-side units not coherent: {seen:?}");
+
+        // Deterministic: pure function of position + fields.
+        let (faces2, back2) = partition_wall(&body, &vein_field, &wall_isos, &classify, cell);
+        assert_eq!((faces, back), (faces2, back2), "partition_wall not reproducible");
+
+        eprintln!("[W*] partition_wall: {nf} wall faces (lo={near_lo}, hi={near_hi}), outward units {seen:?}");
     }
 
     /// Shared edges (and helpers) for the solid-seam watertightness checks. Merges several meshes
