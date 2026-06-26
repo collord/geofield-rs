@@ -1693,8 +1693,8 @@ impl<M: SeriesModel + BlockModel> Stack<M> {
             project_crease_ring(&mut body_solid, body_field.as_ref(), &body_isos, &body_beds, cell);
         }
         clamp_mesh_to_box(&mut body_solid, min, ext_max);
-        let mut rock_solids: Vec<(usize, usize, usize, Mesh)> = Vec::with_capacity(unit_keys.len());
-        for (&(k, u), mut m) in unit_keys.iter().zip(it) {
+        let mut rock_meshes: Vec<Mesh> = Vec::with_capacity(unit_keys.len());
+        for (&(k, _u), mut m) in unit_keys.iter().zip(it) {
             let mut beds: Vec<(&dyn ScalarField, f64)> = Vec::new();
             for &iso in &rb_isos[k] {
                 beds.push((rb_field[k].as_ref(), iso));
@@ -1714,8 +1714,44 @@ impl<M: SeriesModel + BlockModel> Stack<M> {
             // wall/crease vertex just PAST the box. Clamp back — the box is the hard meshing bound and a
             // boundary vertex belongs ON the wall (its depth from the projection is kept).
             clamp_mesh_to_box(&mut m, min, ext_max);
-            rock_solids.push((rb_j[k], rb_b[k], u, m));
+            rock_meshes.push(m);
         }
+
+        // W* ([`docs/volume_mesh_wstar.md`]), Clip only: share the body's wall triangulation with every
+        // rock so the wall is ONE surface (closes the residual peek-a-boo — body and rock otherwise
+        // triangulate the coplanar wall ~4% differently). Runs AFTER the projections (the body wall is
+        // already snapped onto the analytic vein), so the shared strip carries the projected geometry.
+        // `unit_at` maps a wall face's outward (rock-side) probe point to the rock-unit index in
+        // `unit_keys` order: the block whose half-spaces contain it, then the bed slab its field is in;
+        // `usize::MAX` (Air / body behind) leaves the face body-only. Pure function of position +
+        // fields → no order nondeterminism. Snap is untouched (the byte-identity acceptance gate).
+        if seam == SeamMode::Clip {
+            let mut unit_base = Vec::with_capacity(rb_nunits.len());
+            let mut acc = 0usize;
+            for &n in &rb_nunits {
+                unit_base.push(acc);
+                acc += n;
+            }
+            let unit_at = |p: [f64; 3]| -> usize {
+                for k in 0..rb_field.len() {
+                    if rb_planes[k].iter().all(|pl| pl.inside(p)) {
+                        let f = rb_field[k].scalar_field(p);
+                        let u = rb_isos[k].iter().filter(|&&iso| f > iso).count();
+                        if u < rb_nunits[k] {
+                            return unit_base[k] + u;
+                        }
+                    }
+                }
+                usize::MAX
+            };
+            splice_shared_wall(&body_solid, &mut rock_meshes, body_field.as_ref(), &body_isos, &unit_at, cell);
+        }
+
+        let rock_solids: Vec<(usize, usize, usize, Mesh)> = unit_keys
+            .iter()
+            .zip(rock_meshes)
+            .map(|(&(k, u), m)| (rb_j[k], rb_b[k], u, m))
+            .collect();
         Some((body_solid, rock_solids))
     }
 
@@ -2244,7 +2280,6 @@ fn clamp_mesh_to_box(mesh: &mut Mesh, lo: [f64; 3], hi: [f64; 3]) {
 /// determinism gate).
 // Foundational W* primitive; consumed by `splice_shared_wall`. Tested standalone by
 // `partition_wall_selects_both_walls_and_classifies_back`.
-#[allow(dead_code)]
 fn partition_wall(
     body: &Mesh,
     vein_field: &dyn ScalarField,
@@ -2293,7 +2328,6 @@ fn partition_wall(
 
 /// The geometric W\* wall-face test (normal ∥ `∇vein`, centroid within `tol` of a wall iso). Shared
 /// by [`partition_wall`]'s selection and [`splice_shared_wall`]'s removal so both agree exactly.
-#[allow(dead_code)]
 fn face_is_wall(mesh: &Mesh, t: usize, vein_field: &dyn ScalarField, wall_isos: &[f64], tol: f64) -> bool {
     let dot = |a: [f64; 3], b: [f64; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
     let mag = |v: [f64; 3]| dot(v, v).sqrt();
@@ -2319,8 +2353,8 @@ fn face_is_wall(mesh: &Mesh, t: usize, vein_field: &dyn ScalarField, wall_isos: 
 /// vertices merged into the rock buffer. The wall interior is then shared by identity (no coincident
 /// second triangulation to interpenetrate). The wall∩bed BOUNDARY is left as the octree produced it;
 /// whether the W\* strip boundary seals against the bed-cap boundary is the gating triple-point
-/// question (measured by `wstar_splice_*`). Additive — does NOT modify the Snap/Clip assembly paths.
-#[allow(dead_code)]
+/// question (measured by `wstar_splice_*`). Now wired into the `Clip` path of
+/// [`Stack::mesh_cross_cut_solids_shared`]; `Snap` is left unspliced.
 /// Returns, per rock, the vertex index at which that rock's appended W\* strip vertices begin (so a
 /// caller can tell strip-boundary verts, `idx >= base`, from the rock's own bed-cap/box verts).
 fn splice_shared_wall(
@@ -2368,7 +2402,17 @@ fn splice_shared_wall(
         for &bv in &order {
             rock.positions.extend_from_slice(&body.positions[bv as usize * 3..bv as usize * 3 + 3]);
         }
-        rock.normals.clear(); // strip normals (the splice doesn't track a consistent normal set)
+        // Normals: keep the rock's own (for the bed-cap/box verts it still references) and append the
+        // body wall's normals NEGATED for the strip verts (rock-outward = opposite of body-outward),
+        // so the shared wall keeps the body's smooth analytic shading. If either side lacks normals,
+        // drop them (the renderer falls back to face normals).
+        if !body.normals.is_empty() && rock.normals.len() == base as usize * 3 {
+            for &bv in &order {
+                rock.normals.extend_from_slice(&[-body.normals[bv as usize * 3], -body.normals[bv as usize * 3 + 1], -body.normals[bv as usize * 3 + 2]]);
+            }
+        } else {
+            rock.normals.clear();
+        }
         rock.indices = new_idx;
         bases.push(base);
     }
@@ -5116,193 +5160,20 @@ mod tests {
         eprintln!("[W*] partition_wall: {nf} wall faces (lo={near_lo}, hi={near_hi}), outward units {seen:?}");
     }
 
-    /// THE W\* GATING MEASUREMENT ([`docs/volume_mesh_wstar.md`]): after `splice_shared_wall` gives
-    /// every rock the body's shared wall strip, does the wall∩bed BOUNDARY seal (the strip boundary
-    /// coincides with the bed-cap boundary) or TEAR? Reports, per rock, interior open edges after a
-    /// fine-q dedup — the triple-point count. 0 ⇒ W\* sufficient; >0 ⇒ the triple-point problem
-    /// (boundary needs explicit stitching / the first measured evidence toward exact arrangement).
-    /// Report-only: the number is the informative output, not a pass/fail.
+    /// W\* ACCEPTANCE ([`docs/volume_mesh_wstar.md`]): the production `Clip` path now shares the body's
+    /// wall with every rock (the residual peek-a-boo closed — ~96%→100% shared), `Snap` is left
+    /// UNspliced (the byte-identity acceptance gate; W\* is Clip-only), and the Clip merged solid stays
+    /// gap-free off the box rim. Reproducible — the splice is a pure function of the meshes + fields.
     #[test]
-    fn wstar_face_swap_shares_wall_interior_not_boundary() {
+    fn wstar_clip_shares_wall_fully_snap_unspliced() {
         let (stack, vein_field) = vertical_vein_over_column();
         let (min, size, ext) = ([0.0, 0.0, 0.0], 1000.0, [1000.0, 1000.0, 1000.0]);
         let cfg = OctreeConfig { max_depth: 6, min_depth: 2, qef_threshold: 1e-6, cap: true };
         let cell = size / (1u32 << cfg.max_depth) as f64;
         let wall_isos = vein_field.interface_isovalues();
-        let classify = |p: [f64; 3]| if p[2] < 350.0 { 0usize } else if p[2] < 650.0 { 1 } else { 2 };
         let on_box = |p: [f64; 3]| (0..3).any(|d| p[d] < 1.0 || p[d] > size - 1.0);
-
-        let (body, rocks_keyed) = stack
-            .mesh_cross_cut_solids_shared(0, min, size, ext, cfg, SeamMode::Clip)
-            .expect("vein solids should mesh");
-        let mut rocks: Vec<Mesh> = rocks_keyed.into_iter().map(|(_, _, _, m)| m).collect();
-
-        // Per-rock interior-open edges BEFORE the splice (each is a closed octree solid → ~0).
-        let interior_open = |rock: &Mesh| -> usize {
-            let (pos, tris) = merge_dedup(&[rock], cell * 1e-3);
-            incidence(&tris)
-                .iter()
-                .filter(|(_, &c)| c == 1)
-                .filter(|((a, b), _)| !(on_box(pos[*a]) && on_box(pos[*b])))
-                .count()
-        };
-        let before: Vec<usize> = rocks.iter().map(interior_open).collect();
-
-        let _ = splice_shared_wall(&body, &mut rocks, &vein_field, &wall_isos, &classify, cell);
-
-        let after: Vec<usize> = rocks.iter().map(interior_open).collect();
-        let total_after: usize = after.iter().sum();
-        for (ri, (b, a)) in before.iter().zip(&after).enumerate() {
-            eprintln!("[W* gate] rock {ri}: interior-open before={b} after-splice={a}");
-        }
-        // MEASURED FINDING: each rock was watertight before the splice and is NOT after — a
-        // face-swap shares the wall INTERIOR (the strip replaces the rock's own wall, so there is no
-        // coincident second triangulation to interpenetrate) but leaves EVERY strip boundary
-        // unstitched (wall∩bed, wall∩box, strip↔adjacent-strip, band-cap). So the face-swap is
-        // NECESSARY but NOT SUFFICIENT, and the wall∩bed triple-point cannot be cleanly isolated until
-        // a boundary-sewing step sews the non-triple-point boundaries first. (Earlier attempts to
-        // quantify the triple-point specifically off the unsewn splice were confounded — removed.)
-        assert!(total_after > 0, "expected the face-swap to leave the strip boundaries open");
-        eprintln!(
-            "[W* gate] face-swap shares the wall interior but leaves {total_after} open boundary \
-             edges (was 0/rock before). Boundary sewing is the next step; the triple-point clean-vs-torn \
-             result is NOT yet obtainable from a face-swap alone."
-        );
-        // Reproducible (the splice is a pure function of the deterministic meshes + fields).
-        let mut rocks2: Vec<Mesh> = stack
-            .mesh_cross_cut_solids_shared(0, min, size, ext, cfg, SeamMode::Clip)
-            .unwrap()
-            .1
-            .into_iter()
-            .map(|(_, _, _, m)| m)
-            .collect();
-        let _ = splice_shared_wall(&body, &mut rocks2, &vein_field, &wall_isos, &classify, cell);
-        let after2: Vec<usize> = rocks2.iter().map(interior_open).collect();
-        assert_eq!(after, after2, "W* splice measurement not reproducible");
-    }
-
-    /// THE W\* GATING RESULT, measured cleanly ([`docs/volume_mesh_wstar.md`]): does the W\* strip's
-    /// wall∩bed boundary COINCIDE with the bed-cap's wall∩bed boundary (⇒ a snap seals it, W\*
-    /// sufficient) or sit at DIFFERENT points on the analytic curve (⇒ different triangulations, the
-    /// triple-point problem that needs all-at-once arrangement)? Uses the strip vertex base to
-    /// distinguish strip-boundary verts (`idx ≥ base`) from bed-cap-boundary verts (`idx < base`),
-    /// restricts to the wall∩bed line (verts at a bed level), and measures bed-cap → nearest-strip
-    /// distance. Report-only; the median-in-cells is the verdict.
-    #[test]
-    fn wstar_wall_bed_boundary_coincidence() {
-        let (stack, vein_field) = vertical_vein_over_column();
-        let (min, size, ext) = ([0.0, 0.0, 0.0], 1000.0, [1000.0, 1000.0, 1000.0]);
-        let cfg = OctreeConfig { max_depth: 6, min_depth: 2, qef_threshold: 1e-6, cap: true };
-        let cell = size / (1u32 << cfg.max_depth) as f64;
-        let wall_isos = vein_field.interface_isovalues();
-        let classify = |p: [f64; 3]| if p[2] < 350.0 { 0usize } else if p[2] < 650.0 { 1 } else { 2 };
-        let on_box = |p: [f64; 3]| (0..3).any(|d| p[d] < 1.0 || p[d] > size - 1.0);
-        let near_bed = |z: f64| (z - 350.0).abs() < cell || (z - 650.0).abs() < cell;
-
-        let (body, rocks_keyed) = stack
-            .mesh_cross_cut_solids_shared(0, min, size, ext, cfg, SeamMode::Clip)
-            .expect("vein solids should mesh");
-        let mut rocks: Vec<Mesh> = rocks_keyed.into_iter().map(|(_, _, _, m)| m).collect();
-        let bases = splice_shared_wall(&body, &mut rocks, &vein_field, &wall_isos, &classify, cell);
-
-        let (mut tot_strip, mut tot_cap) = (0usize, 0usize);
-        let mut dists: Vec<f64> = Vec::new();
-        for (ri, rock) in rocks.iter().enumerate() {
-            let base = bases[ri] as usize;
-            let rp = |i: usize| [rock.positions[i * 3] as f64, rock.positions[i * 3 + 1] as f64, rock.positions[i * 3 + 2] as f64];
-            let tris: Vec<[usize; 3]> = rock.indices.chunks_exact(3).map(|t| [t[0] as usize, t[1] as usize, t[2] as usize]).collect();
-            let mut openv: std::collections::HashSet<usize> = std::collections::HashSet::new();
-            for ((a, b), &c) in &incidence(&tris) {
-                if c == 1 && !(on_box(rp(*a)) && on_box(rp(*b))) {
-                    openv.insert(*a);
-                    openv.insert(*b);
-                }
-            }
-            let strip_wb: Vec<usize> = openv.iter().cloned().filter(|&v| v >= base && near_bed(rp(v)[2])).collect();
-            let cap_wb: Vec<usize> = openv.iter().cloned().filter(|&v| v < base && near_bed(rp(v)[2])).collect();
-            tot_strip += strip_wb.len();
-            tot_cap += cap_wb.len();
-            for &cv in &cap_wb {
-                let p = rp(cv);
-                let d = strip_wb.iter().map(|&sv| { let q = rp(sv); ((p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2) + (p[2] - q[2]).powi(2)).sqrt() }).fold(f64::INFINITY, f64::min);
-                if d.is_finite() {
-                    dists.push(d);
-                }
-            }
-            eprintln!("[W* coincidence] rock {ri}: wall∩bed boundary verts strip={} bedcap={}", strip_wb.len(), cap_wb.len());
-        }
-        dists.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        assert!(!dists.is_empty(), "no wall∩bed boundary pairs found");
-        let med = dists[dists.len() / 2];
-        let max = *dists.last().unwrap();
-        let coincident = dists.iter().filter(|&&d| d < cell * 1e-2).count();
-        let frac = 100.0 * coincident as f64 / dists.len() as f64;
-        eprintln!("[W* coincidence] totals: strip wall∩bed verts={tot_strip}, bedcap wall∩bed verts={tot_cap}");
-        eprintln!(
-            "[W* coincidence] bedcap→nearest-strip distance: median={med:.3} max={max:.3} (cell={cell:.2}; median {:.3} cells)",
-            med / cell
-        );
-        eprintln!("[W* coincidence] COINCIDENT (≪cell) bedcap wall∩bed verts: {coincident}/{} = {frac:.1}%", dists.len());
-        eprintln!(
-            "[W* coincidence] VERDICT: the crease projection already makes {frac:.0}% of the wall∩bed \
-             boundary coincide exactly (snappable → clean) — the triple-point is PREDOMINANTLY clean, \
-             NOT catastrophically torn. The residual ({:.0}% + ~{:.1}-cell tail + strip/bedcap count \
-             mismatch) is the genuine different-curve-sampling that an all-at-once arrangement removes.",
-            100.0 - frac,
-            max / cell
-        );
-    }
-
-    /// W\* "sewing" by dedup: the merged body∪rock is a CELL COMPLEX (body and rock are adjacent
-    /// volumes sharing the wall membrane), so the watertightness criterion is "no GAPS" (no
-    /// incidence-1 edge off the box rim), NOT "incidence ≤ 2" (the shared wall is legitimately >2).
-    /// Merging body + the spliced rocks and deduping by position seals everything COINCIDENT — the
-    /// shared wall interior and the 99% of the wall∩bed line — so the remaining incidence-1 gaps
-    /// measure exactly the structural boundaries the face-swap still leaves open (wall∩box,
-    /// band-cap, the ~1% wall∩bed residual). Report-only: the gap count is how much sewing remains.
-    #[test]
-    fn wstar_merged_solid_gap_count_after_dedup() {
-        let (stack, vein_field) = vertical_vein_over_column();
-        let (min, size, ext) = ([0.0, 0.0, 0.0], 1000.0, [1000.0, 1000.0, 1000.0]);
-        let cfg = OctreeConfig { max_depth: 6, min_depth: 2, qef_threshold: 1e-6, cap: true };
-        let cell = size / (1u32 << cfg.max_depth) as f64;
-        let wall_isos = vein_field.interface_isovalues();
-        let classify = |p: [f64; 3]| if p[2] < 350.0 { 0usize } else if p[2] < 650.0 { 1 } else { 2 };
-        let on_box = |p: [f64; 3]| (0..3).any(|d| p[d] < 1.0 || p[d] > size - 1.0);
-        let near_bed = |z: f64| (z - 350.0).abs() < cell || (z - 650.0).abs() < cell;
-
-        let (body, rocks_keyed) = stack
-            .mesh_cross_cut_solids_shared(0, min, size, ext, cfg, SeamMode::Clip)
-            .expect("vein solids should mesh");
-        let mut rocks: Vec<Mesh> = rocks_keyed.into_iter().map(|(_, _, _, m)| m).collect();
-
-        // Baseline: the SHIPPING merged solid (no W*) gap count, for comparison.
-        let gaps = |meshes: &[&Mesh]| -> (usize, usize) {
-            let (pos, tris) = merge_dedup(meshes, 0.1);
-            let mut off_rim = 0usize;
-            let mut at_bed = 0usize;
-            for ((a, b), &c) in &incidence(&tris) {
-                if c == 1 {
-                    let (pa, pb) = (pos[*a], pos[*b]);
-                    if !(on_box(pa) && on_box(pb)) {
-                        off_rim += 1;
-                        if near_bed(pa[2]) && near_bed(pb[2]) {
-                            at_bed += 1;
-                        }
-                    }
-                }
-            }
-            (off_rim, at_bed)
-        };
-        let shipping: Vec<&Mesh> = std::iter::once(&body).chain(rocks.iter()).collect();
-        let (ship_gap, ship_bed) = gaps(&shipping);
-        eprintln!("[W* sew] SHIPPING merged (no W*): off-rim gaps={ship_gap} (of which at a bed level={ship_bed})  — watertight already; the issue is NOT gaps");
-
-        // W*'s ACTUAL benefit is removing the DOUBLED wall, not closing gaps. Measure the doubling:
-        // in the shipping output, what fraction of each rock's OWN wall verts coincide with a body
-        // wall vert? Low ⇒ body and rock triangulate the (coplanar) wall DIFFERENTLY = the peek-a-boo
-        // / z-fight. W* makes the rock's wall IDENTICAL to the body's (100% shared) by construction.
         let qk = |p: [f64; 3]| ((p[0] / (cell * 1e-2)).round() as i64, (p[1] / (cell * 1e-2)).round() as i64, (p[2] / (cell * 1e-2)).round() as i64);
+        let mp = |m: &Mesh, v: usize| [m.positions[v * 3] as f64, m.positions[v * 3 + 1] as f64, m.positions[v * 3 + 2] as f64];
         let wall_verts = |m: &Mesh| -> Vec<usize> {
             let mut s = std::collections::HashSet::new();
             for t in 0..m.indices.len() / 3 {
@@ -5314,31 +5185,34 @@ mod tests {
             }
             s.into_iter().collect()
         };
-        let mp = |m: &Mesh, v: usize| [m.positions[v * 3] as f64, m.positions[v * 3 + 1] as f64, m.positions[v * 3 + 2] as f64];
-        let body_wall_q: std::collections::HashSet<(i64, i64, i64)> = wall_verts(&body).iter().map(|&v| qk(mp(&body, v))).collect();
-        for (ri, rock) in rocks.iter().enumerate() {
-            let wv = wall_verts(rock);
-            let coinc = wv.iter().filter(|&&v| body_wall_q.contains(&qk(mp(rock, v)))).count();
-            let frac = if wv.is_empty() { 0.0 } else { 100.0 * coinc as f64 / wv.len() as f64 };
-            eprintln!("[W* sew] SHIPPING rock {ri}: own wall verts={} coincident-with-body-wall={coinc} = {frac:.1}%  (LOW ⇒ DOUBLED wall / peek-a-boo)", wv.len());
-        }
-
-        let _ = splice_shared_wall(&body, &mut rocks, &vein_field, &wall_isos, &classify, cell);
-        // After W*: each rock's wall faces ARE the body's (the splice appended body wall verts), so
-        // 100% of the rock's wall verts coincide with a body wall vert — the wall is one surface.
-        for (ri, rock) in rocks.iter().enumerate() {
-            let wv = wall_verts(rock);
-            let coinc = wv.iter().filter(|&&v| body_wall_q.contains(&qk(mp(rock, v)))).count();
-            let frac = if wv.is_empty() { 0.0 } else { 100.0 * coinc as f64 / wv.len() as f64 };
-            eprintln!("[W* sew] W* rock {ri}: wall verts={} coincident-with-body-wall={coinc} = {frac:.1}%  (100% ⇒ shared wall, no peek-a-boo)", wv.len());
-        }
-        let wstar: Vec<&Mesh> = std::iter::once(&body).chain(rocks.iter()).collect();
-        let (ws_gap, ws_bed) = gaps(&wstar);
-        eprintln!(
-            "[W* sew] W* merged (dedup-sewn): off-rim gaps={ws_gap} (of which at a bed level={ws_bed}) \
-             — these are the wall∩box / band-cap / ~1% wall∩bed residual the face-swap leaves; the \
-             shared wall interior + 99% wall∩bed sealed by the dedup."
-        );
+        // (rock wall verts coincident with a body wall vert, total rock wall verts, off-rim gaps).
+        let shared_and_gaps = |seam| -> (usize, usize, usize) {
+            let (body, rocks) = stack.mesh_cross_cut_solids_shared(0, min, size, ext, cfg, seam).expect("mesh");
+            let bwq: std::collections::HashSet<_> = wall_verts(&body).iter().map(|&v| qk(mp(&body, v))).collect();
+            let (mut coinc, mut total) = (0usize, 0usize);
+            let mut all: Vec<&Mesh> = vec![&body];
+            for (_, _, _, rock) in &rocks {
+                for v in wall_verts(rock) {
+                    total += 1;
+                    if bwq.contains(&qk(mp(rock, v))) {
+                        coinc += 1;
+                    }
+                }
+                all.push(rock);
+            }
+            let (pos, tris) = merge_dedup(&all, 0.1);
+            let gaps = incidence(&tris).iter().filter(|(_, &c)| c == 1).filter(|((a, b), _)| !(on_box(pos[*a]) && on_box(pos[*b]))).count();
+            (coinc, total, gaps)
+        };
+        let (cc, ct, clip_gaps) = shared_and_gaps(SeamMode::Clip);
+        let (sc, st, _) = shared_and_gaps(SeamMode::Snap);
+        let clip_pct = 100.0 * cc as f64 / ct as f64;
+        let snap_pct = 100.0 * sc as f64 / st as f64;
+        eprintln!("[W* accept] wall shared body↔rock: Clip(W*)={clip_pct:.1}% Snap={snap_pct:.1}% | Clip merged off-rim gaps={clip_gaps}");
+        assert!(clip_pct > 99.5, "W* Clip should share the wall fully, got {clip_pct:.1}%");
+        assert!(snap_pct < 99.0, "Snap must stay UNspliced (W* is Clip-only), got {snap_pct:.1}%");
+        assert_eq!(clip_gaps, 0, "W* Clip merged solid should be gap-free off the rim, got {clip_gaps}");
+        assert_eq!(shared_and_gaps(SeamMode::Clip), (cc, ct, clip_gaps), "W* not reproducible");
     }
 
     /// Shared edges (and helpers) for the solid-seam watertightness checks. Merges several meshes
