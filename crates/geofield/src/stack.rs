@@ -2395,6 +2395,80 @@ fn splice_shared_wall(
     bases
 }
 
+/// Position-quantized vertex weld producing a new [`Mesh`] (drops degenerate triangles). `q` is the
+/// merge cell; coincident-within-`q` verts collapse to one. Used to fuse the sewn strip+bed-cap.
+#[allow(dead_code)]
+fn weld_mesh(m: &Mesh, q: f64) -> Mesh {
+    use std::collections::HashMap;
+    let mut map: HashMap<(i64, i64, i64), u32> = HashMap::new();
+    let mut pos: Vec<f32> = Vec::new();
+    let mut remap: Vec<u32> = Vec::with_capacity(m.vertex_count());
+    for i in 0..m.vertex_count() {
+        let p = [m.positions[3 * i], m.positions[3 * i + 1], m.positions[3 * i + 2]];
+        let k = ((p[0] as f64 / q).round() as i64, (p[1] as f64 / q).round() as i64, (p[2] as f64 / q).round() as i64);
+        let idx = *map.entry(k).or_insert_with(|| {
+            pos.extend_from_slice(&p);
+            (pos.len() / 3 - 1) as u32
+        });
+        remap.push(idx);
+    }
+    let mut indices: Vec<u32> = Vec::new();
+    for t in m.indices.chunks_exact(3) {
+        let (a, b, c) = (remap[t[0] as usize], remap[t[1] as usize], remap[t[2] as usize]);
+        if a != b && b != c && a != c {
+            indices.extend_from_slice(&[a, b, c]);
+        }
+    }
+    Mesh { positions: pos, normals: Vec::new(), indices }
+}
+
+/// W\* junction sewing (docs/volume_mesh_wstar.md): close a spliced rock at the wall∩bed junction by
+/// making the W\* strip and the bed-cap/box share the wall∩bed polyline. Split the rock into the
+/// strip (verts `≥ base`, the appended body wall) and the rest (verts `< base`, bed caps + box), weld
+/// each side's free-boundary points into the OTHER (mutual point insertion — T-junction removal via
+/// [`weld_points_into_mesh`]), then merge and weld coincident. `base` is from [`splice_shared_wall`].
+#[allow(dead_code)]
+fn sew_junction(rock: &mut Mesh, base: u32, cell: f64) {
+    let base = base as usize;
+    let (mut strip_i, mut rest_i): (Vec<u32>, Vec<u32>) = (Vec::new(), Vec::new());
+    for t in rock.indices.chunks_exact(3) {
+        if t.iter().all(|&v| v as usize >= base) {
+            strip_i.extend_from_slice(t);
+        } else {
+            rest_i.extend_from_slice(t);
+        }
+    }
+    let extract = |idx: &[u32]| -> Mesh {
+        use std::collections::HashMap;
+        let mut remap: HashMap<u32, u32> = HashMap::new();
+        let mut pos: Vec<f32> = Vec::new();
+        let mut new: Vec<u32> = Vec::new();
+        for &v in idx {
+            let nv = *remap.entry(v).or_insert_with(|| {
+                pos.extend_from_slice(&rock.positions[v as usize * 3..v as usize * 3 + 3]);
+                (pos.len() / 3 - 1) as u32
+            });
+            new.push(nv);
+        }
+        Mesh { positions: pos, normals: Vec::new(), indices: new }
+    };
+    let mut strip = extract(&strip_i);
+    let mut rest = extract(&rest_i);
+    // Mutual point insertion: each side's free-boundary verts split the other's edges so they become
+    // shared. `weld_eps = cell` (the wall∩bed polylines are within a cell of each other on the curve).
+    let strip_bd = crate::weld::free_boundary_points(&strip);
+    let rest_bd = crate::weld::free_boundary_points(&rest);
+    crate::weld::weld_points_into_mesh(&mut rest, &strip_bd, cell, cell);
+    crate::weld::weld_points_into_mesh(&mut strip, &rest_bd, cell, cell);
+    // Merge + weld coincident (the now-aligned wall∩bed verts collapse → the rock closes).
+    let voff = (strip.positions.len() / 3) as u32;
+    strip.positions.extend_from_slice(&rest.positions);
+    for &i in &rest.indices {
+        strip.indices.push(i + voff);
+    }
+    *rock = weld_mesh(&strip, cell * 1e-3);
+}
+
 fn project_vein_walls(mesh: &mut Mesh, vein_field: &dyn ScalarField, wall_isos: &[f64], tol: f64) {
     if wall_isos.is_empty() {
         return;
@@ -5171,6 +5245,48 @@ mod tests {
         let after: usize = rocks.iter().map(open).sum();
         assert!(after > 0, "expected the naive splice to OPEN the rocks (the finding); got {after}");
         eprintln!("[W*] naive splice opens rocks: per-rock open before={before} → after={after} (needs junction sewing before production)");
+    }
+
+    /// W\* JUNCTION-SEW DE-RISK (docs/volume_mesh_wstar.md): does mutual point-insertion sewing
+    /// (`sew_junction`) close each spliced rock PER-SOLID on the dipping fixture? RESULT (measured):
+    /// NO — post-splice ~[192,317,130] → post-sew ~[188,377,126], essentially unchanged. The welds DO
+    /// insert (~340 of ~400 boundary points), but inserting one polyline's verts onto the OTHER's
+    /// CHORDS (straight bed-cap edges) lands them OFF the curved wall∩bed line, so they don't coincide
+    /// and don't merge. The two curve samplings genuinely cannot be zipped by insertion+weld — they
+    /// need RE-TRIANGULATION to a MERGED vertex set (a CDT/arrangement at the junction). So the simple
+    /// field-domain sew is INSUFFICIENT, and this is measured evidence the wall∩bed junction is the
+    /// genuine triple-point/arrangement problem (correcting the earlier "99% clean"). Do NOT wire.
+    #[test]
+    fn wstar_junction_sew_derisk() {
+        let (stack, vein_field) = vertical_vein_over_column();
+        let (min, size, ext) = ([0.0, 0.0, 0.0], 1000.0, [1000.0, 1000.0, 1000.0]);
+        let cfg = OctreeConfig { max_depth: 6, min_depth: 2, qef_threshold: 1e-6, cap: true };
+        let cell = size / (1u32 << cfg.max_depth) as f64;
+        let wall_isos = vein_field.interface_isovalues();
+        let classify = |p: [f64; 3]| if p[2] < 350.0 { 0usize } else if p[2] < 650.0 { 1 } else { 2 };
+        let on_box = |p: [f64; 3]| (0..3).any(|d| p[d] < 1.0 || p[d] > size - 1.0);
+        let open = |rock: &Mesh| -> usize {
+            let (pos, tris) = merge_dedup(&[rock], cell * 1e-4);
+            incidence(&tris).iter().filter(|(_, &c)| c == 1).filter(|((a, b), _)| !(on_box(pos[*a]) && on_box(pos[*b]))).count()
+        };
+
+        let (body, rocks_keyed) = stack
+            .mesh_cross_cut_solids_shared(0, min, size, ext, cfg, SeamMode::Clip)
+            .expect("vein solids should mesh");
+        let mut rocks: Vec<Mesh> = rocks_keyed.into_iter().map(|(_, _, _, m)| m).collect();
+        let bases = splice_shared_wall(&body, &mut rocks, &vein_field, &wall_isos, &classify, cell);
+        let post_splice: Vec<usize> = rocks.iter().map(|r| open(r)).collect();
+        for (rock, &base) in rocks.iter_mut().zip(&bases) {
+            sew_junction(rock, base, cell);
+        }
+        let post_sew: Vec<usize> = rocks.iter().map(|r| open(r)).collect();
+        let total: usize = post_sew.iter().sum();
+        eprintln!("[W* sew-derisk] per-rock interior-open: post-splice={post_splice:?} → post-sew={post_sew:?}");
+        if total == 0 {
+            eprintln!("[W* sew-derisk] SUCCESS — sew closes all rocks per-solid; safe to wire WITH a decline gate, then render-and-look");
+        } else {
+            eprintln!("[W* sew-derisk] INSUFFICIENT — {total} edges still open; escalate (CDT re-triangulation, or certified-arrangement evidence). Do NOT wire.");
+        }
     }
 
     /// Shared edges (and helpers) for the solid-seam watertightness checks. Merges several meshes
