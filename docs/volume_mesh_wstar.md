@@ -266,6 +266,17 @@ re-triangulation** of the bed-cap's wall-side strip against the wall∩bed polyl
 bed plane, the `mesh_clip` pattern) — heavier, and if *that* is intractable it is the first real
 evidence the certified/exact-arrangement path (`docs/11`) is needed at the junction.
 
+> **DE-RISK RESULT (2026-06-26, measured — `wstar_junction_sew_derisk`, commit `ebf362a`): the mutual
+> point-insertion sew is INSUFFICIENT.** post-splice per-rock open ~[192,317,130] → post-sew
+> ~[188,377,126], essentially unchanged. The welds DO insert (~340 of ~400 boundary points), but
+> inserting one polyline's verts onto the *other's CHORDS* (straight bed-cap edges) lands them OFF the
+> curved wall∩bed line, so they don't coincide and don't merge. **The two curve samplings cannot be
+> zipped by insertion+weld — they need RE-TRIANGULATION to a merged vertex set (the CDT/arrangement
+> option above).** This is measured evidence the wall∩bed junction is the genuine triple-point
+> arrangement problem (correcting the "99% clean" claim). The remaining paths are the **field-domain
+> CDT re-triangulation** of the bed-cap wall-side strip, or **the certified/exact-arrangement path**
+> (`docs/11`) — both substantial; neither is a quick patch.
+
 ## The DE-RISKING measurement — do this BEFORE any production wiring (the gate I skipped)
 
 On the dipping fixture (`vertical_vein_over_column`), after W\* splice **+ the junction sew**:
