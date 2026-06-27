@@ -201,3 +201,98 @@ generalization, recorded for when imported walls land. **First cut: A.**
 - **Foot vs hanging wall assignment** — both walls pass the geometric selector; the partition must
   route foot-side rock pieces to the foot wall and hanging-side to the hanging wall via the `−∇`
   back-side slab test, not by wall iso alone.
+
+---
+
+# Junction sewing — the unsolved part (scope)
+
+**Status correction (2026-06-26).** W\* (wall *interior* sharing) was built, wired into the Clip path
+(`1e6fef0`), and **reverted** (`fbf75a9`) after a screenshot showed it OPENS each rock at the wall∩bed
+junction (see-through holes — worse than the sliver). Two over-claims, corrected: the acceptance test
+checked the **merged** solid (gap-free — wrong criterion; merging hides what separately-rendered rocks
+can't), and the "99% coincident triple-point" was wrong. **The wall∩bed junction is the real
+triple-point problem.** This section scopes its fix; nothing is implemented.
+
+## The problem, measured (`wstar_naive_splice_opens_rocks_so_not_wired`)
+
+Each rock unit is rendered as a SEPARATE closed solid (per-lithology colour), so each must be
+individually watertight. Snap/production rocks: **0 open edges**. After the naive W\* face-swap:
+**~200+ open edges per rock**, and **not weldable** — the body's wall strip (body verts) and the
+rock's bed cap (rock verts) sample the wall∩bed curve with DIFFERENT triangulations (different vert
+counts/positions), so a position-weld doesn't merge them. The strip's wall∩bed boundary and the
+bed-cap's wall-side boundary are two distinct polylines of the same curve that must become ONE shared
+polyline.
+
+## Why the existing corefined path is NOT the drop-in answer
+
+[`mesh_cross_cut_solids_corefined`](../crates/geofield/src/stack.rs#L1746) already does true fusion
+(clip corefines the rock against the shared wall → seam shared by index, junction closed). But its
+own test [`corefined_falls_back_on_wavy_wall`](../crates/geofield/src/stack.rs#L5860) shows it
+**returns `None` on exactly the wavy 2-point dipping fit** (the peek-a-boo case): the under-constrained
+wall waves sub-cell between host triangles, so `clip` never sees the crossing and a unit fails to
+close. So it declines on the geometry we need — and the worker falls back to the shared path (the
+peek-a-boo). The corefined path is the principled fusion but it can't resolve this wall; the octree
+(W\*) can. So the fix is **octree W\* (resolves the wavy wall) + a junction-sewing step**, not the
+corefiner.
+
+## Two disciplines the corefined path has and my W\* integration lacked (adopt both)
+
+1. **Per-SOLID watertightness, not merged.** The corefined tests assert
+   [`assert_mesh_watertight`](../crates/geofield/src/mesh_test_util.rs#L76) on the body AND each rock
+   individually. That is the criterion that catches open rocks; the merged check does not.
+2. **Decline rather than ship a hole.** The corefined path returns `None` (caller falls back to the
+   watertight independent path) if any solid fails to close. W\*+sewing must do the same: if the
+   junction doesn't sew watertight, **fall back to the current shared path** (peek-a-boo, but closed)
+   — never emit a holey solid.
+
+## The sewing approach (grounded in an existing precedent)
+
+The SURFACE path already sews a wall to contact creases:
+[`free_boundary_points`](../crates/geofield/src/weld.rs) of each contact →
+[`weld_points_into_mesh(&mut wall, &crease, weld_eps, cell)`](../crates/geofield/src/stack.rs#L1046)
+(insert points into a mesh, splitting the edge they land on, so they become shared — T-junction
+removal). The solid junction sewing is the analog: make the W\* strip and each rock's bed-cap boundary
+**share the wall∩bed polyline** by mutual point insertion —
+- weld the strip's wall∩bed boundary verts into the rock's bed-cap edges, AND
+- weld the bed-cap's wall-side boundary verts into the strip's edges,
+so every vertex on either polyline becomes shared on both → the rock closes. (Mutual, because each
+polyline has verts the other lacks; one-directional welding leaves the other side's verts as
+T-junctions.)
+
+**Open risk:** mutual point-insertion may still leave residual T-junctions or near-degenerate slivers
+where the two polylines interleave finely (the strip is finer than the bed cap — 704 vs 512 verts
+measured). If it does not reach per-solid watertight, the alternative is a **constrained
+re-triangulation** of the bed-cap's wall-side strip against the wall∩bed polyline (a 2D CDT in the
+bed plane, the `mesh_clip` pattern) — heavier, and if *that* is intractable it is the first real
+evidence the certified/exact-arrangement path (`docs/11`) is needed at the junction.
+
+## The DE-RISKING measurement — do this BEFORE any production wiring (the gate I skipped)
+
+On the dipping fixture (`vertical_vein_over_column`), after W\* splice **+ the junction sew**:
+- **per-rock `assert_mesh_watertight`** (each rock individually closed, incidence-2 off the box rim) —
+  the criterion that would have caught the regression;
+- if any rock is not watertight → the sew is insufficient → **do not wire**; either escalate to the
+  CDT option or accept the certified-path evidence.
+
+Only if per-solid watertight passes: wire into the Clip path **with the decline-on-failure gate**, then
+**render and look** (the visual smell test — load the dipping-vein scene, clip seam on, zoom the
+junction) BEFORE claiming it done. The render is the acceptance gate the green test was not.
+
+## Acceptance (corrected from the W\* acceptance above)
+
+- **Per-solid watertight** — body AND each rock individually (`assert_mesh_watertight`), not the merged
+  soup.
+- **Decline-on-failure** — if the junction doesn't sew watertight, fall back to the shared path; never
+  ship a hole.
+- **Render-and-look** — the dipping cross-cut vein renders with the wall ONE surface AND the wall∩bed
+  junction sealed (no notch). Capture before/after.
+- **Determinism hash** — the W\*+sewn output bit-identical native↔wasm (the sew must be a pure function
+  of position + fields; `weld_points_into_mesh` is deterministic if fed a deterministic point set).
+- **Snap byte-identical** — W\*+sewing stays Clip-only.
+
+## Process lessons (write these into the discipline, not just the code)
+
+- Per-SOLID, not merged, watertightness — the renderer draws solids separately.
+- **Look before claiming.** I claimed "peek-a-boo closed" off a green merged-gap test without rendering;
+  the user's eyes were the gate. Render-and-look is mandatory before "done" on a visual fix.
+- **Decline, don't degrade.** A closed solid with a known sliver beats an open solid with a hole.
