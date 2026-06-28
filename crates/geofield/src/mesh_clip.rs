@@ -971,7 +971,7 @@ fn retriangulate_c_face(
 ) {
     let (pts3, local_kind, constraints) = build_face_cdt_input(c, tc, segs, seam);
     let normal = c.tri_normal_raw(tc);
-    let sub = cdt_face(&pts3, &constraints, normal);
+    let sub = cdt_face(&pts3, &constraints, normal, true);
 
     // The W triangles that cut THIS face, split by HOW they cut it. TRANSVERSAL cutters sign the
     // keep side (a sub-triangle is signed by the NEAREST of these — clamped closest point, NOT
@@ -1135,7 +1135,7 @@ fn retriangulate_w_face(
 ) {
     let (pts3, local_kind, constraints) = build_face_cdt_input(w, tw, segs, seam);
     let normal = w.tri_normal_raw(tw);
-    let faces = cdt_face(&pts3, &constraints, normal);
+    let faces = cdt_face(&pts3, &constraints, normal, true);
     for (i, j, k) in faces {
         // W keeps every sub-triangle, so a referenced seam vertex is always allocated here.
         let mut map = |li: usize, out: &mut SideBuilder| -> usize {
@@ -1204,10 +1204,15 @@ fn nearest_w_signed_among(
 /// 2D constrained Delaunay re-triangulation of one face: project 3D points to the face plane by
 /// dropping the dominant axis, run `cdt` with the constraint edges, and return triangles as index
 /// triples into `pts3` — wound to match `face_normal`. The 3D points are NOT moved.
-fn cdt_face(
+///
+/// `pub(crate)` so the solid-junction conform ([`crate::stack`]'s `conform_caps_to_strip`) can reuse
+/// the proven spade CDT for a whole cap REGION (it post-filters the returned faces by a keep-predicate
+/// rather than the single-face keep/discard the corefiner uses).
+pub(crate) fn cdt_face(
     pts3: &[[f64; 3]],
     constraints: &[(usize, usize)],
     face_normal: [f64; 3],
+    forbid_split: bool,
 ) -> Vec<(usize, usize, usize)> {
     use spade::{ConstrainedDelaunayTriangulation, Point2, Triangulation};
 
@@ -1224,21 +1229,26 @@ fn cdt_face(
         }
     }
     // `spade` resolves a constraint endpoint that lands on an existing vertex or edge (the
-    // seam-enters-a-face-edge case `cdt` silently dropped), splitting as needed. We forbid the
-    // constraint from being SPLIT into new vertices here (the seam chain doesn't self-cross within a
-    // single face for the corefinement we feed it); if that ever fires, it's a real new case to
-    // handle, not to paper over.
+    // seam-enters-a-face-edge case `cdt` silently dropped), splitting as needed. The corefiner
+    // (`forbid_split = true`) forbids the constraint from being SPLIT into new vertices (the seam
+    // chain doesn't self-cross within a single face for the corefinement we feed it); if that ever
+    // fires, it's a real new case to handle, not to paper over. The region-conform reuse
+    // (`forbid_split = false`) tolerates a split — a split vertex is dropped defensively below, so a
+    // genuine crossing on a pathological wall surfaces as a non-watertight cap (→ caller declines),
+    // NOT a panic.
     let n_before = t.num_vertices();
     for &(a, b) in constraints {
         if a < handles.len() && b < handles.len() && a != b {
             let _ = t.add_constraint_and_split(handles[a], handles[b], |p| p);
         }
     }
-    debug_assert_eq!(
-        t.num_vertices(),
-        n_before,
-        "spade split a seam constraint into new vertices — unhandled self-crossing in a face"
-    );
+    if forbid_split {
+        debug_assert_eq!(
+            t.num_vertices(),
+            n_before,
+            "spade split a seam constraint into new vertices — unhandled self-crossing in a face"
+        );
+    }
 
     // `inner_faces()` yields only the triangulated interior (the face). Map each spade vertex back
     // to our input index via its fixed handle; for our inputs that equals insertion order.

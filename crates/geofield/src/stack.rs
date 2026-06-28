@@ -1693,16 +1693,9 @@ impl<M: SeriesModel + BlockModel> Stack<M> {
             project_crease_ring(&mut body_solid, body_field.as_ref(), &body_isos, &body_beds, cell);
         }
         clamp_mesh_to_box(&mut body_solid, min, ext_max);
-        // NOTE (W*, docs/volume_mesh_wstar.md): wiring `splice_shared_wall` here was REVERTED. The
-        // face-swap shares the wall INTERIOR (closes the peek-a-boo sliver) but OPENS each rock at the
-        // wall∩bed junction — the body's wall strip does not connect to the rock's bed caps (measured:
-        // Snap rocks 0 open, naive-spliced rocks ~200+ open, NOT weldable). The renderer draws solids
-        // separately, so those become see-through holes — worse than the sliver. The strip↔bed-cap
-        // boundary genuinely needs RE-TRIANGULATION to a shared wall∩bed line (an arrangement at the
-        // junction), not a face-swap. `partition_wall`/`splice_shared_wall` stay as the primitives for
-        // that future work; production keeps the known-good per-rock-watertight path below.
-        let mut rock_solids: Vec<(usize, usize, usize, Mesh)> = Vec::with_capacity(unit_keys.len());
-        for (&(k, u), mut m) in unit_keys.iter().zip(it) {
+        // Build each rock unit's projected mesh (the known-good per-rock-watertight production path).
+        let mut rock_meshes: Vec<Mesh> = Vec::with_capacity(unit_keys.len());
+        for (&(k, _u), mut m) in unit_keys.iter().zip(it) {
             let mut beds: Vec<(&dyn ScalarField, f64)> = Vec::new();
             for &iso in &rb_isos[k] {
                 beds.push((rb_field[k].as_ref(), iso));
@@ -1722,8 +1715,70 @@ impl<M: SeriesModel + BlockModel> Stack<M> {
             // wall/crease vertex just PAST the box. Clamp back — the box is the hard meshing bound and a
             // boundary vertex belongs ON the wall (its depth from the projection is kept).
             clamp_mesh_to_box(&mut m, min, ext_max);
-            rock_solids.push((rb_j[k], rb_b[k], u, m));
+            rock_meshes.push(m);
         }
+
+        // W\* (Clip only, docs/volume_mesh_wstar.md): SHARE the body's wall, then CONFORM the wall∩bed
+        // junction so each rock stays per-solid watertight while it references the shared wall — this is
+        // what closes the dipping peek-a-boo for a well-formed wall. `splice_shared_wall` drops each
+        // rock's own wall and appends the body's wall strip (so body+rock share ONE wall triangulation,
+        // no coincident-but-offset second sheet); `conform_caps_to_strip` then stitches a ribbon from
+        // each rock cap's wall-side boundary to the strip's wall∩bed boundary so the rock seals.
+        //
+        // DECLINE-ON-FAILURE: attempt on a CLONE; commit only if EVERY rock is still individually
+        // watertight (incidence-2 off the box rim — `solid_watertight`, the per-SOLID criterion: the
+        // renderer draws each rock separately). On a degenerate wall whose wall∩bed boundary FOLDS (the
+        // under-constrained 2-point fit; `wstar_cap_conform_closes_rocks`/`wstar_conform_depth_sweep`),
+        // the ribbon can't fully close it → keep the un-spliced production rocks (the closed peek-a-boo).
+        // Never ship a hole. `Snap` is left untouched (byte-identical). The body is the unspliced wall
+        // donor — already watertight, unchanged.
+        if seam == SeamMode::Clip {
+            let mut unit_base = Vec::with_capacity(rb_nunits.len());
+            let mut acc = 0usize;
+            for &n in &rb_nunits {
+                unit_base.push(acc);
+                acc += n;
+            }
+            // Map a wall face's outward (rock-side) probe point to the rock index in `unit_keys` order:
+            // the block whose half-spaces contain it, then its bed slab; `usize::MAX` = body-only.
+            let unit_at = |p: [f64; 3]| -> usize {
+                for k in 0..rb_field.len() {
+                    if rb_planes[k].iter().all(|pl| pl.inside(p)) {
+                        let f = rb_field[k].scalar_field(p);
+                        let u = rb_isos[k].iter().filter(|&&iso| f > iso).count();
+                        if u < rb_nunits[k] {
+                            return unit_base[k] + u;
+                        }
+                    }
+                }
+                usize::MAX
+            };
+            let mut wstar = rock_meshes.clone();
+            let bases =
+                splice_shared_wall(&body_solid, &mut wstar, body_field.as_ref(), &body_isos, &unit_at, cell);
+            for (rock, &base) in wstar.iter_mut().zip(&bases) {
+                conform_caps_to_strip(rock, base, body_field.as_ref(), &body_isos, cell, min, ext_max);
+            }
+            let rim = cell * 0.1;
+            let on_box = |p: [f64; 3]| (0..3).any(|d| p[d] < min[d] + rim || p[d] > ext_max[d] - rim);
+            let closed = |m: &Mesh| -> bool {
+                let pos: Vec<[f64; 3]> = (0..m.vertex_count())
+                    .map(|i| [m.positions[3 * i] as f64, m.positions[3 * i + 1] as f64, m.positions[3 * i + 2] as f64])
+                    .collect();
+                let tris: Vec<[usize; 3]> =
+                    m.indices.chunks_exact(3).map(|t| [t[0] as usize, t[1] as usize, t[2] as usize]).collect();
+                solid_watertight(&pos, &tris, &on_box)
+            };
+            if wstar.iter().all(|m| closed(m)) {
+                rock_meshes = wstar; // W* closed every rock — share the wall.
+            } // else: decline → keep the un-spliced production rocks.
+        }
+
+        let rock_solids: Vec<(usize, usize, usize, Mesh)> = unit_keys
+            .iter()
+            .zip(rock_meshes)
+            .map(|(&(k, u), m)| (rb_j[k], rb_b[k], u, m))
+            .collect();
         Some((body_solid, rock_solids))
     }
 
@@ -2250,9 +2305,8 @@ fn clamp_mesh_to_box(mesh: &mut Mesh, lo: [f64; 3], hi: [f64; 3]) {
 /// the region id `classify_back` returns at the outward probe point. Pure function of position +
 /// fields — output order is `body`'s triangle order, no map-iteration nondeterminism (the W\*
 /// determinism gate).
-// W* primitive (not yet production — see `wstar_naive_splice_opens_rocks_so_not_wired`). Consumed by
-// `splice_shared_wall`; tested standalone by `partition_wall_selects_both_walls_and_classifies_back`.
-#[allow(dead_code)]
+// W* primitive — consumed by `splice_shared_wall` (wired into `mesh_cross_cut_solids_shared`'s Clip
+// path); tested standalone by `partition_wall_selects_both_walls_and_classifies_back`.
 fn partition_wall(
     body: &Mesh,
     vein_field: &dyn ScalarField,
@@ -2301,7 +2355,6 @@ fn partition_wall(
 
 /// The geometric W\* wall-face test (normal ∥ `∇vein`, centroid within `tol` of a wall iso). Shared
 /// by [`partition_wall`]'s selection and [`splice_shared_wall`]'s removal so both agree exactly.
-#[allow(dead_code)]
 fn face_is_wall(mesh: &Mesh, t: usize, vein_field: &dyn ScalarField, wall_isos: &[f64], tol: f64) -> bool {
     let dot = |a: [f64; 3], b: [f64; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
     let mag = |v: [f64; 3]| dot(v, v).sqrt();
@@ -2326,13 +2379,10 @@ fn face_is_wall(mesh: &Mesh, t: usize, vein_field: &dyn ScalarField, wall_isos: 
 /// faces whose outward unit is this rock, **flipped** (rock-outward winding) with the body wall
 /// vertices merged into the rock buffer. The wall interior is then shared by identity (no coincident
 /// second triangulation to interpenetrate). The wall∩bed BOUNDARY is left as the octree produced it;
-/// whether the W\* strip boundary seals against the bed-cap boundary is the gating triple-point
-/// question. NOT yet production: a naive splice OPENS each rock at the wall∩bed junction (the strip
-/// doesn't connect to the bed caps; see `wstar_naive_splice_opens_rocks_so_not_wired`), so wiring it
-/// needs a junction-sewing step first. Stays a primitive for that future work.
-/// Returns, per rock, the vertex index at which that rock's appended W\* strip vertices begin (so a
-/// caller can tell strip-boundary verts, `idx >= base`, from the rock's own bed-cap/box verts).
-#[allow(dead_code)]
+/// [`conform_caps_to_strip`] then stitches the rock's bed-cap boundary to this strip's wall∩bed boundary
+/// so the rock re-closes (a naive splice alone OPENS each rock there — `wstar_naive_splice_opens_rocks_so_not_wired`).
+/// Returns, per rock, the vertex index at which that rock's appended W\* strip vertices begin (so the
+/// conform can tell strip-boundary verts, `idx >= base`, from the rock's own bed-cap/box verts).
 fn splice_shared_wall(
     body: &Mesh,
     rocks: &mut [Mesh],
@@ -2467,6 +2517,329 @@ fn sew_junction(rock: &mut Mesh, base: u32, cell: f64) {
         strip.indices.push(i + voff);
     }
     *rock = weld_mesh(&strip, cell * 1e-3);
+}
+
+/// Build ordered vertex chains (simple polylines) from an undirected edge set. Endpoints have odd
+/// degree; interior verts degree 2. Branches are split into separate chains. Deterministic: starts and
+/// neighbour lists are sorted. Shared by the cap-side and strip-side boundary extraction in
+/// [`conform_caps_to_strip`].
+fn build_chains(edges: &[(u32, u32)]) -> Vec<Vec<u32>> {
+    use std::collections::{HashMap, HashSet};
+    let ekey = |a: u32, b: u32| if a < b { (a, b) } else { (b, a) };
+    let mut adj: HashMap<u32, Vec<u32>> = HashMap::new();
+    for &(a, b) in edges {
+        adj.entry(a).or_default().push(b);
+        adj.entry(b).or_default().push(a);
+    }
+    for v in adj.values_mut() {
+        v.sort_unstable();
+    }
+    let mut used: HashSet<(u32, u32)> = HashSet::new();
+    let mut chains: Vec<Vec<u32>> = Vec::new();
+    let mut starts: Vec<u32> = adj.iter().filter(|(_, n)| n.len() % 2 == 1).map(|(&v, _)| v).collect();
+    starts.sort_unstable();
+    let mut all_v: Vec<u32> = adj.keys().copied().collect();
+    all_v.sort_unstable();
+    for &start in starts.iter().chain(all_v.iter()) {
+        loop {
+            let next = adj.get(&start).and_then(|ns| ns.iter().copied().find(|&n| !used.contains(&ekey(start, n))));
+            let Some(mut cur) = next else { break };
+            let mut prev = start;
+            used.insert(ekey(prev, cur));
+            let mut chain = vec![prev, cur];
+            loop {
+                let nxt = adj
+                    .get(&cur)
+                    .and_then(|ns| ns.iter().copied().find(|&n| n != prev && !used.contains(&ekey(cur, n))));
+                let Some(n) = nxt else { break };
+                used.insert(ekey(cur, n));
+                chain.push(n);
+                prev = cur;
+                cur = n;
+            }
+            chains.push(chain);
+        }
+    }
+    chains
+}
+
+/// W\* junction conform ([`docs/volume_mesh_wstar.md`]) — the part `sew_junction` could not do. After
+/// [`splice_shared_wall`] gives a rock the body's shared wall STRIP, the rock is OPEN at the wall∩bed
+/// (and wall∩floor) junction: the strip's wall∩bed polyline and the rock cap's wall-side polyline are
+/// two DISJOINT samplings of the same `{vein=iso ∧ bed=iso}` curve (measured ~200–760 open edges/rock;
+/// the strip is ~2× finer; a mutual point-insertion weld is insufficient — `wstar_junction_sew_derisk`).
+///
+/// This STITCHES a thin triangle RIBBON across that gap: every original face is KEPT untouched, and the
+/// cap's wall-side boundary chain is zipped to the strip's wall∩bed boundary chain. (An earlier attempt
+/// re-triangulated the whole cap; that forces reproducing the box perimeter, where sub-cell-jittered
+/// verts project to degenerate slivers that collide with the unchanged box-side faces — it broke even
+/// already-closed caps. The ribbon never touches the box perimeter or the cap interior.)
+///
+/// Both sides are extracted as REAL free-boundary edge chains ([`build_chains`]) — the cap's from its
+/// own faces' wall-side incidence-1 edges, the strip's from its faces' incidence-1 edges that are NOT on
+/// a vertical box side. The cap's wall-side splits into one arc per wall (foot/hanging, divided by the
+/// band slot), while the strip's wall∩bed boundary is finer and may fragment, so each cap arc is
+/// PARTITIONED by which strip fragment each of its verts is nearest, and each contiguous cap sub-run is
+/// zipped to that fragment's span. Zipping REAL chain edges (always free boundary) gives each cap and
+/// strip edge incidence-2 with no overlap; the partition covers every fragment without double-covering a
+/// cap edge (an earlier whole-chain match double-covered a strip loop joining foot+hanging at the band
+/// tips → non-manifold). The strip is the canonical (finer) sampling, referenced by its existing index
+/// (`>= base`) and never moved.
+///
+/// Connectivity-only (positions untouched). Pure function of position + the vein field → native==wasm
+/// deterministic; chains and matches are built in sorted order, so no HashMap iteration feeds the output.
+///
+/// NOT a guarantee of closure: where the wall∩bed boundary FOLDS into parallel layers (a degenerate
+/// under-constrained fit; `wstar_cap_conform_closes_rocks`), the ribbon leaves residual open edges. The
+/// caller MUST re-check per-solid watertightness and DECLINE (fall back to the un-spliced production
+/// rock), never ship a hole.
+fn conform_caps_to_strip(
+    rock: &mut Mesh,
+    base: u32,
+    vein_field: &dyn ScalarField,
+    wall_isos: &[f64],
+    cell: f64,
+    min: [f64; 3],
+    ext: [f64; 3],
+) {
+    use std::collections::HashMap;
+    if wall_isos.is_empty() {
+        return;
+    }
+    let dot = |a: [f64; 3], b: [f64; 3]| a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+    let mag = |v: [f64; 3]| dot(v, v).sqrt();
+    let sub3 = |a: [f64; 3], b: [f64; 3]| [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+    let base = base as usize;
+    // A wall∩box SIDE edge (vertical, on an x/y box face) connects different cap levels and must NOT be
+    // zipped — exclude any edge whose midpoint lies on a vertical box face. The z faces (floor/ceiling)
+    // are NOT excluded: they are themselves cap levels (the wall∩floor junction needs conforming). For a
+    // DIPPING wall the side edges have xy extent, so a pure horizontal/vertical (xy-length) test fails;
+    // box-face membership is the robust discriminator.
+    let rim_m = 1.0_f64.min(0.25 * cell);
+    let on_side = |p: [f64; 3]| {
+        p[0] < min[0] + rim_m || p[0] > ext[0] - rim_m || p[1] < min[1] + rim_m || p[1] > ext[1] - rim_m
+    };
+
+    // Snapshot into owned arrays so the read helpers don't borrow `rock` across the write-back.
+    let verts: Vec<[f64; 3]> = (0..rock.vertex_count())
+        .map(|i| [rock.positions[3 * i] as f64, rock.positions[3 * i + 1] as f64, rock.positions[3 * i + 2] as f64])
+        .collect();
+    let tris: Vec<[u32; 3]> = rock.indices.chunks_exact(3).map(|t| [t[0], t[1], t[2]]).collect();
+    let nf = tris.len();
+    let is_strip = |t: usize| tris[t].iter().all(|&v| v as usize >= base);
+    let on_wall = |p: [f64; 3]| {
+        let v = vein_field.scalar_field(p);
+        let g = mag(vein_field.scalar_field_gradient(p)).max(1e-12);
+        wall_isos.iter().any(|&w| (v - w).abs() / g < cell)
+    };
+    let ekey = |a: u32, b: u32| if a < b { (a, b) } else { (b, a) };
+
+    // ---- 1. The cap's WALL-SIDE boundary: incidence-1 edges among the rock's OWN (non-strip) faces
+    //         whose midpoint is on a wall. Remember the adjacent own-face per edge for ribbon winding. --
+    let mut own_inc: HashMap<(u32, u32), (u32, usize)> = HashMap::new();
+    for t in 0..nf {
+        if is_strip(t) {
+            continue;
+        }
+        let f = tris[t];
+        for &(a, b) in &[(f[0], f[1]), (f[1], f[2]), (f[2], f[0])] {
+            let slot = own_inc.entry(ekey(a, b)).or_insert((0, t));
+            slot.0 += 1;
+            slot.1 = t;
+        }
+    }
+    let mut cap_edges: Vec<(u32, u32)> = Vec::new();
+    let mut edge_face: HashMap<(u32, u32), usize> = HashMap::new();
+    for (&(a, b), &(c, t)) in &own_inc {
+        if c != 1 {
+            continue;
+        }
+        let mid = [
+            0.5 * (verts[a as usize][0] + verts[b as usize][0]),
+            0.5 * (verts[a as usize][1] + verts[b as usize][1]),
+            0.5 * (verts[a as usize][2] + verts[b as usize][2]),
+        ];
+        if on_wall(mid) && !on_side(mid) {
+            cap_edges.push((a, b));
+            edge_face.insert((a, b), t);
+        }
+    }
+    if cap_edges.is_empty() {
+        return;
+    }
+    cap_edges.sort_unstable();
+
+    // ---- 2. The strip's wall∩bed boundary: incidence-1 strip edges that are NOT on a vertical box
+    //         side (those are the wall∩box edges, on the rim — legitimately open, not zipped). ----
+    let mut sinc: HashMap<(u32, u32), u32> = HashMap::new();
+    for t in 0..nf {
+        if !is_strip(t) {
+            continue;
+        }
+        let f = tris[t];
+        for &(a, b) in &[(f[0], f[1]), (f[1], f[2]), (f[2], f[0])] {
+            *sinc.entry(ekey(a, b)).or_insert(0) += 1;
+        }
+    }
+    let mut strip_edges: Vec<(u32, u32)> = Vec::new();
+    for (&(a, b), &c) in &sinc {
+        let mid = [
+            0.5 * (verts[a as usize][0] + verts[b as usize][0]),
+            0.5 * (verts[a as usize][1] + verts[b as usize][1]),
+            0.5 * (verts[a as usize][2] + verts[b as usize][2]),
+        ];
+        if c == 1 && !on_side(mid) {
+            strip_edges.push((a, b));
+        }
+    }
+    strip_edges.sort_unstable();
+    if strip_edges.is_empty() {
+        return;
+    }
+
+    // ---- 3. Real chains for both sides. ----
+    let cap_chains = build_chains(&cap_edges);
+    let strip_chains = build_chains(&strip_edges);
+    if strip_chains.is_empty() {
+        return;
+    }
+    let strip_pts: Vec<Vec<[f64; 3]>> =
+        strip_chains.iter().map(|ch| ch.iter().map(|&v| verts[v as usize]).collect()).collect();
+    // squared distance from `p` to a polyline.
+    let dist2_to = |p: [f64; 3], poly: &[[f64; 3]]| -> f64 {
+        let mut best = f64::INFINITY;
+        for w in poly.windows(2) {
+            let (a, b) = (w[0], w[1]);
+            let ab = sub3(b, a);
+            let l2 = dot(ab, ab).max(1e-18);
+            let t = (dot(sub3(p, a), ab) / l2).clamp(0.0, 1.0);
+            let foot = [a[0] + t * ab[0], a[1] + t * ab[1], a[2] + t * ab[2]];
+            best = best.min(dot(sub3(p, foot), sub3(p, foot)));
+        }
+        best
+    };
+    let gather = 2.0 * cell;
+
+    // ---- 4. Per cap chain: zip it to the nearby strip boundary. The cap's wall-side splits into one
+    //         arc per wall (foot / hanging, divided by the band slot); the strip's wall∩bed boundary is
+    //         finer and FRAGMENTED (`build_chains` splits it at the staircase's branch/endpoint verts),
+    //         so a single cap arc must cover SEVERAL strip fragments. We PARTITION the cap arc by which
+    //         strip fragment each cap vertex is nearest, and zip each contiguous cap sub-run to that
+    //         fragment's nearby portion. Zipping REAL chain edges (always free boundary) keeps each cap
+    //         and strip edge incidence-2 with no overlap; partitioning covers every fragment without
+    //         double-covering a cap edge. ----
+    let mut ribbon: Vec<[u32; 3]> = Vec::new();
+    let d2v = |x: u32, y: u32| dot(sub3(verts[x as usize], verts[y as usize]), sub3(verts[x as usize], verts[y as usize]));
+    for cap in &cap_chains {
+        if cap.len() < 2 {
+            continue;
+        }
+        let cpts: Vec<[f64; 3]> = cap.iter().map(|&v| verts[v as usize]).collect();
+        // cap outward normal = average of the chain's edges' adjacent cap faces.
+        let mut nrm = [0.0; 3];
+        for w in cap.windows(2) {
+            if let Some(&t) = edge_face.get(&ekey(w[0], w[1])) {
+                let f = tris[t];
+                let (a, b, c) = (verts[f[0] as usize], verts[f[1] as usize], verts[f[2] as usize]);
+                let n = [
+                    (b[1] - a[1]) * (c[2] - a[2]) - (b[2] - a[2]) * (c[1] - a[1]),
+                    (b[2] - a[2]) * (c[0] - a[0]) - (b[0] - a[0]) * (c[2] - a[2]),
+                    (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]),
+                ];
+                let nm = mag(n).max(1e-12);
+                nrm = [nrm[0] + n[0] / nm, nrm[1] + n[1] / nm, nrm[2] + n[2] / nm];
+            }
+        }
+        let m = mag(nrm);
+        nrm = if m < 1e-9 { [0.0, 0.0, 1.0] } else { [nrm[0] / m, nrm[1] / m, nrm[2] / m] };
+        let wind = |a: u32, b: u32, c: u32| -> [u32; 3] {
+            let (pa, pb, pc) = (verts[a as usize], verts[b as usize], verts[c as usize]);
+            let e1 = sub3(pb, pa);
+            let e2 = sub3(pc, pa);
+            let n = [e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]];
+            if dot(n, nrm) < 0.0 { [a, c, b] } else { [a, b, c] }
+        };
+
+        // Per cap vertex: the nearest strip fragment within `gather` (or None).
+        let label: Vec<Option<usize>> = cpts
+            .iter()
+            .map(|&p| {
+                let mut best: Option<(f64, usize)> = None;
+                for (si, spts) in strip_pts.iter().enumerate() {
+                    if spts.len() < 2 {
+                        continue;
+                    }
+                    let d = dist2_to(p, spts);
+                    if d <= gather * gather && best.map_or(true, |(bd, _)| d < bd) {
+                        best = Some((d, si));
+                    }
+                }
+                best.map(|(_, si)| si)
+            })
+            .collect();
+        // Maximal runs of equal label; consecutive runs share their boundary vertex.
+        let mut start = 0usize;
+        for i in 1..=cap.len() {
+            if i == cap.len() || label[i] != label[start] {
+                if let Some(si) = label[start] {
+                    let (s, e) = (start, i.min(cap.len() - 1)); // [s, e] inclusive
+                    if e > s {
+                        let cap_sub = &cap[s..=e];
+                        let cs_pts: Vec<[f64; 3]> = cap_sub.iter().map(|&v| verts[v as usize]).collect();
+                        // The fragment's span near this cap sub-arc: from the FIRST to the LAST vertex
+                        // within `gather` (inclusive of any momentary divergence between), so no strip
+                        // edge in that reach is stranded (which would leave a hole).
+                        let sc = &strip_chains[si];
+                        let inb: Vec<bool> = sc.iter().map(|&v| dist2_to(verts[v as usize], &cs_pts) <= gather * gather).collect();
+                        let first = inb.iter().position(|&b| b);
+                        let last = inb.iter().rposition(|&b| b);
+                        if let (Some(fst), Some(lst)) = (first, last) {
+                            if lst > fst {
+                            let mut strip: Vec<u32> = sc[fst..=lst].to_vec();
+                            let c0 = cs_pts[0];
+                            let (sf, sl) = (verts[strip[0] as usize], verts[*strip.last().unwrap() as usize]);
+                            if dot(sub3(sl, c0), sub3(sl, c0)) < dot(sub3(sf, c0), sub3(sf, c0)) {
+                                strip.reverse();
+                            }
+                            let (mut ci, mut sj) = (0usize, 0usize);
+                            let (cm, sn) = (cap_sub.len(), strip.len());
+                            while ci + 1 < cm || sj + 1 < sn {
+                                let adv_cap = if ci + 1 >= cm {
+                                    false
+                                } else if sj + 1 >= sn {
+                                    true
+                                } else {
+                                    d2v(cap_sub[ci + 1], strip[sj]) <= d2v(strip[sj + 1], cap_sub[ci])
+                                };
+                                if adv_cap {
+                                    ribbon.push(wind(cap_sub[ci], cap_sub[ci + 1], strip[sj]));
+                                    ci += 1;
+                                } else {
+                                    ribbon.push(wind(strip[sj], strip[sj + 1], cap_sub[ci]));
+                                    sj += 1;
+                                }
+                            }
+                            } // if lst > fst
+                        } // if let (first, last)
+                    } // if e > s
+                } // if let Some(si) = label[start]
+                start = i.min(cap.len() - 1);
+                if i == cap.len() {
+                    break;
+                }
+            }
+        }
+    }
+
+    if ribbon.is_empty() {
+        return;
+    }
+    let mut idx: Vec<u32> = rock.indices.clone();
+    for f in &ribbon {
+        idx.extend_from_slice(f);
+    }
+    rock.indices = idx;
+    rock.normals.clear(); // mixed shading after the ribbon → let the renderer use face normals.
 }
 
 fn project_vein_walls(mesh: &mut Mesh, vein_field: &dyn ScalarField, wall_isos: &[f64], tol: f64) {
@@ -2678,6 +3051,176 @@ mod tests {
     use crate::mesh_test_util::{assert_mesh_watertight, assert_volume_watertight, incidence};
     use crate::Model;
     use std::collections::HashMap;
+
+    /// TEMPORARY de-risk spike (docs/13 §4/§5 fold-characterization probe). Brute-checks the vein-BAND
+    /// closed solid for SELF-INTERSECTION among NON-ADJACENT triangle pairs (sharing no vertex index),
+    /// AABB-bucketed on a uniform grid for cost. A clean FOLD has ZERO self-intersections (curvy but
+    /// embedded); a dual-contour TANGLE has many. Reports the count, a few example positions (esp. near
+    /// z=650, x≈675), and the count of coincident-position vertex clusters (collapsed sheets). This is
+    /// the highest-value bit and is engine-independent (complements the Manifold probe).
+    /// `#[ignore]`; run with `cargo test -p geofield spike_band_self_intersection -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn spike_band_self_intersection() {
+        let cfg = OctreeConfig { max_depth: 6, min_depth: 2, qef_threshold: 1e-6, cap: true };
+        let cases: [(&str, fn() -> (Stack<Model>, Model)); 2] = [
+            ("DEGENERATE", vertical_vein_over_column),
+            ("WELL-COND ", well_conditioned_vein_over_column),
+        ];
+
+        // --- minimal geometry ---
+        fn sub(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+            [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+        }
+        fn cross(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+            [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
+        }
+        fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
+            a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+        }
+        // Does segment p->q cross triangle (a,b,c)'s interior (Moller-Trumbore, both-sided)?
+        // Returns the hit point if the crossing is strictly inside the segment and triangle (small
+        // margin to ignore shared-boundary grazes that aren't real interpenetration).
+        fn seg_tri_hit(
+            p: [f64; 3],
+            q: [f64; 3],
+            a: [f64; 3],
+            b: [f64; 3],
+            c: [f64; 3],
+        ) -> Option<[f64; 3]> {
+            let dir = sub(q, p);
+            let e1 = sub(b, a);
+            let e2 = sub(c, a);
+            let pv = cross(dir, e2);
+            let det = dot(e1, pv);
+            let m = 1e-9;
+            if det.abs() < 1e-18 {
+                return None; // parallel / degenerate
+            }
+            let inv = 1.0 / det;
+            let tv = sub(p, a);
+            let u = dot(tv, pv) * inv;
+            if u < m || u > 1.0 - m {
+                return None;
+            }
+            let qv = cross(tv, e1);
+            let v = dot(dir, qv) * inv;
+            if v < m || u + v > 1.0 - m {
+                return None;
+            }
+            let t = dot(e2, qv) * inv;
+            if t <= m || t >= 1.0 - m {
+                return None; // crossing outside the open segment
+            }
+            Some([p[0] + t * dir[0], p[1] + t * dir[1], p[2] + t * dir[2]])
+        }
+
+        for (label, build) in cases {
+            let (stack, _f) = build();
+            let body = stack
+                .mesh_cross_cut_solids_shared(
+                    0,
+                    [0.0, 0.0, 0.0],
+                    1000.0,
+                    [1000.0, 1000.0, 1000.0],
+                    cfg,
+                    SeamMode::Snap,
+                )
+                .expect("body")
+                .0;
+
+            let pos: Vec<[f64; 3]> = body
+                .positions
+                .chunks_exact(3)
+                .map(|c| [c[0] as f64, c[1] as f64, c[2] as f64])
+                .collect();
+            let tris: Vec<[usize; 3]> = body
+                .indices
+                .chunks_exact(3)
+                .map(|t| [t[0] as usize, t[1] as usize, t[2] as usize])
+                .collect();
+
+            // Coincident-position vertex clusters (collapsed sheets). Quantize to 1e-4 mm.
+            let mut buckets: HashMap<(i64, i64, i64), u32> = HashMap::new();
+            let qz = |x: f64| (x * 1e4).round() as i64;
+            for p in &pos {
+                *buckets.entry((qz(p[0]), qz(p[1]), qz(p[2]))).or_insert(0) += 1;
+            }
+            let coincident_clusters = buckets.values().filter(|&&n| n > 1).count();
+            let max_cluster = buckets.values().copied().max().unwrap_or(0);
+
+            // AABB grid over the triangles; cell = 1000/64 ~ 15.6 (the octree cell at depth 6).
+            let cell = 1000.0 / 64.0;
+            let key = |p: [f64; 3]| -> (i64, i64, i64) {
+                ((p[0] / cell) as i64, (p[1] / cell) as i64, (p[2] / cell) as i64)
+            };
+            let mut grid: HashMap<(i64, i64, i64), Vec<usize>> = HashMap::new();
+            for (ti, t) in tris.iter().enumerate() {
+                let (a, b, c) = (pos[t[0]], pos[t[1]], pos[t[2]]);
+                let lo = [
+                    a[0].min(b[0]).min(c[0]),
+                    a[1].min(b[1]).min(c[1]),
+                    a[2].min(b[2]).min(c[2]),
+                ];
+                let hi = [
+                    a[0].max(b[0]).max(c[0]),
+                    a[1].max(b[1]).max(c[1]),
+                    a[2].max(b[2]).max(c[2]),
+                ];
+                let (klo, khi) = (key(lo), key(hi));
+                for gx in klo.0..=khi.0 {
+                    for gy in klo.1..=khi.1 {
+                        for gz in klo.2..=khi.2 {
+                            grid.entry((gx, gy, gz)).or_default().push(ti);
+                        }
+                    }
+                }
+            }
+
+            // For each grid cell, test candidate pairs that share NO vertex index. A real
+            // self-intersection = an EDGE of one triangle piercing the INTERIOR of a non-adjacent
+            // triangle. Test all three edges of the lower-index triangle against the higher.
+            let mut seen_pairs: std::collections::HashSet<(usize, usize)> = Default::default();
+            let mut hits: Vec<[f64; 3]> = Vec::new();
+            for cand in grid.values() {
+                for i in 0..cand.len() {
+                    for j in (i + 1)..cand.len() {
+                        let (ta, tb) = (cand[i], cand[j]);
+                        let (lo, hi) = if ta < tb { (ta, tb) } else { (tb, ta) };
+                        if !seen_pairs.insert((lo, hi)) {
+                            continue;
+                        }
+                        let (t1, t2) = (tris[lo], tris[hi]);
+                        // Skip adjacent (share any vertex index).
+                        if t1.iter().any(|a| t2.contains(a)) {
+                            continue;
+                        }
+                        let (a, b, c) = (pos[t2[0]], pos[t2[1]], pos[t2[2]]);
+                        for e in [(t1[0], t1[1]), (t1[1], t1[2]), (t1[2], t1[0])] {
+                            if let Some(h) = seg_tri_hit(pos[e.0], pos[e.1], a, b, c) {
+                                hits.push(h);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            let near = hits
+                .iter()
+                .filter(|h| (h[2] - 650.0).abs() < 30.0)
+                .count();
+            let n_hits = hits.len();
+            eprintln!(
+                "[spike] {label}: verts={} tris={} | SELF-INTERSECTIONS(non-adjacent edge->tri)={n_hits} (near z=650: {near}) | coincident-pos clusters={coincident_clusters} max-cluster={max_cluster}",
+                pos.len(),
+                tris.len()
+            );
+            for h in hits.iter().take(8) {
+                eprintln!("        hit @ [{:.1}, {:.1}, {:.1}]", h[0], h[1], h[2]);
+            }
+        }
+    }
 
     /// An imported-mesh field proxy (`MeshSdf`) drops straight into `fill_normals_from_field`: an
     /// imported clip with no defining field can still reshade its corefiner output from the SDF
@@ -5231,20 +5774,18 @@ mod tests {
             incidence(&tris).iter().filter(|(_, &c)| c == 1).filter(|((a, b), _)| !(on_box(pos[*a]) && on_box(pos[*b]))).count()
         };
 
-        let (body, rocks_keyed) = stack
-            .mesh_cross_cut_solids_shared(0, min, size, ext, cfg, SeamMode::Clip)
-            .expect("vein solids should mesh");
-        let mut rocks: Vec<Mesh> = rocks_keyed.into_iter().map(|(_, _, _, m)| m).collect();
+        let (body, mut rocks) = clip_projected_unspliced(&stack, &vein_field, min, size, ext, cfg);
 
-        // Production (W* NOT wired): each rock is individually watertight.
+        // The un-spliced production rocks are each individually watertight.
         let before: usize = rocks.iter().map(open).sum();
-        assert_eq!(before, 0, "production Clip rocks must be individually watertight (W* not wired)");
+        assert_eq!(before, 0, "un-spliced production Clip rocks must be individually watertight");
 
-        // The naive face-swap opens them — the reason it stays a primitive, not production.
+        // The naive face-swap (splice alone, no conform) OPENS them — why it needs the junction conform
+        // (`conform_caps_to_strip`) before production. The wired path applies splice+conform together.
         let _ = splice_shared_wall(&body, &mut rocks, &vein_field, &wall_isos, &classify, cell);
         let after: usize = rocks.iter().map(open).sum();
         assert!(after > 0, "expected the naive splice to OPEN the rocks (the finding); got {after}");
-        eprintln!("[W*] naive splice opens rocks: per-rock open before={before} → after={after} (needs junction sewing before production)");
+        eprintln!("[W*] naive splice opens rocks: per-rock open before={before} → after={after} (needs the junction conform)");
     }
 
     /// W\* JUNCTION-SEW DE-RISK (docs/volume_mesh_wstar.md): does mutual point-insertion sewing
@@ -5270,10 +5811,7 @@ mod tests {
             incidence(&tris).iter().filter(|(_, &c)| c == 1).filter(|((a, b), _)| !(on_box(pos[*a]) && on_box(pos[*b]))).count()
         };
 
-        let (body, rocks_keyed) = stack
-            .mesh_cross_cut_solids_shared(0, min, size, ext, cfg, SeamMode::Clip)
-            .expect("vein solids should mesh");
-        let mut rocks: Vec<Mesh> = rocks_keyed.into_iter().map(|(_, _, _, m)| m).collect();
+        let (body, mut rocks) = clip_projected_unspliced(&stack, &vein_field, min, size, ext, cfg);
         let bases = splice_shared_wall(&body, &mut rocks, &vein_field, &wall_isos, &classify, cell);
         let post_splice: Vec<usize> = rocks.iter().map(|r| open(r)).collect();
         for (rock, &base) in rocks.iter_mut().zip(&bases) {
@@ -5286,6 +5824,183 @@ mod tests {
             eprintln!("[W* sew-derisk] SUCCESS — sew closes all rocks per-solid; safe to wire WITH a decline gate, then render-and-look");
         } else {
             eprintln!("[W* sew-derisk] INSUFFICIENT — {total} edges still open; escalate (CDT re-triangulation, or certified-arrangement evidence). Do NOT wire.");
+        }
+    }
+
+    /// Per-solid open-edge count: incidence-1 edges off the box rim, in the RAW index space (the
+    /// criterion [`assert_mesh_watertight`] uses). NOT `merge_dedup` — that collapses coincident-but-
+    /// distinct cap/strip verts into false non-manifolds (the W\* ribbon deliberately references the
+    /// strip's own indices, which sit ON the cap's wall∩bed line). `0` ⇒ the rock is watertight.
+    fn raw_open_off_rim(m: &Mesh, on_box: &dyn Fn([f64; 3]) -> bool) -> usize {
+        let rp = |i: u32| [m.positions[i as usize * 3] as f64, m.positions[i as usize * 3 + 1] as f64, m.positions[i as usize * 3 + 2] as f64];
+        let mut inc: std::collections::HashMap<(u32, u32), u32> = std::collections::HashMap::new();
+        for t in m.indices.chunks_exact(3) {
+            for &(a, b) in &[(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+                let e = if a < b { (a, b) } else { (b, a) };
+                *inc.entry(e).or_insert(0) += 1;
+            }
+        }
+        inc.iter()
+            .filter(|(_, &c)| c == 1)
+            .filter(|((a, b), _)| !(on_box(rp(*a)) && on_box(rp(*b))))
+            .count()
+    }
+
+    /// Reconstruct the Clip-projected, PRE-W\* body + rocks the production path builds BEFORE it shares
+    /// the wall — needed because `mesh_cross_cut_solids_shared(Clip)` now applies W\* internally, so it no
+    /// longer exposes the un-spliced rocks the W\* primitives operate on. Takes the Snap solids (identical
+    /// connectivity, walls un-projected) and applies the same Clip wall/crease projections + clamp. Assumes
+    /// the cross-cut column is series 1 (the two W\* fixtures). For exercising `splice_shared_wall` /
+    /// `conform_caps_to_strip` in isolation from the wiring.
+    fn clip_projected_unspliced(
+        stack: &Stack<Model>,
+        vein: &Model,
+        min: [f64; 3],
+        size: f64,
+        ext: [f64; 3],
+        cfg: OctreeConfig,
+    ) -> (Mesh, Vec<Mesh>) {
+        let cell = size / (1u32 << cfg.max_depth) as f64;
+        let wall_isos = vein.interface_isovalues();
+        let (mut body, rocks_keyed) = stack
+            .mesh_cross_cut_solids_shared(0, min, size, ext, cfg, SeamMode::Snap)
+            .expect("snap solids");
+        let mut rocks: Vec<Mesh> = rocks_keyed.into_iter().map(|(_, _, _, m)| m).collect();
+        let bed = &stack.series_at(1).expect("column series").model;
+        let bed_isos = bed.interface_isovalues();
+        let beds: Vec<(&dyn ScalarField, f64)> =
+            bed_isos.iter().map(|&iso| (bed as &dyn ScalarField, iso)).collect();
+        let mut proj = |m: &mut Mesh| {
+            project_vein_walls(m, vein, &wall_isos, cell);
+            project_crease_ring(m, vein, &wall_isos, &beds, cell);
+            clamp_mesh_to_box(m, min, ext);
+        };
+        proj(&mut body);
+        for r in &mut rocks {
+            proj(r);
+        }
+        (body, rocks)
+    }
+
+    /// W\* JUNCTION CONFORM — DE-RISK GATE ([`docs/volume_mesh_wstar.md`]). After `splice_shared_wall`
+    /// gives each rock the body's shared wall strip, `conform_caps_to_strip` STITCHES a ribbon from each
+    /// cap's wall-side boundary to the strip's wall∩bed polyline. The gate is PER-SOLID watertightness
+    /// (the renderer draws each rock separately; the MERGED check the first W\* attempt used was the
+    /// wrong criterion and hid the regression). Result, measured here and pinned:
+    ///
+    /// - **WELL-CONDITIONED wall** (`well_conditioned_vein_over_column`): body AND every rock close
+    ///   PER-SOLID watertight, zero non-manifold. The ribbon is sufficient for a well-formed wall.
+    /// - **DEGENERATE 2-point dipping fit** (`vertical_vein_over_column`, the user's peek-a-boo scene):
+    ///   the floor unit and the z=350 bed close, but the z=650 wall∩bed leaves residual STRIP free edges
+    ///   open — its boundary is finer AND fragmented into parallel spurs (the 2-point fit waves worst far
+    ///   from its z=200/800 control points), which the ribbon cannot disentangle without double-covering
+    ///   the cap. This is the SAME wall on which [`Stack::mesh_cross_cut_solids_corefined`] declines
+    ///   (`corefined_falls_back_on_wavy_wall`), and is the FIRST measured evidence the exact-arrangement
+    ///   path (`docs/11`/`docs/12`) is needed AT THE JUNCTION — a geometry/topology need, not determinism.
+    ///   Per the discipline, such a scene must DECLINE (fall back to the closed peek-a-boo solid), never
+    ///   ship the holes.
+    #[test]
+    fn wstar_cap_conform_closes_rocks() {
+        let (min, size, ext) = ([0.0, 0.0, 0.0], 1000.0, [1000.0, 1000.0, 1000.0]);
+        let cfg = OctreeConfig { max_depth: 6, min_depth: 2, qef_threshold: 1e-6, cap: true };
+        let cell = size / (1u32 << cfg.max_depth) as f64;
+        let classify = |p: [f64; 3]| if p[2] < 350.0 { 0usize } else if p[2] < 650.0 { 1 } else { 2 };
+        let on_box = |p: [f64; 3]| (0..3).any(|d| p[d] < 1.0 || p[d] > size - 1.0);
+
+        let run = |stack: &Stack<Model>, vein_field: &Model| -> (Vec<usize>, Vec<usize>) {
+            let wall_isos = vein_field.interface_isovalues();
+            // Pre-W* rocks (the wired Clip path now applies W* itself; exercise the primitives directly).
+            let (body, mut rocks) = clip_projected_unspliced(stack, vein_field, min, size, ext, cfg);
+            let bases = splice_shared_wall(&body, &mut rocks, vein_field, &wall_isos, &classify, cell);
+            let pre: Vec<usize> = rocks.iter().map(|r| raw_open_off_rim(r, &on_box)).collect(); // after splice
+            for (rock, &base) in rocks.iter_mut().zip(&bases) {
+                conform_caps_to_strip(rock, base, vein_field, &wall_isos, cell, min, ext);
+            }
+            // body is the unspliced shared-wall donor — always watertight; assert it stays so.
+            assert_mesh_watertight(&body, &on_box);
+            let post: Vec<usize> = rocks.iter().map(|r| raw_open_off_rim(r, &on_box)).collect();
+            (pre, post)
+        };
+
+        // WELL-CONDITIONED: the ribbon fully closes every rock per-solid (the achievable deliverable).
+        let (wc_stack, wc_vein) = well_conditioned_vein_over_column();
+        let (wc_pre, wc_post) = run(&wc_stack, &wc_vein);
+        eprintln!("[W* conform] well-conditioned: per-rock open {wc_pre:?} → {wc_post:?}");
+        assert!(wc_pre.iter().sum::<usize>() > 0, "splice should open the rocks (else the test proves nothing)");
+        assert!(
+            wc_post.iter().all(|&o| o == 0),
+            "well-conditioned rocks must close PER-SOLID after the conform; got {wc_post:?}"
+        );
+
+        // DEGENERATE dipping fit: the conform sharply reduces the holes (and adds NO non-manifold), but
+        // the z=650 wall∩bed cannot fully close — the decline case. Pin it: rock 0 closes; the total
+        // residual is a fraction of the pre-conform holes (so the ribbon is doing real work) but nonzero.
+        let (dp_stack, dp_vein) = vertical_vein_over_column();
+        let (dp_pre, dp_post) = run(&dp_stack, &dp_vein);
+        eprintln!("[W* conform] dipping (degenerate): per-rock open {dp_pre:?} → {dp_post:?}");
+        assert_eq!(dp_post[0], 0, "the floor unit (rock 0) must close even on the degenerate fit");
+        let (pre_sum, post_sum) = (dp_pre.iter().sum::<usize>(), dp_post.iter().sum::<usize>());
+        assert!(post_sum * 2 < pre_sum, "conform should at least halve the dipping holes: {pre_sum} → {post_sum}");
+        assert!(post_sum > 0, "the degenerate z=650 wall∩bed is the documented decline case (escalation evidence)");
+    }
+
+    /// W\* PRODUCTION INVARIANT: `mesh_cross_cut_solids_shared`'s `Clip` path emits PER-SOLID watertight
+    /// body + rocks for BOTH fixtures — the well-conditioned wall via the wired W\* share+conform, the
+    /// degenerate dipping fit via the decline-on-failure fallback to the un-spliced production rocks.
+    /// This is the production guarantee: the wall∩bed junction is either sealed (W\*) or left as the
+    /// closed peek-a-boo, NEVER a hole. (The conform's partial closure on the degenerate fit — the
+    /// escalation evidence — is measured by `wstar_cap_conform_closes_rocks`, which exercises the
+    /// primitives directly; here we assert only that production never ships an open solid.)
+    #[test]
+    fn wstar_clip_output_watertight() {
+        let (min, size, ext) = ([0.0, 0.0, 0.0], 1000.0, [1000.0, 1000.0, 1000.0]);
+        let cfg = OctreeConfig { max_depth: 6, min_depth: 2, qef_threshold: 1e-6, cap: true };
+        let on_box = |p: [f64; 3]| (0..3).any(|d| p[d] < 1.0 || p[d] > size - 1.0);
+        for (name, (stack, _vein)) in
+            [("dipping", vertical_vein_over_column()), ("well-conditioned", well_conditioned_vein_over_column())]
+        {
+            let (body, rocks) = stack
+                .mesh_cross_cut_solids_shared(0, min, size, ext, cfg, SeamMode::Clip)
+                .expect("vein solids should mesh");
+            assert_mesh_watertight(&body, &on_box);
+            for (j, b, u, m) in &rocks {
+                if m.triangle_count() > 0 {
+                    assert_mesh_watertight(m, &on_box);
+                }
+                let _ = (j, b, u);
+            }
+            eprintln!("[W* wired] {name}: Clip output per-solid watertight ({} rocks)", rocks.len());
+        }
+    }
+
+    /// Does deeper octree (Track B / adaptive refinement) resolve the degenerate dipping fold that
+    /// leaves the conform open at z=650? MEASURED — NO, it makes it WORSE and erratically:
+    ///   depth 6 → [0, 128, 186];  depth 7 → [0, 759, 0];  depth 8 → [757, 1530, 765].
+    /// Finer cells resolve MORE of the under-constrained 2-point fit's spurious wave, so the wall∩bed
+    /// boundary folds into MORE parallel layers (measured: 3 coincident free-boundary chains at z=650),
+    /// not fewer. The fold is intrinsic to the FIT'S CONDITIONING, not the resolution — so Track B does
+    /// not fix THIS junction; a better-conditioned vein fit does (the 15-point `well_conditioned_…`
+    /// fixture closes fully at depth 6) — or the exact-arrangement path (`docs/11`/`docs/12`). Run:
+    /// `cargo test -p geofield wstar_conform_depth_sweep -- --nocapture --ignored`
+    #[test]
+    #[ignore]
+    fn wstar_conform_depth_sweep() {
+        let (min, size, ext) = ([0.0, 0.0, 0.0], 1000.0, [1000.0, 1000.0, 1000.0]);
+        let classify = |p: [f64; 3]| if p[2] < 350.0 { 0usize } else if p[2] < 650.0 { 1 } else { 2 };
+        let on_box = |p: [f64; 3]| (0..3).any(|d| p[d] < 1.0 || p[d] > size - 1.0);
+        for depth in [6u32, 7, 8] {
+            let (stack, vein) = vertical_vein_over_column();
+            let cfg = OctreeConfig { max_depth: depth, min_depth: 2, qef_threshold: 1e-6, cap: true };
+            let cell = size / (1u32 << depth) as f64;
+            let wall_isos = vein.interface_isovalues();
+            let t0 = std::time::Instant::now();
+            let (body, mut rocks) = clip_projected_unspliced(&stack, &vein, min, size, ext, cfg);
+            let bases = splice_shared_wall(&body, &mut rocks, &vein, &wall_isos, &classify, cell);
+            for (rock, &base) in rocks.iter_mut().zip(&bases) {
+                conform_caps_to_strip(rock, base, &vein, &wall_isos, cell, min, ext);
+            }
+            let post: Vec<usize> = rocks.iter().map(|r| raw_open_off_rim(r, &on_box)).collect();
+            eprintln!("[depth sweep] depth={depth} cell={cell:.1} dipping per-rock open={post:?} ({} ms)", t0.elapsed().as_millis());
         }
     }
 

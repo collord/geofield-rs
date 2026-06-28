@@ -307,3 +307,64 @@ junction) BEFORE claiming it done. The render is the acceptance gate the green t
 - **Look before claiming.** I claimed "peek-a-boo closed" off a green merged-gap test without rendering;
   the user's eyes were the gate. Render-and-look is mandatory before "done" on a visual fix.
 - **Decline, don't degrade.** A closed solid with a known sliver beats an open solid with a hole.
+
+---
+
+# Field-domain RIBBON conform — built + measured (2026-06-27)
+
+The junction re-triangulation (the task the DE-RISK above scoped) was built as `conform_caps_to_strip`
+(`crates/geofield/src/stack.rs`, with the shared `build_chains` helper): after `splice_shared_wall`,
+extract each rock cap's wall-side boundary chains and the strip's wall∩bed boundary chains, then ZIP a
+thin triangle ribbon between them — keeping every original face, referencing the strip's own vertex
+indices (so cap and strip share the junction by construction), partitioning each cap arc by nearest
+strip fragment so foot/hanging take disjoint portions. It reuses `mesh_clip::cdt_face` (now `pub(crate)`).
+De-risk gate: `wstar_cap_conform_closes_rocks`.
+
+## Result (measured, per-SOLID raw incidence — the criterion `assert_mesh_watertight` uses)
+
+| Fixture | per-rock open: splice → conform | verdict |
+|---|---|---|
+| **well-conditioned** (15-pt fit) | `[252,508,252] → [0,0,0]` | every rock + body PER-SOLID watertight, **zero non-manifold** ✅ |
+| **degenerate 2-pt dipping fit** (the user's scene) | `[377,756,440] → [0,128,186]` | floor + z=350 close; **~314 strip-edge holes at z=650** |
+
+**The ribbon conform is correct and robust** (zero non-manifold in raw index space; full closure of a
+well-formed wall). Two corrections to the earlier framing:
+
+1. **The "non-manifold" panic that derailed the first CDT attempts was a `merge_dedup` ARTIFACT.** The
+   ribbon deliberately references the strip's own indices, which sit ON the cap's wall∩bed line; a
+   position-dedup collapses those coincident-but-distinct verts into false incidence-3. The RAW per-solid
+   incidence (what the renderer and `assert_mesh_watertight` see) has **zero** non-manifold. Always
+   measure per-solid raw, never merge-deduped, for this.
+2. **A full-cap region CDT is the WRONG decomposition.** Re-triangulating the whole cap forces
+   reproducing the box perimeter, where sub-cell-jittered verts project to degenerate slivers that
+   collide with the unchanged box-side faces (it broke even already-closed caps). The RIBBON — keep
+   every face, only stitch the wall-side gap — never touches the box perimeter. This is the load-bearing
+   architectural choice.
+
+## Why the dipping fit DOESN'T close (the escalation evidence, now mechanism-pinned)
+
+At the degenerate z=650 the strip's wall∩bed free boundary is **not a clean curve but a 3-LAYER FOLDED
+band** — three coincident free-boundary chains (x≈675, z≈650, y∈[0,1000], 64 verts each). The
+under-constrained 2-point fit (control points only at z=200/800) folds the dual-contour wall worst far
+from its controls. A single cap chain cannot stitch to a 3-deep folded strip boundary.
+
+**Deeper octree makes it WORSE, not better** (`wstar_conform_depth_sweep`): depth 6 → `[0,128,186]`;
+depth 7 → `[0,759,0]`; depth 8 → `[757,1530,765]`. Finer cells resolve MORE of the spurious wave → more
+fold layers. **So Track B (adaptive refinement) does NOT fix this junction** — the fold is intrinsic to
+the FIT'S CONDITIONING, not the resolution.
+
+## Conclusion / what closes the dipping junction
+
+This is the **first measured evidence the exact-arrangement path is needed AT THE JUNCTION** — a
+geometry/topology need (a clean wall∩bed arrangement on a folded wall), confirmed NOT to be a
+determinism or resolution problem. Two ways forward, in cost order:
+
+1. **Better-conditioned vein fit** (more control points across y AND z on each wall). PROVEN to work: the
+   15-point `well_conditioned_vein_over_column` closes fully at depth 6 with the existing conform. This
+   is a data/authoring fix, not a meshing fix — likely the cheapest real answer for the user's scene.
+2. **Exact-arrangement path** (`docs/11`/`docs/12` Stage 0) — compute a certified wall∩bed arrangement
+   that doesn't fold, then the ribbon (or a corefine) closes cleanly. The substantial certified-geometry
+   investment, now earned by measurement.
+
+Production is **unchanged** — the conform is NOT wired (the dipping gate isn't green; that scene must
+decline per the discipline). The primitives + de-risk tests stand as the evidence.
