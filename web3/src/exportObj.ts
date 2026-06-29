@@ -35,14 +35,19 @@ export function exportObj(surfaces: SurfacePayload[], lithoNames?: Record<string
     for (let i = 0; i < nVerts; i++) {
       lines.push(`v ${s.positions[i * 3]} ${s.positions[i * 3 + 1]} ${s.positions[i * 3 + 2]}`);
     }
-    for (let i = 0; i < nVerts; i++) {
-      lines.push(`vn ${s.normals[i * 3]} ${s.normals[i * 3 + 1]} ${s.normals[i * 3 + 2]}`);
+    // The Manifold boolean path emits no per-vertex normals; emit position-only faces then (a
+    // valid OBJ — viewers recompute face normals) instead of `vn undefined` + dangling `//n` refs.
+    const hasNormals = s.normals.length === s.positions.length && s.normals.length > 0;
+    if (hasNormals) {
+      for (let i = 0; i < nVerts; i++) {
+        lines.push(`vn ${s.normals[i * 3]} ${s.normals[i * 3 + 1]} ${s.normals[i * 3 + 2]}`);
+      }
     }
     for (let i = 0; i < s.indices.length; i += 3) {
       const a = s.indices[i] + 1 + vertexOffset;
       const b = s.indices[i + 1] + 1 + vertexOffset;
       const c = s.indices[i + 2] + 1 + vertexOffset;
-      lines.push(`f ${a}//${a} ${b}//${b} ${c}//${c}`);
+      lines.push(hasNormals ? `f ${a}//${a} ${b}//${b} ${c}//${c}` : `f ${a} ${b} ${c}`);
     }
     vertexOffset += nVerts;
   }

@@ -53,6 +53,7 @@ import {
 import { AddSurfaceMenu } from "./HierarchyPanel/AddSurfaceMenu";
 import { SurfaceDataModal } from "./HierarchyPanel/SurfaceDataModal";
 import type { RenderMode, RunCommand, SurfacePayload, WorkerMessage } from "./protocol";
+import { initManifold, meshManifoldVolumes } from "./manifoldVolumes";
 
 function App() {
   const [project, setProject] = useState<Project>(() => loadProject() ?? blankProject());
@@ -67,6 +68,12 @@ function App() {
   // see-through dashes, no scalloping, no rim slivers. Off = the legacy snap, kept as an A/B escape
   // hatch. Toggling re-meshes (it changes geometry), so it re-runs the stack.
   const [seamClip, setSeamClip] = useState(true);
+  // Cross-cut volume mesher (docs/13 §5, docs/14): the DEFAULT volume mesher is the Manifold
+  // boolean engine (overhanging band + slabs, `(slab−band) ∩ domainBox` — wall shared by
+  // construction, junction sealed, borders clean). Off = the legacy field-domain shared-tree path
+  // (the wall∩bed peek-a-boo), kept as an A/B escape hatch. Solid mode + a cross-cut vein only;
+  // toggling re-meshes. "clip seam" is inert while this is on (Manifold corefines the wall itself).
+  const [manifold, setManifold] = useState(true);
   const [hiddenKeys, setHiddenKeys] = useState<Set<string>>(new Set());
   // Camera round-trip: the Viewer fills `viewApiRef` with a getter (read on Export);
   // `importedView` (a new object per Import) is pushed back to re-apply a saved view.
@@ -89,6 +96,7 @@ function App() {
     onDone?: () => void,
     mode: RenderMode = renderMode,
     seamClipOverride?: boolean,
+    manifoldOverride?: boolean,
   ) {
     workerRef.current?.terminate();
     const worker = new Worker(new URL("./worker.ts", import.meta.url), { type: "module" });
@@ -102,10 +110,30 @@ function App() {
       }
       else if (msg.type === "error") setStatus("error: " + msg.message);
       else if (msg.type === "done") {
-        setSurfaces(msg.surfaces);
-        setState(applyCoreUpdate(msg.update)); // derived = read-only cache (FR-018)
-        setStatus("done");
-        onDone?.();
+        const finish = (surfaces: SurfacePayload[]) => {
+          setSurfaces(surfaces);
+          setState(applyCoreUpdate(msg.update)); // derived = read-only cache (FR-018)
+          setStatus("done");
+          onDone?.();
+        };
+        // Solid + manifold path: the worker shipped the raw host slabs; difference the band on the
+        // PERSISTENT main-thread Manifold instance (it hangs if re-instantiated per worker — docs/14),
+        // then overlay onto the field-path solids (replace each (series,unit) the boolean pass covers,
+        // keep the rest as the fallback). A decline / per-slab failure → the field path renders.
+        if (msg.manifoldSlabs && msg.manifoldMeta) {
+          const { veinIndex, extent, assignment } = msg.manifoldMeta;
+          const slabs = msg.manifoldSlabs;
+          initManifold()
+            .then((wasm) => {
+              const rocks = meshManifoldVolumes(wasm, slabs, extent, veinIndex, assignment);
+              if (!rocks) return finish(msg.surfaces);
+              const covered = new Set(rocks.map((r) => `${r.series}:${r.unit}`));
+              finish([...rocks, ...msg.surfaces.filter((s) => !covered.has(`${s.series}:${s.unit}`))]);
+            })
+            .catch(() => finish(msg.surfaces));
+        } else {
+          finish(msg.surfaces);
+        }
       }
     };
     const cmd: RunCommand = {
@@ -124,6 +152,9 @@ function App() {
       // An explicit override avoids the stale-closure race when toggled from the checkbox (React
       // state updates are async, so the freshly-set value is passed in directly).
       seamClip: seamClipOverride ?? seamClip,
+      // The Manifold boolean A/B (solid mode + a cross-cut vein). Explicit override avoids the
+      // stale-closure race when toggled from the checkbox (mirrors seamClip).
+      manifold: manifoldOverride ?? manifold,
     };
     worker.postMessage(cmd);
   }
@@ -434,6 +465,26 @@ function App() {
                 }}
               />
               clip seam
+            </label>
+            <label
+              className="debug-toggle"
+              title="Cross-cut volume mesher (Solids only, DEFAULT on): on = the Manifold boolean engine (wall shared by construction, junction sealed, borders clean), off = the legacy field-domain shared tree (the wall∩bed peek-a-boo). Re-meshes on toggle."
+            >
+              <input
+                type="checkbox"
+                data-testid="manifold-toggle"
+                checked={manifold}
+                onChange={(e) => {
+                  const on = e.target.checked;
+                  setManifold(on);
+                  // Re-mesh immediately (the boolean engine changes geometry). Pass `on`
+                  // explicitly — the state set above hasn't applied yet this tick.
+                  if (project.elements.length > 0 && validate(project).canApply) {
+                    runStack(project, undefined, renderMode, undefined, on);
+                  }
+                }}
+              />
+              manifold
             </label>
           </div>
         </div>

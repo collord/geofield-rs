@@ -115,6 +115,42 @@ function threeContactFloor(): ProjectElement {
   };
 }
 
+/** An interface from explicit XYZ points + one upward orientation at the centroid (a conformable
+ *  bed fits field-increasing-upward). Used for a CURVED bed (>2 points, non-planar). */
+function bedFromPoints(name: string, pts: { x: number; y: number; z: number }[]): InterfaceData {
+  const c = pts.reduce((a, p) => ({ x: a.x + p.x, y: a.y + p.y, z: a.z + p.z }), { x: 0, y: 0, z: 0 });
+  const n = pts.length;
+  return {
+    id: newId("iface"),
+    name,
+    points: pts,
+    orientations: [{ x: c.x / n, y: c.y / n, z: c.z / n, dip: 0, dipDir: 0 }], // dip 0 ⇒ pole up
+  };
+}
+
+/** Like `threeContactFloor` but bed 3 is CURVED (z 620→780 across x,y) — the case a flat AABB box
+ *  slab can't represent (its box would overlap the unit below). Exercises the Manifold path's
+ *  curved-bed-following host slabs (docs/13 §5 follow-up). */
+function curvedContactFloor(): ProjectElement {
+  return {
+    kind: "series",
+    id: newId("el"),
+    name: "sediments",
+    relation: "conformable",
+    unboundedAbove: true,
+    interfaces: [
+      dippingInterface("bed 1", 300, 0, 0),
+      dippingInterface("bed 2", 500, 0, 0),
+      bedFromPoints("bed 3 (curved)", [
+        { x: 200, y: 500, z: 700 },
+        { x: 800, y: 500, z: 680 },
+        { x: 200, y: 200, z: 620 },
+        { x: 800, y: 800, z: 780 },
+      ]),
+    ],
+  };
+}
+
 export const TEMPLATES: Template[] = [
   {
     id: "blank",
@@ -182,7 +218,7 @@ export const TEMPLATES: Template[] = [
     id: "cross-cutting-vein-dipping",
     name: "Cross-cutting vein (dipping) — repro",
     description:
-      "DIAGNOSTIC: like the vein scenario but the walls DIP (oblique to the grid), the case a vertical wall can't exercise. Toggle to Solids and look for a see-through channel between the vein body and the cross-cut beds.",
+      "DIAGNOSTIC: the walls DIP (oblique to the grid) AND bed 3 is CURVED — the case neither a vertical wall nor a flat-box slab can exercise. Toggle to Solids; turn 'manifold' on to seal the vein body↔bed junction the field path leaves as a peek-a-boo.",
     build: () => ({
       version: 1,
       name: "cross-cutting-vein-dipping",
@@ -194,7 +230,7 @@ export const TEMPLATES: Template[] = [
           footWall: dippingWall("foot wall", 400, 0.5),
           hangingWall: dippingWall("hanging wall", 600, 0.5),
         },
-        threeContactFloor(),
+        curvedContactFloor(),
       ],
       extent: EXTENT,
     }),

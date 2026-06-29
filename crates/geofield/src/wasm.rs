@@ -1115,6 +1115,48 @@ impl WasmStack {
         out
     }
 
+    /// WALL-FREE host UNIT SLABS for a cross-cutting body's cut units, co-contoured on ONE shared
+    /// octree so curved beds are followed and adjacent units' bed contacts coincide (docs/13 §5
+    /// follow-up). The Manifold A/B path differences the band from these CLEAN slabs (the band is the
+    /// first tagged solid of `mesh_cross_cut_solids_shared_*`). Returns the body interior solid
+    /// tagged `(series, 0, 0)` FIRST, then each cut unit `(series, block, unit)`. Empty for a
+    /// stratigraphic series / topography / wall-less / out-of-range body. This exists because the
+    /// independent per-unit [`Self::mesh_series_block_unit_solid`] leaves LOD-transition T-junctions
+    /// that Manifold rejects — the shared-tree contour avoids them by construction.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mesh_cross_cut_host_slabs_octree(
+        &self,
+        series: usize,
+        min_x: f64,
+        min_y: f64,
+        min_z: f64,
+        size: f64,
+        ext_x: f64,
+        ext_y: f64,
+        ext_z: f64,
+        max_depth: u32,
+        min_depth: u32,
+        qef_threshold: f64,
+    ) -> Vec<WasmTaggedSolid> {
+        let cfg = octree_cfg(max_depth, min_depth, qef_threshold, true);
+        let Some(slabs) = self.inner.mesh_cross_cut_host_slabs(
+            series, [min_x, min_y, min_z], size, [ext_x, ext_y, ext_z], cfg,
+        ) else {
+            return Vec::new();
+        };
+        slabs
+            .into_iter()
+            .map(|(j, b, u, m)| WasmTaggedSolid {
+                series: j,
+                block: b,
+                unit: u,
+                positions: m.positions,
+                normals: m.normals,
+                indices: m.indices,
+            })
+            .collect()
+    }
+
     /// Number of lithology UNIT solids in `block` of `series` (`interfaces + 1`; 0 if out
     /// of range or field-less). This includes the topmost VOID unit above the series'
     /// bounding contact — for the renderable rock units use

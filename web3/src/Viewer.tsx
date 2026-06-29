@@ -219,8 +219,15 @@ export function Viewer(props: {
       if (hidden && hidden.has(surfaceKey(s))) continue; // per-volume visibility (debug)
       const geom = new THREE.BufferGeometry();
       geom.setAttribute("position", new THREE.BufferAttribute(s.positions, 3));
-      geom.setAttribute("normal", new THREE.BufferAttribute(s.normals, 3));
       geom.setIndex(new THREE.BufferAttribute(s.indices, 1));
+      // The field path supplies analytic per-vertex normals; the Manifold boolean path emits none
+      // (an empty array) — compute them from the geometry so those solids shade instead of going
+      // black. (An empty normal attribute would mismatch the position count and render unlit.)
+      if (s.normals.length === s.positions.length && s.normals.length > 0) {
+        geom.setAttribute("normal", new THREE.BufferAttribute(s.normals, 3));
+      } else {
+        geom.computeVertexNormals();
+      }
       // Solid mode: colour each unit solid by its assigned lithology (Air is never emitted,
       // so there is nothing transparent to draw). Contact mode: colour by series index.
       const color =

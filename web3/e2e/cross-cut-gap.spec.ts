@@ -48,8 +48,10 @@ test("cross-cut solids have no inter-unit gap on either side of the vein", async
   for (const [name, units] of [["left", sides.left], ["right", sides.right]] as const) {
     expect(units.length, `${name} has all units`).toBeGreaterThanOrEqual(4);
     for (let i = 1; i < units.length; i++) {
-      // Each rock block is a real slab on this side (not a dropped-to-sliver block — docs/10).
-      expect(units[i].n, `${name} unit ${units[i].unit} present`).toBeGreaterThan(40);
+      // Each rock block is a real slab on this side (not a dropped-to-sliver block — docs/10). The
+      // Manifold mesher (now the default) triangulates economically, so a box-capped top unit can be
+      // ~30-something verts in an x-band; a dropped/sliver block is near-zero. >10 separates them.
+      expect(units[i].n, `${name} unit ${units[i].unit} present`).toBeGreaterThan(10);
       // No inter-unit gap: unit i's bottom meets unit i-1's top (within a fraction of a unit).
       expect(
         Math.abs(units[i].zmin - units[i - 1].zmax),

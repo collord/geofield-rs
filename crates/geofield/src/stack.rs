@@ -2013,6 +2013,201 @@ impl<M: SeriesModel + BlockModel> Stack<M> {
 
         Some((body_mesh, rock_solids))
     }
+
+    /// WALL-FREE host UNIT SLABS for the units a cross-cutting body cuts, co-contoured on ONE
+    /// shared octree so adjacent units' bed contacts coincide and curved beds are followed
+    /// faithfully (the curved-bed analogue of the flat box). This is the host-slab half of
+    /// [`Self::mesh_cross_cut_solids_corefined`] WITHOUT the wall contouring or corefine — it
+    /// returns clean closed slabs ready to hand a boolean engine (Manifold), which then differences
+    /// the band INTERNALLY (the wall becomes shared by construction). Returns the body's interior
+    /// solid tagged `(series, 0, 0)` FIRST, then each cut unit slab tagged `(series, block, unit)`.
+    /// Empty for a stratigraphic series / topography / out-of-range / wall-less body.
+    ///
+    /// The band and slabs are contoured on an OVERHANGING box (domain ± `cell·3`, docs/14) so their
+    /// domain-edge caps sit OUTSIDE the true extent. The caller (`meshManifoldVolumes`) differences
+    /// the band then clips with one clean domain cube, so no two primitives are coplanar at the
+    /// boundary and Manifold sheds no connected sliver "flaps" along the data-free walls / floor.
+    ///
+    /// Why a dedicated binding (docs/13 §5 follow-up): the independent per-unit
+    /// [`Self::mesh_one_block_unit_solid`] is adaptive-LOD-contoured PER UNIT, leaving pervasive
+    /// T-junctions + cracks at LOD transitions that Manifold rejects as non-manifold (measured: a
+    /// `merge()` and a JS T-junction weld both INSUFFICIENT). The shared-tree co-contour here avoids
+    /// those defects by construction — the same reason the corefined path uses it.
+    pub fn mesh_cross_cut_host_slabs(
+        &self,
+        ib: usize,
+        min: [f64; 3],
+        size: f64,
+        ext_max: [f64; 3],
+        cfg: OctreeConfig,
+    ) -> Option<Vec<(usize, usize, usize, Mesh)>> {
+        let (body_upper, body_lower_iso): (f64, Option<f64>) = match self.series.get(ib)? {
+            StackElement::Vein(v) => {
+                let (lo, hi) = v.band()?;
+                (hi, Some(lo))
+            }
+            StackElement::Intrusion(it) => {
+                let isos = it.model.interface_isovalues();
+                match it.envelope {
+                    Envelope::Single(k) => (*isos.get(k)?, None),
+                    Envelope::Shell { inner, outer } => {
+                        let (a, b) = (*isos.get(inner)?, *isos.get(outer)?);
+                        let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+                        (hi, Some(lo))
+                    }
+                }
+            }
+            _ => return None,
+        };
+
+        let cfg = OctreeConfig { cap: true, ..cfg };
+        // OVERHANG the domain box by a few cells (docs/14): contour the body band AND every unit slab
+        // on an OVERSIZED box so their domain-edge caps sit OUTSIDE the true extent. The caller then
+        // differences the band and clips the result back with one clean domain cube — so nothing is
+        // coplanar at the boundary and Manifold sheds no connected sliver "flaps" (the same trick
+        // `mesh_cross_cut_solids_corefined` uses on its wall to dodge the box∩wall∩bed edge-on
+        // degeneracy, here applied to BOTH primitives because the flap is a band-cap/slab-cap meet).
+        // The margin is cell-relative so it scales with the domain and stays strictly larger than any
+        // contour-vertex jitter (so nothing lands back on the true box face).
+        let cell = size / (1u32 << cfg.max_depth.max(1)) as f64;
+        let margin = cell * 3.0;
+        let wmin = [min[0] - margin, min[1] - margin, min[2] - margin];
+        let wext = [ext_max[0] + margin, ext_max[1] + margin, ext_max[2] + margin];
+        let wsize = size + 2.0 * margin;
+        let box_b = AxisBox::from_bounds(wmin, wext);
+        let body_e = self.series.get(ib)?;
+        let vein_field: Box<dyn ScalarField + '_> = Box::new(body_e.model().field());
+        let body_isos = body_e.model().interface_isovalues();
+        let (lo, hi) = match body_lower_iso {
+            Some(l) => (l.min(body_upper), l.max(body_upper)),
+            None => (body_upper, body_upper),
+        };
+        let single_wall = body_lower_iso.is_none();
+        let body_lower = body_lower_iso.map(|l| ContactHalfSpace::new(vein_field.as_ref(), l, false));
+
+        // Cut blocks (mirrors `mesh_cross_cut_solids_corefined`).
+        let cut = self.cuts_below(ib, min, size);
+        let mut rb_j: Vec<usize> = Vec::new();
+        let mut rb_b: Vec<usize> = Vec::new();
+        let mut rb_field: Vec<Box<dyn ScalarField + '_>> = Vec::new();
+        let mut rb_isos: Vec<Vec<f64>> = Vec::new();
+        let mut rb_planes: Vec<Vec<PlaneHalfSpace>> = Vec::new();
+        let mut rb_nunits: Vec<usize> = Vec::new();
+        for &j in &cut {
+            let Some(s) = self.series_at(j) else { continue };
+            for b in 0..self.series_block_count(j).max(1) {
+                let Some(bf) = s.model.block_field(b) else { continue };
+                let isos = s.model.block_interface_isovalues(b);
+                if isos.is_empty() {
+                    continue;
+                }
+                let planes: Vec<PlaneHalfSpace> = s
+                    .model
+                    .block_half_spaces(b)
+                    .into_iter()
+                    .map(|hs| PlaneHalfSpace::new(hs.point, hs.normal, hs.keep_positive))
+                    .collect();
+                rb_nunits.push(self.present_unit_count(j, b));
+                rb_j.push(j);
+                rb_b.push(b);
+                rb_field.push(Box::new(bf));
+                rb_isos.push(isos);
+                rb_planes.push(planes);
+            }
+        }
+        let mut unit_keys: Vec<(usize, usize)> = Vec::new();
+        for (k, &nunits) in rb_nunits.iter().enumerate() {
+            for u in 0..nunits {
+                unit_keys.push((k, u));
+            }
+        }
+
+        // Refinement half-spaces: both wall isos + every bed (so the shared tree refines where the
+        // band and the beds will be differenced, keeping the slabs faithful there).
+        let wall_lo_ref = ContactHalfSpace::new(vein_field.as_ref(), lo, false);
+        let wall_hi_ref = ContactHalfSpace::new(vein_field.as_ref(), hi, false);
+        let mut bed_refine: Vec<ContactHalfSpace> = Vec::new();
+        for k in 0..rb_j.len() {
+            for &iso in &rb_isos[k] {
+                bed_refine.push(ContactHalfSpace::new(rb_field[k].as_ref(), iso, false));
+            }
+        }
+        let mut unit_upper: Vec<f64> = Vec::with_capacity(unit_keys.len());
+        let mut unit_lower: Vec<Option<ContactHalfSpace>> = Vec::with_capacity(unit_keys.len());
+        for &(k, u) in &unit_keys {
+            let isos = &rb_isos[k];
+            let n = isos.len();
+            // Sentinel for the topmost unit's upper bound: sample over the OVERSIZED box so the
+            // "+1 above max" iso still exceeds the field everywhere the slab is contoured (it now
+            // overhangs `min..ext`).
+            let upper = if u < n { isos[u] } else { max_abs_field_in_box(rb_field[k].as_ref(), wmin, wsize) + 1.0 };
+            let lower = (u > 0).then(|| ContactHalfSpace::new(rb_field[k].as_ref(), isos[u - 1], false));
+            unit_upper.push(upper);
+            unit_lower.push(lower);
+        }
+
+        let mut build_contrib: Vec<&dyn Boundary> = vec![&box_b, &wall_lo_ref];
+        if !single_wall {
+            build_contrib.push(&wall_hi_ref);
+        }
+        for c in &bed_refine {
+            build_contrib.push(c);
+        }
+        let build_primary = *body_isos.first().unwrap_or(&body_upper);
+        let build_scene = Scene::new(vein_field.as_ref(), build_primary, build_contrib);
+
+        // Output scenes: body interior solid first, then each wall-free unit slab.
+        let mut scenes: Vec<Scene> = Vec::with_capacity(1 + unit_keys.len());
+        {
+            let mut c: Vec<&dyn Boundary> = vec![&box_b];
+            if let Some(l) = &body_lower {
+                c.push(l);
+            }
+            scenes.push(Scene::new(vein_field.as_ref(), body_upper, c));
+        }
+        for (idx, &(k, _u)) in unit_keys.iter().enumerate() {
+            let mut c: Vec<&dyn Boundary> = vec![&box_b];
+            for p in &rb_planes[k] {
+                c.push(p);
+            }
+            if let Some(l) = &unit_lower[idx] {
+                c.push(l);
+            }
+            scenes.push(Scene::new(rb_field[k].as_ref(), unit_upper[idx], c));
+        }
+        let scene_refs: Vec<&Scene> = scenes.iter().collect();
+        // Contour on the OVERSIZED extent so the box-cap faces are produced OUTSIDE the domain (the
+        // overhang); the caller clips back with one clean domain cube.
+        let mut hosts = octree_dual_contour_shared(&build_scene, &scene_refs, wmin, wsize, cfg);
+
+        let mut out: Vec<(usize, usize, usize, Mesh)> = Vec::with_capacity(1 + unit_keys.len());
+        // Body interior solid first, tagged (ib, 0, 0). The band has no bed caps (it's bounded by the
+        // vein isos + box), so it needs no projection — leave it as contoured.
+        if hosts[0].triangle_count() > 0 {
+            out.push((ib, 0, 0, hosts[0].clone()));
+        } else {
+            return None; // wall-less / out-of-range body
+        }
+        for (idx, &(k, u)) in unit_keys.iter().enumerate() {
+            let host = &mut hosts[idx + 1];
+            if host.triangle_count() == 0 {
+                continue;
+            }
+            // Project the slab's BED CAPS onto the true contact before handing it to the boolean
+            // engine. A binary-aligned bed (e.g. z=500 = size/2) makes the dual-contour cap FLOAT off
+            // the contact; the field path fixes this with the same `project_bed_caps`, but the Manifold
+            // path gets the raw slab — so without this, `slab − band` leaves an inter-unit GAP at the
+            // floated bed (measured: ~17 units at z=500 on the vertical-vein scene). Adjacent units'
+            // caps are co-contoured (coincident), and the projection is a pure function of position, so
+            // they land on the SAME contact and still meet. Box caps (a whole unit off any bed) are
+            // excluded by the projection's half-spacing gate; the wall-free slab has no wall faces to veto.
+            let beds: Vec<(&dyn ScalarField, f64)> =
+                rb_isos[k].iter().map(|&iso| (rb_field[k].as_ref(), iso)).collect();
+            project_bed_caps(host, vein_field.as_ref(), &body_isos, &beds, cell);
+            out.push((rb_j[k], rb_b[k], u, host.clone()));
+        }
+        Some(out)
+    }
 }
 
 /// CLOSED-solid watertightness on a deduped soup: incidence exactly 2 except edges whose BOTH

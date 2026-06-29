@@ -59,6 +59,12 @@ export interface RunCommand {
    *  rim slivers. Single-wall + two-wall-band bodies (and erode contacts) corefine; others fall back
    *  to snap. The UI exposes this as an A/B checkbox (default on) so the two closers can be compared. */
   seamClip?: boolean;
+  /** The cross-cut volume mesher (DEFAULT `true`, docs/13 §5 + docs/14): in solid mode with a
+   *  cross-cut vein, the worker ships raw co-contoured host slabs and the MAIN THREAD differences the
+   *  band with `manifold-3d`, so the wall is shared by construction (no wall∩bed peek-a-boo) and the
+   *  binary-aligned bed caps are projected (no inter-unit gap). Pass `false` for the legacy
+   *  field-domain shared-tree path (kept as an A/B). Inert outside solid mode / without a vein. */
+  manifold?: boolean;
 }
 
 export type Command = RunCommand;
@@ -86,12 +92,37 @@ export interface SurfacePayload {
   unit?: number;
 }
 
+/** One raw co-contoured host slab for the MAIN-THREAD Manifold boolean pass. [0] is the vein BAND
+ *  (interior solid), [1..] are the wall-free unit slabs, all overhanging the domain (docs/14). The
+ *  booleans run on the main thread because re-instantiating the Manifold wasm per fit-worker hangs
+ *  its boolean op (manifold-3d is single-threaded; the 2nd instance in a page deadlocks in `subtract`);
+ *  the engine wasm, conversely, wants a fresh terminate-per-fit worker. So they live apart: engine in
+ *  the worker, Manifold on the persistent main thread (one instance, never re-instantiated). */
+export interface ManifoldSlab {
+  series: number;
+  block: number;
+  unit: number;
+  positions: Float32Array;
+  indices: Uint32Array;
+}
+
 /** The fit/mesh completed: the meshes for the viewer + the core's hierarchy round-trip
  *  payload (declared state + derived view) for the panel. */
 export interface DoneMessage {
   type: "done";
   surfaces: SurfacePayload[];
   update: CoreUpdate; // parsed from WasmStack.core_update_json()
+  /** Solid + manifold mode: the raw host slabs ([0]=band) for the main thread to difference with
+   *  manifold-3d. When present, `surfaces` is the FULL field-path solids (the fallback); the main
+   *  thread replaces each (series,unit) the Manifold pass covers and keeps the rest. Absent on the
+   *  pure field path (Manifold off / no vein / declined). */
+  manifoldSlabs?: ManifoldSlab[];
+  /** Inputs the main-thread Manifold pass needs (the worker owns the command). */
+  manifoldMeta?: {
+    veinIndex: number;
+    extent: [number, number, number, number, number, number];
+    assignment: Record<string, string>;
+  };
 }
 
 export interface ErrorMessage {

@@ -15,6 +15,8 @@ import { initKernel, setEngineMemory } from "./kernel-bridge";
 import kernelWasmUrl from "./wasm-kernel/geofield_kernel.wasm?url";
 import type {
   Command,
+  DoneMessage,
+  ManifoldSlab,
   RunCommand,
   SeriesJson,
   SurfacePayload,
@@ -24,6 +26,12 @@ import type { CoreUpdate } from "./HierarchyPanel/dto";
 
 const NAN = Number.NaN;
 const QEF_EPS = 1e-6;
+
+// NOTE: the Manifold boolean engine does NOT run here. This worker is terminate-per-fit, and the
+// single-threaded manifold-3d wasm hangs its boolean op when re-instantiated in a fresh worker (the
+// 2nd instance in a page deadlocks in `subtract`). So the worker only produces the raw co-contoured
+// host slabs (`collectManifoldSlabs`); the booleans run on the persistent main thread
+// (`manifoldVolumes.ts`), which holds ONE Manifold instance for the page lifetime. See docs/14.
 
 function emit(msg: WorkerMessage, transfer: Transferable[] = []) {
   (self as unknown as Worker).postMessage(msg, transfer);
@@ -269,6 +277,36 @@ function collectSolids(
   return out;
 }
 
+/** Produce the raw co-contoured host slabs for the MAIN-THREAD Manifold boolean pass (docs/13 §5,
+ *  docs/14). `[0]` is the vein BAND (interior solid); `[1..]` are the WALL-FREE unit slabs, all
+ *  contoured on ONE shared tree (so the band's wall and the slabs' wall cavities are consistent and
+ *  the slabs follow curved beds) and OVERHANGING the domain (so the main-thread clip is flap-free).
+ *  Returns `null` when the body produced no slabs (wall-less / out-of-range / declined) — the caller
+ *  then renders the field-path solids unchanged. The booleans deliberately do NOT run here: the
+ *  Manifold wasm hangs when re-instantiated in this terminate-per-fit worker, so it lives on the
+ *  persistent main thread (`manifoldVolumes.ts`). */
+function collectManifoldSlabs(
+  stack: WasmStack,
+  veinIndex: number,
+  extent: [number, number, number, number, number, number],
+  depth: number,
+): ManifoldSlab[] | null {
+  const [x0, x1, y0, y1, z0, z1] = extent;
+  const size = Math.max(x1 - x0, y1 - y0, z1 - z0);
+  const minDepth = Math.min(2, depth);
+  const tagged = stack.mesh_cross_cut_host_slabs_octree(veinIndex, x0, y0, z0, size, x1, y1, z1, depth, minDepth, QEF_EPS);
+  if (tagged.length === 0) return null; // wall-less / declined → caller falls back to the field path
+  const slabs: ManifoldSlab[] = tagged.map((tm) => ({
+    series: tm.series,
+    block: tm.block,
+    unit: tm.unit,
+    positions: tm.positions(),
+    indices: tm.indices(),
+  }));
+  for (const tm of tagged) tm.free();
+  return slabs;
+}
+
 async function run(cmd: RunCommand) {
   emit({ type: "status", phase: "loading kernel + engine wasm…" });
   await initWasm();
@@ -277,10 +315,32 @@ async function run(cmd: RunCommand) {
   const stack = buildStack(cmd.series);
 
   const solid = cmd.renderMode === "solid";
-  emit({ type: "status", phase: solid ? "meshing solids…" : "meshing surfaces…" });
-  const surfaces = solid
-    ? collectSolids(stack, cmd.series, cmd.extent, cmd.maxDepth, cmd.assignment ?? {}, cmd.seamClip ?? true)
-    : collectSurfaces(stack, cmd.series, cmd.extent, cmd.maxDepth, cmd.weldTJunctions ?? true, cmd.seamClip ?? true);
+  // The Manifold volume mesher (docs/13 §5, docs/14): in SOLID mode, when enabled (the default) and
+  // the stack has a cross-cut vein, the vein's rock-unit volumes are differenced with Manifold so the
+  // wall is shared by construction (no peek-a-boo). The booleans run on the MAIN thread (Manifold
+  // hangs when re-instantiated in this terminate-per-fit worker), so here we only produce the raw
+  // co-contoured host slabs and ship them up. `surfaces` carries the FULL field-path solids as the
+  // fallback — the main thread replaces each (series,unit) the Manifold pass covers and keeps the
+  // rest, so a Manifold decline / per-slab failure degrades gracefully to the field path.
+  const veinIndex = cmd.series.findIndex((s) => s.crossCut?.kind === "vein");
+  const useManifold = solid && (cmd.manifold ?? false) && veinIndex >= 0;
+  let surfaces: SurfacePayload[];
+  let manifoldSlabs: ManifoldSlab[] | undefined;
+  let manifoldMeta: DoneMessage["manifoldMeta"];
+  if (useManifold) {
+    emit({ type: "status", phase: "meshing solids (Manifold boolean)…" });
+    const slabs = collectManifoldSlabs(stack, veinIndex, cmd.extent, cmd.maxDepth);
+    surfaces = collectSolids(stack, cmd.series, cmd.extent, cmd.maxDepth, cmd.assignment ?? {}, cmd.seamClip ?? true);
+    if (slabs) {
+      manifoldSlabs = slabs;
+      manifoldMeta = { veinIndex, extent: cmd.extent, assignment: cmd.assignment ?? {} };
+    }
+  } else {
+    emit({ type: "status", phase: solid ? "meshing solids…" : "meshing surfaces…" });
+    surfaces = solid
+      ? collectSolids(stack, cmd.series, cmd.extent, cmd.maxDepth, cmd.assignment ?? {}, cmd.seamClip ?? true)
+      : collectSurfaces(stack, cmd.series, cmd.extent, cmd.maxDepth, cmd.weldTJunctions ?? true, cmd.seamClip ?? true);
+  }
 
   // The hierarchy round-trip payload (declared state + derived view) — parsed from the
   // core's single JSON getter (contract D3+D5). The UI treats `derived` as a read-only cache.
@@ -291,7 +351,10 @@ async function run(cmd: RunCommand) {
   for (const s of surfaces) {
     transfer.push(s.positions.buffer, s.normals.buffer, s.indices.buffer);
   }
-  emit({ type: "done", surfaces, update }, transfer);
+  if (manifoldSlabs) {
+    for (const s of manifoldSlabs) transfer.push(s.positions.buffer, s.indices.buffer);
+  }
+  emit({ type: "done", surfaces, update, manifoldSlabs, manifoldMeta }, transfer);
 }
 
 self.onmessage = (e: MessageEvent<Command>) => {
