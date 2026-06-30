@@ -2162,8 +2162,19 @@ fn below_solid(
     let wext = [ext_max[0] + margin, ext_max[1] + margin, ext_max[2] + margin];
     let wsize = size + 2.0 * margin;
     let box_b = AxisBox::from_bounds(wmin, wext);
-    let scene = Scene::new(field, iso, vec![&box_b]);
-    octree_dual_contour_scene(&scene, wmin, wsize, cfg)
+    // Force-refine the cells the CONTACT passes through, so a grid-aligned bed (e.g. z = size/2, on an
+    // octree cell boundary at every depth) that grazes a cell can't leave a closure crack (16 open
+    // edges → Manifold rejects the whole solid → dropped units). `refine_shared_contacts` only fires on
+    // cells where ≥2 surfaces straddle, so we add the contact itself as a self-contributor in the BUILD
+    // scene (the OUTPUT scene stays `[box]`, unclipped) — exactly the binary-aligned-bed treatment the
+    // old shared-tree path got, here for a single-level-set primitive.
+    let refine = ContactHalfSpace::new(field, iso, false);
+    let build = Scene::new(field, iso, vec![&box_b, &refine]);
+    let out = Scene::new(field, iso, vec![&box_b]);
+    octree_dual_contour_shared(&build, &[&out], wmin, wsize, cfg)
+        .into_iter()
+        .next()
+        .unwrap_or_default()
 }
 
 /// A BAND primitive: the closed solid `{lo < field < hi}` clipped to the box and closed, overhanging
@@ -2187,8 +2198,18 @@ fn band_solid(
     let wsize = size + 2.0 * margin;
     let box_b = AxisBox::from_bounds(wmin, wext);
     let lower = ContactHalfSpace::new(field, lo, false); // keep field > lo
-    let scene = Scene::new(field, hi, vec![&box_b, &lower]); // field < hi ∧ field > lo ∧ in box
-    octree_dual_contour_scene(&scene, wmin, wsize, cfg)
+    // Force-refine the cells BOTH band walls pass through (see `below_solid`): `refine_shared_contacts`
+    // fires only where ≥2 surfaces straddle, so we pair each wall with a self-contributor in the BUILD
+    // scene. At `hi`: primary(hi) + `refine_hi`; at `lo`: `lower` + `refine_lo`. The OUTPUT scene stays
+    // the plain band `[box, lower]`. Keeps a grid-aligned wall graze from cracking the band solid.
+    let refine_lo = ContactHalfSpace::new(field, lo, false);
+    let refine_hi = ContactHalfSpace::new(field, hi, false);
+    let build = Scene::new(field, hi, vec![&box_b, &lower, &refine_lo, &refine_hi]);
+    let out = Scene::new(field, hi, vec![&box_b, &lower]); // field < hi ∧ field > lo ∧ in box
+    octree_dual_contour_shared(&build, &[&out], wmin, wsize, cfg)
+        .into_iter()
+        .next()
+        .unwrap_or_default()
 }
 
 /// CLOSED-solid watertightness on a deduped soup: incidence exactly 2 except edges whose BOTH
