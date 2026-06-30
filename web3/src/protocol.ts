@@ -92,16 +92,19 @@ export interface SurfacePayload {
   unit?: number;
 }
 
-/** One raw co-contoured host slab for the MAIN-THREAD Manifold boolean pass. [0] is the vein BAND
- *  (interior solid), [1..] are the wall-free unit slabs, all overhanging the domain (docs/14). The
- *  booleans run on the main thread because re-instantiating the Manifold wasm per fit-worker hangs
- *  its boolean op (manifold-3d is single-threaded; the 2nd instance in a page deadlocks in `subtract`);
- *  the engine wasm, conversely, wants a fresh terminate-per-fit worker. So they live apart: engine in
- *  the worker, Manifold on the persistent main thread (one instance, never re-instantiated). */
-export interface ManifoldSlab {
+/** One op of a unified volume-mesh RECIPE (`mesh_volume_recipe_octree`): a single-level-set primitive
+ *  + the boolean the main thread applies. `op`: 0 = Base, 1 = Intersect, 2 = Subtract, 3 = BaseBox
+ *  (start from the domain cube; empty mesh). Ops for one `(series, block, unit)` are consecutive. The
+ *  geology lives in Rust (`clip_maskers`, youngest-present-wins); the main thread is a dumb Manifold
+ *  executor that composes the primitives into watertight, gap-free rock units. */
+export interface RecipeOp {
   series: number;
   block: number;
   unit: number;
+  /** 255 = primitive DEFINITION (mesh present, id = primId); 0 = Base, 1 = Intersect, 2 = Subtract,
+   *  3 = BaseBox (domain cube) — these reference `primId` and carry no mesh. */
+  op: number;
+  primId: number;
   positions: Float32Array;
   indices: Uint32Array;
 }
@@ -112,14 +115,11 @@ export interface DoneMessage {
   type: "done";
   surfaces: SurfacePayload[];
   update: CoreUpdate; // parsed from WasmStack.core_update_json()
-  /** Solid + manifold mode: the raw host slabs ([0]=band) for the main thread to difference with
-   *  manifold-3d. When present, `surfaces` is the FULL field-path solids (the fallback); the main
-   *  thread replaces each (series,unit) the Manifold pass covers and keeps the rest. Absent on the
-   *  pure field path (Manifold off / no vein / declined). */
-  manifoldSlabs?: ManifoldSlab[];
-  /** Inputs the main-thread Manifold pass needs (the worker owns the command). */
-  manifoldMeta?: {
-    veinIndex: number;
+  /** Solid mode (unified mesher): the flat recipe-op list for the main-thread Manifold pass to
+   *  compose into rock units. When present, `surfaces` holds only non-solid extras (none today). */
+  recipeOps?: RecipeOp[];
+  /** Inputs the main-thread recipe execution needs. */
+  recipeMeta?: {
     extent: [number, number, number, number, number, number];
     assignment: Record<string, string>;
   };

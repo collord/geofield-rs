@@ -53,7 +53,7 @@ import {
 import { AddSurfaceMenu } from "./HierarchyPanel/AddSurfaceMenu";
 import { SurfaceDataModal } from "./HierarchyPanel/SurfaceDataModal";
 import type { RenderMode, RunCommand, SurfacePayload, WorkerMessage } from "./protocol";
-import { initManifold, meshManifoldVolumes } from "./manifoldVolumes";
+import { initManifold, executeRecipe } from "./manifoldVolumes";
 
 function App() {
   const [project, setProject] = useState<Project>(() => loadProject() ?? blankProject());
@@ -116,20 +116,16 @@ function App() {
           setStatus("done");
           onDone?.();
         };
-        // Solid + manifold path: the worker shipped the raw host slabs; difference the band on the
-        // PERSISTENT main-thread Manifold instance (it hangs if re-instantiated per worker — docs/14),
-        // then overlay onto the field-path solids (replace each (series,unit) the boolean pass covers,
-        // keep the rest as the fallback). A decline / per-slab failure → the field path renders.
-        if (msg.manifoldSlabs && msg.manifoldMeta) {
-          const { veinIndex, extent, assignment } = msg.manifoldMeta;
-          const slabs = msg.manifoldSlabs;
+        // Unified solid mesher: the worker shipped a boolean RECIPE over single-level-set primitives;
+        // compose the rock units on the PERSISTENT main-thread Manifold instance (it hangs if
+        // re-instantiated per worker — docs/14). The geology is already baked into the recipe (Rust's
+        // clip_maskers); the main thread just runs the booleans. On any failure, fall back to whatever
+        // `surfaces` the worker sent (the legacy field path when the toggle is off, else empty).
+        if (msg.recipeOps && msg.recipeMeta) {
+          const { extent, assignment } = msg.recipeMeta;
+          const ops = msg.recipeOps;
           initManifold()
-            .then((wasm) => {
-              const rocks = meshManifoldVolumes(wasm, slabs, extent, veinIndex, assignment);
-              if (!rocks) return finish(msg.surfaces);
-              const covered = new Set(rocks.map((r) => `${r.series}:${r.unit}`));
-              finish([...rocks, ...msg.surfaces.filter((s) => !covered.has(`${s.series}:${s.unit}`))]);
-            })
+            .then((wasm) => finish(executeRecipe(wasm, ops, extent, assignment)))
             .catch(() => finish(msg.surfaces));
         } else {
           finish(msg.surfaces);

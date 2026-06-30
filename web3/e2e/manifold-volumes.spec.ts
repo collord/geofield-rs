@@ -50,11 +50,11 @@ test("manifold-toggle seals the dipping cross-cut vein's rock units (watertight,
   await page.getByTestId("seed-template").selectOption("cross-cutting-vein-dipping");
   await expect(page.getByText("status: done")).toBeVisible({ timeout: 30_000 });
 
-  // Switch to Solids. The Manifold boolean path is now the DEFAULT volume mesher, so the very first
-  // solid render already meshes through it (status passes through the "Manifold boolean" phase) —
+  // Switch to Solids. The unified Manifold recipe mesher is the DEFAULT volume mesher, so the very
+  // first solid render already meshes through it (status passes through the "(Manifold)" phase) —
   // no toggle needed. Assert the toggle reflects that default-on state.
   await page.getByTestId("render-toggle").click();
-  await expect(page.getByText(/Manifold boolean/)).toBeVisible({ timeout: 30_000 });
+  await expect(page.getByText(/Manifold/)).toBeVisible({ timeout: 30_000 });
   await expect(page.getByText("status: done")).toBeVisible({ timeout: 30_000 });
   await expect(page.getByTestId("manifold-toggle")).toBeChecked();
   await waitForSolids(page);

@@ -278,6 +278,51 @@ impl WasmTaggedSolid {
     }
 }
 
+/// One op of a volume-mesh RECIPE (`mesh_volume_recipe_octree`): a single-level-set primitive plus
+/// the boolean to apply on the main thread. `op`: 0 = Base, 1 = Intersect, 2 = Subtract, 3 = BaseBox
+/// (start from the domain cube; empty mesh). Ops for one `(series, block, unit)` are consecutive.
+/// Normals are omitted — Manifold only needs positions + indices.
+#[wasm_bindgen]
+pub struct WasmRecipeOp {
+    series: usize,
+    block: usize,
+    unit: usize,
+    op: u32,
+    prim_id: u32,
+    positions: Vec<f32>,
+    indices: Vec<u32>,
+}
+
+#[wasm_bindgen]
+impl WasmRecipeOp {
+    #[wasm_bindgen(getter)]
+    pub fn series(&self) -> usize {
+        self.series
+    }
+    #[wasm_bindgen(getter)]
+    pub fn block(&self) -> usize {
+        self.block
+    }
+    #[wasm_bindgen(getter)]
+    pub fn unit(&self) -> usize {
+        self.unit
+    }
+    #[wasm_bindgen(getter)]
+    pub fn op(&self) -> u32 {
+        self.op
+    }
+    #[wasm_bindgen(getter, js_name = primId)]
+    pub fn prim_id(&self) -> u32 {
+        self.prim_id
+    }
+    pub fn positions(&self) -> Vec<f32> {
+        self.positions.clone()
+    }
+    pub fn indices(&self) -> Vec<u32> {
+        self.indices.clone()
+    }
+}
+
 /// A fitted model exposed to JS. Wraps a [`RemoteModel`] handle into the kernel module.
 #[wasm_bindgen]
 pub struct WasmModel {
@@ -1115,18 +1160,13 @@ impl WasmStack {
         out
     }
 
-    /// WALL-FREE host UNIT SLABS for a cross-cutting body's cut units, co-contoured on ONE shared
-    /// octree so curved beds are followed and adjacent units' bed contacts coincide (docs/13 §5
-    /// follow-up). The Manifold A/B path differences the band from these CLEAN slabs (the band is the
-    /// first tagged solid of `mesh_cross_cut_solids_shared_*`). Returns the body interior solid
-    /// tagged `(series, 0, 0)` FIRST, then each cut unit `(series, block, unit)`. Empty for a
-    /// stratigraphic series / topography / wall-less / out-of-range body. This exists because the
-    /// independent per-unit [`Self::mesh_series_block_unit_solid`] leaves LOD-transition T-junctions
-    /// that Manifold rejects — the shared-tree contour avoids them by construction.
+    /// THE unified volume mesher: a flat list of boolean RECIPE ops over single-level-set primitives,
+    /// for every present rock unit of the whole stack. The main thread executes them on Manifold
+    /// (`series,block,unit` groups the ops; `op` = 0 Base / 1 Intersect / 2 Subtract / 3 BaseBox).
+    /// Replaces the per-unit field-domain solid meshing (and its gaps) with primitive composition.
     #[allow(clippy::too_many_arguments)]
-    pub fn mesh_cross_cut_host_slabs_octree(
+    pub fn mesh_volume_recipe_octree(
         &self,
-        series: usize,
         min_x: f64,
         min_y: f64,
         min_z: f64,
@@ -1137,21 +1177,18 @@ impl WasmStack {
         max_depth: u32,
         min_depth: u32,
         qef_threshold: f64,
-    ) -> Vec<WasmTaggedSolid> {
+    ) -> Vec<WasmRecipeOp> {
         let cfg = octree_cfg(max_depth, min_depth, qef_threshold, true);
-        let Some(slabs) = self.inner.mesh_cross_cut_host_slabs(
-            series, [min_x, min_y, min_z], size, [ext_x, ext_y, ext_z], cfg,
-        ) else {
-            return Vec::new();
-        };
-        slabs
+        self.inner
+            .mesh_volume_recipe([min_x, min_y, min_z], size, [ext_x, ext_y, ext_z], cfg)
             .into_iter()
-            .map(|(j, b, u, m)| WasmTaggedSolid {
-                series: j,
-                block: b,
-                unit: u,
+            .map(|(series, block, unit, op, prim_id, m)| WasmRecipeOp {
+                series,
+                block,
+                unit,
+                op,
+                prim_id,
                 positions: m.positions,
-                normals: m.normals,
                 indices: m.indices,
             })
             .collect()
