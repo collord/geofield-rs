@@ -1383,9 +1383,28 @@ impl<M: SeriesModel + BlockModel> Stack<M> {
     ///
     /// Returns 0 for a field-less block.
     pub fn present_unit_count(&self, i: usize, b: usize) -> usize {
-        // Keep every unit, every series. Clipping (incl. topography) decides where each has
-        // volume; the cap above supplies the void, so no unit is dropped at the count level.
-        self.block_unit_count(i, b)
+        let n = self.block_unit_count(i, b);
+        // Match `global_unit` (the visible-lithology truth): a BOUNDED series (`unbounded_above =
+        // false`) is present only BELOW its top contact (`present_at`: field < iso_top), so its top
+        // "void" unit belongs to whatever lies ABOVE that unconformity — the OLDER series beneath it
+        // in the stack (which fills upward into that space), not this series.
+        //
+        // Keeping that void unit was premised on "the cap above supplies the void". That holds when a
+        // younger element or topography caps the series, but a topography-less youngest erode/onlap
+        // series has no such cap: its uncapped top unit then filled to the box ceiling and OVERLAPPED
+        // the older floor (the reported "erosion deposits on the same side it erodes" bug — the eroded
+        // rock and the deposited rock occupying the same space).
+        //
+        // So drop the top unit for a bounded series IFF an OLDER element lies beneath it (`i` is not
+        // the oldest) — that older element owns the space above the unconformity. A LONE bounded
+        // series (nothing older) still fills upward: the honest "no ground surface defined yet" state,
+        // with nothing to overlap. In app stacks the oldest series is always the floor, so a bounded
+        // series always has an older element and always drops — matching `global_unit`.
+        let has_older = i + 1 < self.series.len();
+        match self.series_at(i) {
+            Some(s) if n > 0 && !s.unbounded_above && has_older => n - 1,
+            _ => n,
+        }
     }
 
     /// Mesh ONE lithology UNIT of block `b` of series `i` as a watertight CLOSED solid —
@@ -4269,12 +4288,14 @@ mod tests {
             4,
             "universal fill-upward: the floor keeps ALL units (top unit is rock, not a void)"
         );
-        // The younger Erode series now ALSO keeps all its units (clipping, not the count,
-        // removes the part above the erosion); the flag no longer drops its top unit.
+        // The younger Erode series sits over the floor, so its top "void" unit (above its erosion
+        // unconformity) belongs to the OLDER floor beneath — not to the erode series. It must be
+        // DROPPED, else it fills the box ceiling and overlaps the floor (the reported erode-overlap
+        // bug). This matches `global_unit`, which gives the erode series only its below-iso_top rock.
         assert_eq!(
             stack.present_unit_count(0, 0),
-            stack.block_unit_count(0, 0),
-            "universal fill-upward: a younger series keeps its topmost unit too (clip-driven)"
+            stack.block_unit_count(0, 0) - 1,
+            "a bounded series over an older element drops its top void unit (owned by the floor)"
         );
 
         // The basement's topmost unit (index 3) is the slab that daylights against the
