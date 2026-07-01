@@ -151,6 +151,36 @@ pub struct CoreUpdate {
     pub derived: DerivedView,
 }
 
+/// Sign of the fitted field's variation with z (its "up" sense), sampled across the domain box
+/// `ext = [x0,x1,y0,y1,z0,z1]`, for ordering the unit ladder by physical elevation:
+///   * `Some(true)`  — field INCREASES with z (higher isovalue = higher z; unit index n is the top).
+///   * `Some(false)` — field DECREASES with z (a deposit-above / erode field; unit index 0 is the top).
+///   * `None`        — mixed sign (a FOLDED field, no single up-sense) or ~flat in z → caller keeps
+///                     the default mesher order. Sampling a 3×3 (x,y) grid at z-mid ± h detects folds.
+fn field_up_sense<M: SeriesModel>(model: &M, ext: [f64; 6]) -> Option<bool> {
+    let [x0, x1, y0, y1, z0, z1] = ext;
+    let zc = 0.5 * (z0 + z1);
+    let h = 1e-3 * (z1 - z0).abs().max(1.0); // small step; field |grad| ~1e-3/unit ≫ f64 noise
+    let (mut pos, mut neg) = (0u32, 0u32);
+    for &fx in &[0.35, 0.5, 0.65] {
+        for &fy in &[0.35, 0.5, 0.65] {
+            let x = x0 + fx * (x1 - x0);
+            let y = y0 + fy * (y1 - y0);
+            let d = model.scalar_field([x, y, zc + h]) - model.scalar_field([x, y, zc - h]);
+            if d > 1e-12 {
+                pos += 1;
+            } else if d < -1e-12 {
+                neg += 1;
+            }
+        }
+    }
+    match (pos, neg) {
+        (p, 0) if p > 0 => Some(true),
+        (0, n) if n > 0 => Some(false),
+        _ => None, // folded (both signs) or flat (neither) → default order
+    }
+}
+
 impl<M: SeriesModel> Stack<M> {
     /// Project the live stack to its declared-state DTOs. Element ids are the stack
     /// index as a string in the MVP (stable for one session's edits).
@@ -191,7 +221,14 @@ impl<M: SeriesModel> Stack<M> {
 
     /// Compute the read-only derived view. Pure function of declared state + the
     /// fitted fields — the property core-api.md invariant 5 pins.
-    pub fn derived_view(&self) -> DerivedView {
+    ///
+    /// `ext = [x0,x1,y0,y1,z0,z1]` is the domain box, used only to order each series' unit ladder
+    /// by physical elevation (top-of-stack first): the mesher's unit index runs with ASCENDING
+    /// isovalue, which is bottom→top only when the field increases with z. An erode series deposits
+    /// ABOVE its unconformity (its field decreases with z), so its isovalue order is inverted — we
+    /// detect that from the fitted field and flip the ladder so the physically-upper unit lists on
+    /// top. Index VALUES are unchanged (they stay the stable assignment key); only display order moves.
+    pub fn derived_view(&self, ext: [f64; 6]) -> DerivedView {
         use crate::stack::StackElement;
         let mut effective_relation = Vec::with_capacity(self.series.len());
         let mut validation = Vec::with_capacity(self.series.len());
@@ -247,14 +284,20 @@ impl<M: SeriesModel> Stack<M> {
                 StackElement::Vein(_) | StackElement::Intrusion(_) if has_iface => 1,
                 _ => 0, // topography (Air only), or a field-less element
             };
-            // Emit TOP-of-stack first (descending index): the mesher's unit index 0 is the
-            // BOTTOM slab (`isovalues` ascending → unit 0 below the lowest contact, unit n the
-            // top), so the UI ladder — youngest/top at the top — lists indices n..0. The
-            // `index` VALUE stays the core's stable mesher coordinate (the assignment key).
-            units.push((
-                id.clone(),
-                (0..unit_count).rev().map(|index| UnitInfo { index }).collect(),
-            ));
+            // Emit TOP-of-stack first: the mesher's unit index runs with ASCENDING isovalue, so
+            // index 0 is the BOTTOM slab and index n the top ONLY when the field increases with z.
+            // A deposit-above (erode) field decreases with z, inverting that — so order by the
+            // fitted field's actual up-sense at this domain. Field-up (or folded/ambiguous, the
+            // safe default): list n..0. Field-down: list 0..n so the physically-upper unit is on
+            // top. The `index` VALUE stays the stable mesher coordinate (the assignment key).
+            let field_down = matches!(e, StackElement::Series(_))
+                && field_up_sense(e.model(), ext) == Some(false);
+            let order: Vec<usize> = if field_down {
+                (0..unit_count).collect()
+            } else {
+                (0..unit_count).rev().collect()
+            };
+            units.push((id.clone(), order.into_iter().map(|index| UnitInfo { index }).collect()));
         }
         DerivedView {
             effective_relation,
@@ -264,11 +307,12 @@ impl<M: SeriesModel> Stack<M> {
         }
     }
 
-    /// The full `CoreUpdate` (declared state + derived view) for a UI round-trip.
-    pub fn core_update(&self) -> CoreUpdate {
+    /// The full `CoreUpdate` (declared state + derived view) for a UI round-trip. `ext` is the
+    /// domain box, used to order each series' unit ladder by physical elevation (see `derived_view`).
+    pub fn core_update(&self, ext: [f64; 6]) -> CoreUpdate {
         CoreUpdate {
             model: self.to_dtos(),
-            derived: self.derived_view(),
+            derived: self.derived_view(ext),
         }
     }
 }
@@ -305,13 +349,42 @@ mod tests {
         ])
     }
 
+    /// The unit ladder is ordered by PHYSICAL elevation, not raw mesher index. A deposit-above
+    /// (field DECREASES with z) series — what the UI's `erode ⇒ deposit-above` produces — has its
+    /// mesher unit index running OPPOSITE to elevation, so index 0 is the physically-TOP slab and
+    /// must lead the ladder (not the default `.rev()`). Pins the fix for the "Unknown over basalt"
+    /// inversion. Index VALUES stay the stable mesher coordinate; only display order changes.
+    #[test]
+    fn deposit_above_series_lists_units_top_first() {
+        let down = {
+            let mut sps = Vec::new();
+            for i in 0..4 {
+                for j in 0..4 {
+                    let (x, y) = (i as f64 * 300.0 + 50.0, j as f64 * 300.0 + 50.0);
+                    sps.push(SurfacePoint::new([x, y, 600.0], 0));
+                }
+            }
+            let oris = vec![Orientation::new([500.0, 500.0, 600.0], [0.0, 0.0, -1.0])]; // pole DOWN
+            Model::fit(&Series::new(sps, oris), KernelOptions::default())
+        };
+        let stack = Stack::new(vec![
+            StackedSeries::new(down, Relation::Erode).into(),
+            StackedSeries::floor(dipping_plane(400.0, 0.0, 0.0)).into(),
+        ]);
+        let dv = stack.derived_view([0.0, 1000.0, 0.0, 1000.0, 0.0, 1000.0]);
+        let erode: Vec<usize> = dv.units[0].1.iter().map(|u| u.index).collect();
+        assert_eq!(erode, vec![0, 1], "deposit-above (field-down) lists index 0 (the top slab) first");
+        let floor: Vec<usize> = dv.units[1].1.iter().map(|u| u.index).collect();
+        assert_eq!(floor, vec![1, 0], "field-up floor keeps the default top-first-by-rev order");
+    }
+
     /// T016 [US4] — the DTO JSON contract round-trips losslessly. The hand-mirrored TS
     /// (`web3/src/HierarchyPanel/dto.ts`) depends on these exact serde shapes; this test
     /// fails if the Rust shape changes incompatibly, bounding drift until ts-rs lands.
     #[test]
     fn core_update_json_round_trips() {
         let stack = erode_over_floor();
-        let update = stack.core_update();
+        let update = stack.core_update([0.0, 1000.0, 0.0, 1000.0, 0.0, 1000.0]);
         let json = serde_json::to_string(&update).expect("serialize CoreUpdate");
         let back: CoreUpdate = serde_json::from_str(&json).expect("deserialize CoreUpdate");
         assert_eq!(update, back, "CoreUpdate must round-trip through JSON unchanged");
@@ -323,8 +396,8 @@ mod tests {
     #[test]
     fn derived_view_is_pure_and_correct() {
         let stack = erode_over_floor();
-        let a = stack.derived_view();
-        let b = stack.derived_view();
+        let a = stack.derived_view([0.0, 1000.0, 0.0, 1000.0, 0.0, 1000.0]);
+        let b = stack.derived_view([0.0, 1000.0, 0.0, 1000.0, 0.0, 1000.0]);
         assert_eq!(a, b, "derived view must be a pure function of declared state");
 
         // Element "0" is the younger Erode; "1" is the floor.
@@ -412,7 +485,7 @@ mod tests {
         assert!(matches!(back, StackElementDto::Topography { .. }));
 
         // DerivedView.units: topography lists none; the floor lists its units.
-        let dv = stack.derived_view();
+        let dv = stack.derived_view([0.0, 1000.0, 0.0, 1000.0, 0.0, 1000.0]);
         assert_eq!(dv.units[0].1.len(), 0, "topography contributes no rock unit (Air only)");
         assert_eq!(dv.units[1].1.len(), 2, "1-contact floor exposes 2 units (universal fill-up)");
     }

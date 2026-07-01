@@ -313,7 +313,7 @@ async function run(cmd: RunCommand) {
 
   // The hierarchy round-trip payload (declared state + derived view) — parsed from the
   // core's single JSON getter (contract D3+D5). The UI treats `derived` as a read-only cache.
-  const update = JSON.parse(stack.core_update_json()) as CoreUpdate;
+  const update = JSON.parse(stack.core_update_json(...cmd.extent)) as CoreUpdate;
   stack.free?.();
 
   const transfer: Transferable[] = [];

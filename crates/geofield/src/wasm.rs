@@ -777,8 +777,10 @@ impl WasmStack {
     /// One getter rather than N flat derived-getters keeps the boundary a single
     /// serialized DTO (the design doc §7 contract) — the same payload the round-trip
     /// purity test (`schema::tests`) pins.
-    pub fn core_update_json(&self) -> String {
-        serde_json::to_string(&self.inner.core_update())
+    /// `x0..z1` is the domain box — used only to order each series' unit ladder by physical
+    /// elevation (a deposit-above erode field lists its top unit first; see `Stack::derived_view`).
+    pub fn core_update_json(&self, x0: f64, x1: f64, y0: f64, y1: f64, z0: f64, z1: f64) -> String {
+        serde_json::to_string(&self.inner.core_update([x0, x1, y0, y1, z0, z1]))
             .unwrap_or_else(|e| format!("{{\"error\":\"serialize CoreUpdate: {e}\"}}"))
     }
 

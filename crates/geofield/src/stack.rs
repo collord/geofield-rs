@@ -4755,7 +4755,7 @@ mod tests {
             Model::fit(&Series::new(sps, oris), KernelOptions::default())
         };
         let stack = Stack::new(vec![topography_at(900.0), StackedSeries::floor(basement).into()]);
-        let dv = stack.derived_view();
+        let dv = stack.derived_view([0.0, 1000.0, 0.0, 1000.0, 0.0, 1000.0]);
 
         // Two elements present as keys; order parallels the model (topography id "0", floor "1").
         assert_eq!(dv.units.len(), 2, "every element appears in units");
