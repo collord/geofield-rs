@@ -11,18 +11,19 @@ test("flipping a surface's orientation is a geometry edit that re-fits on Apply"
   await expect(page.getByText("status: done")).toBeVisible({ timeout: 30_000 });
   await expect(page.getByTestId("stale-scrim")).toHaveCount(0);
 
-  // The youngest surface (the erosion contact) is seeded flipped — its menu shows the ✓.
+  // The youngest surface (the erosion contact) is seeded UNflipped — the `erode` relation now
+  // carries the deposit-above "up" sense, so it renders correct with no explicit flip (no ✓).
   await page.getByTestId("surface-menu").first().click();
-  await expect(page.getByTestId("surface-flip").first()).toContainText("✓");
+  await expect(page.getByTestId("surface-flip").first()).not.toContainText("✓");
 
   // Flip it -> dirty + scrim (a geometry-affecting edit).
   await page.getByTestId("surface-flip").first().click();
   await expect(page.getByTestId("apply-bar")).toBeVisible();
   await expect(page.getByTestId("stale-scrim")).toBeVisible();
 
-  // The toggle state is reflected (no longer flipped -> no ✓).
+  // The toggle state is reflected (now flipped -> ✓).
   await page.getByTestId("surface-menu").first().click();
-  await expect(page.getByTestId("surface-flip").first()).not.toContainText("✓");
+  await expect(page.getByTestId("surface-flip").first()).toContainText("✓");
   await page.getByTestId("surface-menu").first().click(); // close the menu
 
   // Apply re-fits and clears the scrim.

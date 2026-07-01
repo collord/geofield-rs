@@ -183,10 +183,10 @@ const NO_FAULT = { fault_point: [0, 0, 0], fault_normal: [0, 0, 0] };
 /** Flatten an ordered list of interfaces into the SeriesJson point/orientation arrays.
  *  The interface's position in the list becomes its `sp_if` id. Orientations convert
  *  dip/dipDir -> pole HERE and nowhere else. */
-function flattenInterfaces(interfaces: InterfaceData[]): Pick<
-  SeriesJson,
-  "sp_xyz" | "sp_if" | "ori_xyz" | "ori_pole"
-> {
+function flattenInterfaces(
+  interfaces: InterfaceData[],
+  defaultFlip = false,
+): Pick<SeriesJson, "sp_xyz" | "sp_if" | "ori_xyz" | "ori_pole"> {
   const sp_xyz: number[] = [];
   const sp_if: number[] = [];
   const ori_xyz: number[] = [];
@@ -196,7 +196,12 @@ function flattenInterfaces(interfaces: InterfaceData[]): Pick<
       sp_xyz.push(p.x, p.y, p.z);
       sp_if.push(ifId);
     }
-    const s = iface.flipped ? -1 : 1; // flip negates the pole (field "up" sense)
+    // `defaultFlip` is the relation's natural "up" sense: an ERODE series deposits ABOVE its
+    // unconformity (eroding DOWN into what's below), so its field points the opposite way to a
+    // conformable bed's. The per-interface `flipped` toggle is then an XOR override on top of
+    // that default — so an UNflipped erode contact is already the correct deposit-above state,
+    // not a double-negative the author has to flip in. (Confirmed convention: erode ⇒ deposit-above.)
+    const s = (!!iface.flipped !== defaultFlip) ? -1 : 1; // flip negates the pole (field "up" sense)
     for (const o of iface.orientations) {
       ori_xyz.push(o.x, o.y, o.z);
       const [nx, ny, nz] = dipDirToPole(o.dip, o.dipDir);
@@ -233,7 +238,9 @@ export function toSeriesJson(project: Project): SeriesJson[] {
         name: el.name,
         relation: RELATION_CODE[el.relation],
         unboundedAbove: el.unboundedAbove,
-        ...flattenInterfaces(el.interfaces),
+        // Erode deposits above its unconformity: the relation carries that "up" sense as the
+        // interface default, so the erosion contact is correct UNflipped (see flattenInterfaces).
+        ...flattenInterfaces(el.interfaces, el.relation === "erode"),
         ...NO_FAULT,
       };
     }

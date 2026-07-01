@@ -185,9 +185,10 @@ export const TEMPLATES: Template[] = [
           name: "basalt",
           relation: "erode",
           unboundedAbove: false,
-          // Seed FLIPPED: the basalt deposit caps the unconformity from above (the field's
-          // "up" sense is inverted vs. a conformable bed). Renders correct out of the box.
-          interfaces: [dippingInterface("erosion surface", 650, 0.4, 0, true)],
+          // UNflipped: the `erode` relation already implies deposit-above (it carries the
+          // inverted "up" sense vs. a conformable bed — see project.ts flattenInterfaces), so the
+          // erosion contact renders correct out of the box with no explicit flip.
+          interfaces: [dippingInterface("erosion surface", 650, 0.4, 0)],
         },
         threeContactFloor(),
       ],
