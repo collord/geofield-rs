@@ -15,6 +15,10 @@
 pub mod mesh;
 pub mod octree;
 
+// Wavefront `.obj` ingress for imported mesh surfaces (feature 004). Byte-oriented, wasm-safe (no
+// `std::fs`), BSD — turns an imported file buffer into deduplicated triangle geometry.
+pub mod obj;
+
 // The multi-series stack (erode/onlap masking) is generic over `SeriesModel`, so it runs
 // on BOTH targets: over the in-process kernel `Model` natively, and over `RemoteModel`
 // (the wasm import bridge) in the browser.

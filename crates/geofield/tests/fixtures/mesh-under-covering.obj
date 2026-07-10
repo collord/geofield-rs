@@ -1,0 +1,9 @@
+# A flat bed at z=500 covering only the inner [200,800]^2 footprint — its AABB is
+# strictly inside the [0,1000]^3 domain, so it must be PROJECTED out to the box (US2).
+v 200 200 500
+v 800 200 500
+v 800 800 500
+v 200 800 500
+vn 0 0 1
+f 1//1 2//1 3//1
+f 1//1 3//1 4//1

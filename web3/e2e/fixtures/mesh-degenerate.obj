@@ -1,0 +1,8 @@
+# Degenerate: three collinear vertices → a single zero-area triangle, plus a duplicate
+# vertex. Ingress must skip the zero-area face and (with nothing meshable left) REPORT a
+# clear rejection rather than emit garbage (FR-011).
+v 100 500 500
+v 400 500 500
+v 700 500 500
+v 100 500 500
+f 1 2 3
