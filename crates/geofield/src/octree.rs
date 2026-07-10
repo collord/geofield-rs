@@ -756,6 +756,22 @@ impl TriMesh {
         omega / (4.0 * std::f64::consts::PI)
     }
 
+    /// Axis-aligned bounds `(min, max)` of the mesh vertices (feature 004: the coverage box that
+    /// separates the exact interior from the smooth projection). `None` for an empty mesh.
+    pub fn bounds(&self) -> Option<([f64; 3], [f64; 3])> {
+        if self.vertices.is_empty() {
+            return None;
+        }
+        let (mut lo, mut hi) = ([f64::MAX; 3], [f64::MIN; 3]);
+        for v in &self.vertices {
+            for k in 0..3 {
+                lo[k] = lo[k].min(v[k]);
+                hi[k] = hi[k].max(v[k]);
+            }
+        }
+        Some((lo, hi))
+    }
+
     /// The triangle whose CLAMPED closest point to `p` is nearest, as
     /// `(triangle, distance, closest_point)`. Unlike a centroid test this is exact for
     /// `p` sitting on a large facet whose centroid is far (or beyond a small facet whose
@@ -944,6 +960,73 @@ impl ScalarField for MeshSignedField<'_> {
         let n = self.mesh.surface_normal(p).unwrap_or([0.0, 0.0, 1.0]);
         let s = if self.sign.scalar_field(p) < self.iso { -1.0 } else { 1.0 };
         [s * n[0], s * n[1], s * n[2]]
+    }
+}
+
+/// The STITCHED exact-inside / smooth-outside field for an imported surface projected to the domain
+/// boundary (feature 004 US2). Inside the mesh's xy footprint it is the signed distance to the EXACT
+/// mesh (as [`MeshSignedField`]); OUTSIDE it is the signed distance to the SMOOTH co-kriged surface
+/// (`|kriged − iso| / |∇kriged|`, a first-order distance so the two regions share the SAME scale).
+/// The sign ("below the contact") comes from the kriged field throughout. Because the exact and
+/// smooth surfaces coincide at the footprint edge (the mesh boundary vertices are kriging
+/// constraints — spike `seam_gap=0`), the field is continuous across the seam, so contouring
+/// `{ < 0 }` gives ONE watertight solid: exact inside the bounds, smoothly extended to the box
+/// beyond — no field-blend, no spurious phantom sheet (research.md D3). When the footprint already
+/// covers the domain this reduces to the pure exact patch (US1).
+pub struct StitchedField<'a> {
+    mesh: &'a TriMesh,
+    /// xy footprint of the mesh (the exact/smooth switch); z is ignored (a bed switches by column).
+    min_xy: [f64; 2],
+    max_xy: [f64; 2],
+    kriged: &'a dyn ScalarField,
+    iso: f64,
+}
+
+impl<'a> StitchedField<'a> {
+    pub fn new(mesh: &'a TriMesh, min_xy: [f64; 2], max_xy: [f64; 2], kriged: &'a dyn ScalarField, iso: f64) -> Self {
+        Self { mesh, min_xy, max_xy, kriged, iso }
+    }
+
+    fn inside_footprint(&self, p: [f64; 3]) -> bool {
+        p[0] >= self.min_xy[0] && p[0] <= self.max_xy[0] && p[1] >= self.min_xy[1] && p[1] <= self.max_xy[1]
+    }
+
+    /// |∇kriged| by central finite difference (works for any `ScalarField`; the kriged field is
+    /// smooth so a small step is well-conditioned).
+    fn kriged_grad_norm(&self, p: [f64; 3]) -> f64 {
+        let h = 1e-2;
+        let g = [
+            self.kriged.scalar_field([p[0] + h, p[1], p[2]]) - self.kriged.scalar_field([p[0] - h, p[1], p[2]]),
+            self.kriged.scalar_field([p[0], p[1] + h, p[2]]) - self.kriged.scalar_field([p[0], p[1] - h, p[2]]),
+            self.kriged.scalar_field([p[0], p[1], p[2] + h]) - self.kriged.scalar_field([p[0], p[1], p[2] - h]),
+        ];
+        ((g[0] * g[0] + g[1] * g[1] + g[2] * g[2]).sqrt() / (2.0 * h)).max(1e-9)
+    }
+}
+
+impl ScalarField for StitchedField<'_> {
+    fn scalar_field(&self, p: [f64; 3]) -> f64 {
+        let s = if self.kriged.scalar_field(p) < self.iso { -1.0 } else { 1.0 };
+        let d = if self.inside_footprint(p) {
+            self.mesh.surface_distance(p).unwrap_or(0.0)
+        } else {
+            (self.kriged.scalar_field(p) - self.iso).abs() / self.kriged_grad_norm(p)
+        };
+        s * d
+    }
+    fn scalar_field_gradient(&self, p: [f64; 3]) -> [f64; 3] {
+        // The kriged gradient is a good surface-normal proxy in both regions (the kriged field
+        // approximates the surface); normalize + orient outward (toward increasing signed distance).
+        let h = 1e-2;
+        let g = [
+            self.kriged.scalar_field([p[0] + h, p[1], p[2]]) - self.kriged.scalar_field([p[0] - h, p[1], p[2]]),
+            self.kriged.scalar_field([p[0], p[1] + h, p[2]]) - self.kriged.scalar_field([p[0], p[1] - h, p[2]]),
+            self.kriged.scalar_field([p[0], p[1], p[2] + h]) - self.kriged.scalar_field([p[0], p[1], p[2] - h]),
+        ];
+        let n = (g[0] * g[0] + g[1] * g[1] + g[2] * g[2]).sqrt().max(1e-12);
+        // ∇kriged points toward increasing kriged; signed distance increases on the `> iso` side,
+        // which is the same direction, so this is already outward.
+        [g[0] / n, g[1] / n, g[2] / n]
     }
 }
 

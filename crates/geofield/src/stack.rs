@@ -81,7 +81,7 @@ use crate::mesh::Mesh;
 use crate::mesh_clip::{clip, ClipMesh, Keep};
 use crate::octree::{
     octree_dual_contour_scene, octree_dual_contour_shared, AxisBox, Boundary, ContactHalfSpace,
-    MeshSignedField, OctreeConfig, PlaneHalfSpace, Scene, SlabComplement, TriMesh,
+    OctreeConfig, PlaneHalfSpace, Scene, SlabComplement, StitchedField, TriMesh,
 };
 use crate::{clip_mesh_to_half_spaces, max_abs_field_in_box, BlockModel, ScalarField, SeriesModel};
 
@@ -2211,15 +2211,24 @@ impl<M: SeriesModel + BlockModel> Stack<M> {
                 }
                 StackElement::ImportedSurface(im) => {
                     // A stratigraphic contact = ONE interface (the mesh), 2 units (below / above).
-                    // The EXACT-PATCH primitive is `below(MeshSignedField)`: its zero-set is the
-                    // imported triangles (sign from the kriged field), so the contact honors the
-                    // mesh exactly (feature 004 research D3). Mirrors the Series arm for n=1.
+                    // The primitive is `below(StitchedField)`: EXACT (mesh distance) inside the mesh's
+                    // footprint, SMOOTH (kriged distance) beyond it out to the box — one continuous
+                    // field, one contour, so the imported triangles are honored exactly inside the
+                    // bounds and projected smoothly to the boundary (feature 004 US2, research D3).
+                    // When the footprint spans the domain this is the pure exact patch (US1).
                     let Some(iso) = im.iso() else { continue };
+                    let Some((bmin, bmax)) = im.mesh.bounds() else { continue };
                     let f = im.model.field();
-                    let signed = MeshSignedField::new(&im.mesh, &f, iso);
+                    let stitched = StitchedField::new(
+                        &im.mesh,
+                        [bmin[0], bmin[1]],
+                        [bmax[0], bmax[1]],
+                        &f,
+                        iso,
+                    );
                     let bid = next_id;
                     next_id += 1;
-                    out.push((0, 0, 0, 255, bid, below_solid(&signed, 0.0, min, size, ext_max, cfg)));
+                    out.push((0, 0, 0, 255, bid, below_solid(&stitched, 0.0, min, size, ext_max, cfg)));
                     let clip_refs = self.emit_clip_defs(&mut out, &mut next_id, i, min, size, ext_max, cfg);
                     // Below-the-contact unit (0) is always rock; the ABOVE unit (1) is the void owned
                     // by a younger element / Air — dropped when an older element lies beneath, exactly

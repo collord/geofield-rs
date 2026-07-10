@@ -77,14 +77,14 @@ description: "Task list for Imported Mesh Surfaces"
 
 ### Tests for User Story 2
 
-- [ ] T017 [P] [US2] Native invariant test `crates/geofield/tests/imported_mesh_projection.rs`: import fixture (b) → watertight AND reaches every domain box face (INV-2); seam continuous — seam edges incidence 2, seam vertices shared by index, dihedral ≤ tol (INV-4); assert exactly one surface component per unit (no spurious phantom sheet)
+- [X] T017 [P] [US2] Native invariant test `crates/geofield/tests/imported_mesh_projection.rs`: import fixture (b) → watertight AND reaches every domain box face (INV-2); seam continuous — seam edges incidence 2, seam vertices shared by index, dihedral ≤ tol (INV-4); assert exactly one surface component per unit (no spurious phantom sheet)
 
 ### Implementation for User Story 2
 
-- [ ] T018 [US2] Kriged smooth fit in `crates/geofield/src/wasm.rs` `add_imported_surface`: fit `Model::fit` through mesh vertices (as `SurfacePoint`s, single `interface_id`) + normals (as `Orientation` poles) via `remote::fit` across the existing kernel wasm boundary, bounding the solve with `DecimateConfig.point_budget` (reuse the `decimate_frac` ABI) — Constitution V: no new seam (research.md D1/D2)
-- [ ] T019 [US2] Smooth-patch mesher in `crates/geofield/src/stack.rs`: contour the kriged field clipped to [outside the mesh AABB → domain box] (reuse the `AxisBox` extent-clip; extrapolate-then-clip like a fitted surface)
-- [ ] T020 [US2] Patch-stitch weld in `crates/geofield/src/stack.rs`: `mesh_clip::clip` the exact patch (T011) and the smooth patch (T019) at the shared AABB seam → single watertight surface; SHORT-CIRCUIT (FR-007) when the mesh AABB already contains the domain box (exact patch only, no projection)
-- [ ] T021 [US2] Conditional on the T003 finding: implement the `mesh_clip` `refine` hook (`crates/geofield/src/mesh_clip.rs:182`) to nudge AABB-seam vertices onto the kriged field's zero set IF the index-shared weld alone misses INV-4 seam continuity; otherwise mark this task no-op-needed with the spike evidence (Principle VI — don't build it unless the spike says so)
+- [X] T018 [US2] Kriged smooth fit in `crates/geofield/src/wasm.rs` `add_imported_surface`: fit `Model::fit` through mesh vertices (as `SurfacePoint`s, single `interface_id`) + normals (as `Orientation` poles) via `remote::fit` across the existing kernel wasm boundary, bounding the solve with `DecimateConfig.point_budget` (reuse the `decimate_frac` ABI) — Constitution V: no new seam (research.md D1/D2)
+- [X] T019 [US2] Smooth-patch mesher in `crates/geofield/src/stack.rs`: contour the kriged field clipped to [outside the mesh AABB → domain box] (reuse the `AxisBox` extent-clip; extrapolate-then-clip like a fitted surface)
+- [X] T020 [US2] Patch-stitch weld in `crates/geofield/src/stack.rs`: `mesh_clip::clip` the exact patch (T011) and the smooth patch (T019) at the shared AABB seam → single watertight surface; SHORT-CIRCUIT (FR-007) when the mesh AABB already contains the domain box (exact patch only, no projection)
+- [X] T021 [US2] Conditional on the T003 finding: implement the `mesh_clip` `refine` hook (`crates/geofield/src/mesh_clip.rs:182`) to nudge AABB-seam vertices onto the kriged field's zero set IF the index-shared weld alone misses INV-4 seam continuity; otherwise mark this task no-op-needed with the spike evidence (Principle VI — don't build it unless the spike says so)
 
 **Checkpoint**: under-covering imports close watertight to the boundary with a continuous seam. The kicker works.
 
