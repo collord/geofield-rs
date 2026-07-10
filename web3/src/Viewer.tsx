@@ -309,18 +309,28 @@ export function Viewer(props: {
     if (!st || !props.drawBounds) return;
     const { renderer, camera, controls, scene } = st;
     const dom = renderer.domElement;
-    const [x0, x1, y0, y1, z0, z1] = props.extent;
-    const cx = (x0 + x1) / 2;
-    const cy = (y0 + y1) / 2;
-    const zmid = (z0 + z1) / 2;
-    const span = Math.max(x1 - x0, y1 - y0);
+    // Frame the top-down view on the DATA (so the meshes stay visible while you draw the bounds
+    // around them) — NOT the model extent, which for world-coordinate data sits far off at the origin.
+    // Fall back to the extent only when there's no data.
+    const [ex0, ex1, ey0, ey1, ez0, ez1] = props.extent;
+    const bmin = dataBox ? dataBox.min : ([ex0, ey0, ez0] as [number, number, number]);
+    const bmax = dataBox ? dataBox.max : ([ex1, ey1, ez1] as [number, number, number]);
+    const cx = (bmin[0] + bmax[0]) / 2;
+    const cy = (bmin[1] + bmax[1]) / 2;
+    const zmid = (bmin[2] + bmax[2]) / 2;
+    const span = Math.max(bmax[0] - bmin[0], bmax[1] - bmin[1]) || 1;
 
-    // Snap top-down: look straight down -Z with +Y up, from well above the box.
+    // Snap top-down: look straight down -Z with +Y (North) up, from well above the data. Scale
+    // near/far to the data so world-coordinate meshes stay inside the frustum (don't clip away).
     const damp = controls.enableDamping;
     controls.enableDamping = false;
     controls.update();
     camera.up.set(0, 1, 0);
-    camera.position.set(cx, cy, zmid + span * 2.0);
+    const dist = span * 2.0 || 1000;
+    camera.position.set(cx, cy, zmid + dist);
+    camera.near = Math.max(dist * 1e-3, 0.01);
+    camera.far = dist * 100;
+    camera.updateProjectionMatrix();
     controls.target.set(cx, cy, zmid);
     controls.update();
     controls.enableDamping = damp;
