@@ -55,6 +55,13 @@ All Technical-Context unknowns resolved against the current codebase. Citations 
 
 **Alternatives considered**: FIELD-BLEND (one composite `ScalarField` = weighted MeshSdf + kriged) — rejected (spurious-lobe risk + incommensurate scales + contradicts the existing `docs/07` decision). Contour-the-mesh-then-Manifold-union-with-a-smooth-solid — rejected (the corefiner shares by index and avoids the union scalloping the main-thread Manifold path would reintroduce).
 
+**FOLLOW-UP FINDING (US1 build, 2026-07-09) — the exact patch cannot be `below(MeshSdf)`.** `MeshSdf`'s SIGN comes from the generalized winding number, which is only defined for a CLOSED mesh. An imported stratigraphic contact is an **OPEN sheet** (a bed with a boundary rim), so its winding number is ≈0 everywhere → `MeshSdf` has no usable inside/outside → `below_solid(&MeshSdf, 0)` does not produce a solid. Consequences for the exact-patch mesher (T011):
+- The **side** ("which half is below the contact") must come from the kriged field's sign (or the mesh normals), NOT from `MeshSdf`. `MeshSdf` still gives exact *distance/geometry near* the sheet, just not the sign.
+- Contouring the **kriged field** gives a watertight solid whose dividing surface equals the mesh **only where the kriged fit reproduces the mesh** — exact for a PLANAR imported bed (kriging is exact through coplanar constraints), but only *approximate between vertices* for a CURVED/dense mesh. So "kriged contour" satisfies INV-3 (exact-inside) for planar imports and within-tolerance for gently-curved ones, but NOT bit-exact for arbitrary meshes.
+- **True** exact-inside for an arbitrary curved mesh needs the mesh triangles used *directly* as the contact face (not a contour), closed into a solid using the kriged sign — a mesh-direct "close an open sheet into a half-space solid" operation that does not exist yet. This is a bounded seam (Principle IV), NOT simple reuse of `below_solid`.
+
+**Decision needed (user):** for v1, is "exact for planar / within-tolerance for curved, via the kriged contour" acceptable for US1 (reuse-maximal, ships now), with mesh-direct exactness for curved meshes as a documented refinement seam? Or must US1 deliver mesh-direct exactness for arbitrary curved imports up front (a larger geometry task)? This gates how US1's mesher (T011) is built.
+
 ---
 
 ## D4 — OBJ parser: hand-roll in the BSD engine
