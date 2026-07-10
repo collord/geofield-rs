@@ -54,7 +54,7 @@ description: "Task list for Imported Mesh Surfaces"
 ### Tests for User Story 1
 
 - [X] T009 [P] [US1] Native invariant test `crates/geofield/tests/imported_mesh_exact.rs`: import fixture (a) → watertight closed unit solids (INV-1) + contour coincides with input triangles within tolerance (INV-3, sample points on input tris, measure distance to output surface)
-- [ ] T010 [P] [US1] Playwright `web3/e2e/imported-mesh.spec.ts`: import `.obj` via the distinct mesh-import control (NOT the JSON Import) → an imported-surface element appears in the hierarchy and its geometry renders in the viewer (SC-009)
+- [X] T010 [P] [US1] Playwright `web3/e2e/imported-mesh.spec.ts`: import `.obj` via the distinct mesh-import control (NOT the JSON Import) → an imported-surface element appears in the hierarchy and its geometry renders in the viewer (SC-009)
 
 ### Implementation for User Story 1
 
@@ -62,8 +62,8 @@ description: "Task list for Imported Mesh Surfaces"
 - [X] T012 [P] [US1] Add `SeriesJson.importedMesh?` discriminator (sibling to `crossCut?`/`topography?`) in `web3/src/protocol.ts` per [contracts/protocol.md](./contracts/protocol.md)
 - [X] T013 [P] [US1] Add `ProjectElement { kind: "importedSurface" }` to `web3/src/HierarchyPanel/project.ts` (+ `toSeriesJson` compile to `importedMesh`) and `.geoproj` save/load round-trip (FR-012); mesh embedded, derived NOT stored
 - [X] T014 [US1] `buildStack` branch in `web3/src/worker.ts` → `stack.add_imported_surface(...)` (depends T008, T012)
-- [ ] T015 [US1] Distinct ".obj import" affordance in `web3/src/main.tsx` (+ HierarchyPanel): read file bytes → add an `importedSurface` element → re-fit/re-mesh; element shows role/relation selection, rename, delete — kept separate from the `.geoproj` "Import" button (FR-013)
-- [ ] T016 [US1] Wire the imported surface as a stratigraphic contact in `crates/geofield/src/stack.rs`: its `MeshSdf` (iso 0) drives units above/below via the existing unit-derivation + `clip_maskers` machinery; lithology assignment flows through its derived units identically to a fitted surface (Principle III — reuse, not re-encode)
+- [X] T015 [US1] Distinct ".obj import" affordance in `web3/src/main.tsx` (+ HierarchyPanel): read file bytes → add an `importedSurface` element → re-fit/re-mesh; element shows role/relation selection, rename, delete — kept separate from the `.geoproj` "Import" button (FR-013)
+- [X] T016 [US1] Wire the imported surface as a stratigraphic contact in `crates/geofield/src/stack.rs`: its `MeshSdf` (iso 0) drives units above/below via the existing unit-derivation + `clip_maskers` machinery; lithology assignment flows through its derived units identically to a fitted surface (Principle III — reuse, not re-encode)
 
 **Checkpoint**: importing a domain-spanning `.obj` yields a working, watertight, exactly-honored contact surface. MVP.
 

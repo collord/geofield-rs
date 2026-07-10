@@ -24,6 +24,7 @@ import {
   validate,
   exportProjectJson,
   importProjectJson,
+  newId,
 } from "./HierarchyPanel/project";
 import {
   addSurface,
@@ -356,6 +357,26 @@ function App() {
   };
   const onRenameProject = (name: string) => commit({ ...project, name });
 
+  // --- Import a MESH surface (feature 004): read a `.obj` file's text, add an importedSurface
+  //     element (a Contact by default), and commit (a geometry edit → re-fits on Apply). Distinct
+  //     from the project-JSON "Import" above (FR-013). ---
+  const onImportMesh = async (file: File) => {
+    try {
+      const objText = await file.text();
+      const el = {
+        kind: "importedSurface" as const,
+        id: newId("el"),
+        name: file.name.replace(/\.obj$/i, ""),
+        role: "contact" as const,
+        relation: "conformable" as const,
+        objText,
+      };
+      commit({ ...project, elements: [el, ...project.elements] });
+    } catch (err) {
+      setStatus("mesh import failed: " + (err instanceof Error ? err.message : String(err)));
+    }
+  };
+
   // --- OBJ export (US6) -----------------------------------------------------------------
   const canExportObj = surfaces.length > 0 && !dirty;
   const onExportObj = () => {
@@ -404,6 +425,20 @@ function App() {
                 onChange={(e) => {
                   const f = e.target.files?.[0];
                   if (f) void onImportFile(f);
+                  e.target.value = "";
+                }}
+              />
+            </label>
+            <label className="import-btn" data-testid="import-mesh-btn">
+              Import mesh
+              <input
+                type="file"
+                accept=".obj"
+                data-testid="import-mesh-input"
+                style={{ display: "none" }}
+                onChange={(e) => {
+                  const f = e.target.files?.[0];
+                  if (f) void onImportMesh(f);
                   e.target.value = "";
                 }}
               />
