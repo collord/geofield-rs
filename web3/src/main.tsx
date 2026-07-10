@@ -7,7 +7,7 @@
 // keep their immediate round-trip and never set dirty. A grey scrim signals the stale view
 // while dirty. The two-wasm core, worker, and ABI are UNCHANGED — this is a TS/React layer.
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { HierarchyPanel, LithologyCatalog, VolumeVisibility, applyCoreUpdate, emptyState, type HierarchyState } from "./HierarchyPanel";
 import type { RelationDto } from "./HierarchyPanel/dto";
@@ -58,6 +58,50 @@ import { SurfaceDataModal } from "./HierarchyPanel/SurfaceDataModal";
 import type { RenderMode, RunCommand, SurfacePayload, WorkerMessage } from "./protocol";
 import { initManifold, executeRecipe } from "./manifoldVolumes";
 
+/** The minZ/maxZ form shown after the 2-point XY bounds digitization, to complete the rectangular
+ *  prism (feature: draw model bounds). Prefilled from the current extent's Z range. */
+function ZRangeForm(props: {
+  extent: [number, number, number, number, number, number];
+  rect: { x0: number; x1: number; y0: number; y1: number };
+  onConfirm: (minZ: number, maxZ: number) => void;
+  onCancel: () => void;
+}) {
+  const [minZ, setMinZ] = useState(String(props.extent[4]));
+  const [maxZ, setMaxZ] = useState(String(props.extent[5]));
+  const { x0, x1, y0, y1 } = props.rect;
+  const num = (s: string) => Number.parseFloat(s);
+  const valid = Number.isFinite(num(minZ)) && Number.isFinite(num(maxZ)) && num(minZ) !== num(maxZ);
+  return (
+    <div
+      data-testid="z-range-form"
+      style={{
+        position: "absolute", top: 12, left: 12, zIndex: 10, background: "#fff",
+        border: "1px solid #ccd", borderRadius: 6, padding: "0.75rem", boxShadow: "0 2px 8px rgba(0,0,0,0.15)",
+        display: "grid", gap: "0.4rem", minWidth: 220,
+      }}
+    >
+      <strong style={{ fontSize: "0.9em" }}>Model bounds — Z range</strong>
+      <div style={{ fontSize: "0.75em", color: "#556" }}>
+        X [{x0.toFixed(0)}, {x1.toFixed(0)}] · Y [{y0.toFixed(0)}, {y1.toFixed(0)}]
+      </div>
+      <label style={{ fontSize: "0.8em" }}>
+        min Z{" "}
+        <input data-testid="min-z" type="number" value={minZ} onChange={(e) => setMinZ(e.target.value)} style={{ width: 90 }} />
+      </label>
+      <label style={{ fontSize: "0.8em" }}>
+        max Z{" "}
+        <input data-testid="max-z" type="number" value={maxZ} onChange={(e) => setMaxZ(e.target.value)} style={{ width: 90 }} />
+      </label>
+      <div style={{ display: "flex", gap: "0.4rem" }}>
+        <button type="button" data-testid="confirm-bounds" disabled={!valid} onClick={() => props.onConfirm(num(minZ), num(maxZ))}>
+          Set bounds
+        </button>
+        <button type="button" onClick={props.onCancel}>Cancel</button>
+      </div>
+    </div>
+  );
+}
+
 function App() {
   const [project, setProject] = useState<Project>(() => loadProject() ?? blankProject());
   const [dirty, setDirty] = useState(false);
@@ -78,6 +122,13 @@ function App() {
   // toggling re-meshes. "clip seam" is inert while this is on (Manifold corefines the wall itself).
   const [manifold, setManifold] = useState(true);
   const [hiddenKeys, setHiddenKeys] = useState<Set<string>>(new Set());
+  // Model-bounds authoring (feature: draw model bounds). `showBounds` toggles the wireframe box;
+  // `drawNonce` bumps to (re)enter top-down 2-point digitization; `pendingBounds` holds the drawn
+  // XY rectangle while the user completes the prism with minZ/maxZ.
+  const [showBounds, setShowBounds] = useState(false);
+  const [drawNonce, setDrawNonce] = useState(0);
+  const [pendingBounds, setPendingBounds] = useState<{ x0: number; x1: number; y0: number; y1: number } | null>(null);
+  const drawBounds = useMemo(() => (drawNonce ? { nonce: drawNonce } : undefined), [drawNonce]);
   // Camera round-trip: the Viewer fills `viewApiRef` with a getter (read on Export);
   // `importedView` (a new object per Import) is pushed back to re-apply a saved view.
   const viewApiRef = useRef<{ getView: () => ViewState } | null>(null);
@@ -255,6 +306,25 @@ function App() {
     commit(setImportRole(project, elementId, role));
   const onSetImportExtend = (elementId: string, extend: boolean) =>
     commit(setImportExtend(project, elementId, extend));
+
+  // Draw model bounds (feature): the Viewer reports the drawn XY rectangle; show the wireframe and
+  // open the minZ/maxZ form to complete the prism.
+  const onBoundsXY = (x0: number, x1: number, y0: number, y1: number) => {
+    setPendingBounds({ x0, x1, y0, y1 });
+    setShowBounds(true);
+  };
+  // Confirm the prism: commit `project.extent` and re-mesh (extent bounds the mesher's domain box).
+  const onConfirmBounds = (minZ: number, maxZ: number) => {
+    if (!pendingBounds) return;
+    const { x0, x1, y0, y1 } = pendingBounds;
+    const lo = Math.min(minZ, maxZ);
+    const hi = Math.max(minZ, maxZ);
+    const next: Project = { ...project, extent: [x0, x1, y0, y1, lo, hi] };
+    setProject(next);
+    saveProject(next);
+    setPendingBounds(null);
+    if (next.elements.length > 0 && validate(next).canApply) runStack(next);
+  };
   const onDeleteElement = (elementId: string) => commit(deleteElement(project, elementId));
 
   // --- reorder (US4) — wire the existing resolver output --------------------------------
@@ -484,6 +554,23 @@ function App() {
               />
               edges
             </label>
+            <button
+              type="button"
+              data-testid="draw-bounds"
+              title="Draw the model bounds: top-down view, click two corners of the rectangle, then set the Z range."
+              onClick={() => setDrawNonce((n) => n + 1)}
+            >
+              Draw bounds
+            </button>
+            <label className="debug-toggle" title="Show the model-bounds wireframe box">
+              <input
+                type="checkbox"
+                data-testid="bounds-toggle"
+                checked={showBounds}
+                onChange={(e) => setShowBounds(e.target.checked)}
+              />
+              bounds
+            </label>
             <label
               className="debug-toggle"
               title="Cross-cut seam closer: off = legacy snap, on = mesh–mesh clip corefine (shared seam, no see-through dashes). Re-meshes on toggle."
@@ -626,7 +713,18 @@ function App() {
           hiddenKeys={hiddenKeys}
           viewApiRef={viewApiRef}
           importedView={importedView}
+          showBounds={showBounds}
+          drawBounds={drawBounds}
+          onBoundsXY={onBoundsXY}
         />
+        {pendingBounds && (
+          <ZRangeForm
+            extent={project.extent}
+            rect={pendingBounds}
+            onConfirm={onConfirmBounds}
+            onCancel={() => setPendingBounds(null)}
+          />
+        )}
       </main>
 
       {editing && editingIface && (

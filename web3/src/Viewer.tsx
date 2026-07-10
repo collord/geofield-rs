@@ -74,6 +74,27 @@ function buildAxes(extent: Extent): THREE.Group {
   return g;
 }
 
+/** Build a 12-edge wireframe box spanning the model bounds (feature: draw model bounds). Distinct
+ *  from `buildAxes` (which only draws the 3 axis edges from one corner) — this is the full prism. */
+function buildBoundsBox(extent: Extent): THREE.LineSegments {
+  const [x0, x1, y0, y1, z0, z1] = extent;
+  const c: [number, number, number][] = [
+    [x0, y0, z0], [x1, y0, z0], [x1, y1, z0], [x0, y1, z0], // bottom
+    [x0, y0, z1], [x1, y0, z1], [x1, y1, z1], [x0, y1, z1], // top
+  ];
+  const edges: [number, number][] = [
+    [0, 1], [1, 2], [2, 3], [3, 0], // bottom loop
+    [4, 5], [5, 6], [6, 7], [7, 4], // top loop
+    [0, 4], [1, 5], [2, 6], [3, 7], // verticals
+  ];
+  const pts: THREE.Vector3[] = [];
+  for (const [a, b] of edges) {
+    pts.push(new THREE.Vector3(...c[a]), new THREE.Vector3(...c[b]));
+  }
+  const geom = new THREE.BufferGeometry().setFromPoints(pts);
+  return new THREE.LineSegments(geom, new THREE.LineBasicMaterial({ color: 0x22d3ee })); // cyan
+}
+
 /** Convert a "#rrggbb" hex string to a three.js numeric colour. */
 function hexToNum(hex: string): number {
   return parseInt(hex.replace("#", ""), 16) || 0x888888;
@@ -103,6 +124,12 @@ export function Viewer(props: {
   /** When set (a NEW object), the Viewer applies this camera state — used on Import to
    *  restore a saved view. Applied after the extent re-center so it wins. */
   importedView?: ViewState;
+  /** Draw the model-bounds wireframe box (feature: draw model bounds). Display-only. */
+  showBounds?: boolean;
+  /** When set (a NEW object), enter 2-point top-down bounds digitization. On the second click the
+   *  Viewer calls `onBoundsXY(x0,x1,y0,y1)` with the drawn rectangle (model coords) and exits. */
+  drawBounds?: { nonce: number };
+  onBoundsXY?: (x0: number, x1: number, y0: number, y1: number) => void;
 }) {
   const mountRef = useRef<HTMLDivElement | null>(null);
   const stateRef = useRef<{
@@ -112,6 +139,8 @@ export function Viewer(props: {
     controls: OrbitControls;
     group: THREE.Group;
     axes: THREE.Group | null;
+    boundsBox: THREE.LineSegments | null;
+    rubber: THREE.LineLoop | null; // live rectangle during digitization
   } | null>(null);
 
   // One-time three.js setup.
@@ -140,7 +169,7 @@ export function Viewer(props: {
     controls.target.set(500, 500, 500);
     controls.update();
 
-    stateRef.current = { renderer, scene, camera, controls, group, axes: null };
+    stateRef.current = { renderer, scene, camera, controls, group, axes: null, boundsBox: null, rubber: null };
     if (props.viewApiRef) {
       props.viewApiRef.current = {
         getView: () => ({
@@ -183,6 +212,123 @@ export function Viewer(props: {
     st.controls.target.set((x0 + x1) / 2, (y0 + y1) / 2, (z0 + z1) / 2);
     st.controls.update();
   }, [props.extent]);
+
+  // The model-bounds wireframe box — rebuilt on extent change, shown/hidden by `showBounds`.
+  useEffect(() => {
+    const st = stateRef.current;
+    if (!st) return;
+    if (st.boundsBox) {
+      st.scene.remove(st.boundsBox);
+      st.boundsBox.geometry.dispose();
+      st.boundsBox = null;
+    }
+    if (props.showBounds) {
+      const box = buildBoundsBox(props.extent);
+      st.scene.add(box);
+      st.boundsBox = box;
+    }
+  }, [props.extent, props.showBounds]);
+
+  // 2-point BOUNDS DIGITIZATION (feature: draw model bounds). Fires when `drawBounds` is a new
+  // object: snap top-down, disable orbit, and capture two ground-plane clicks into a rectangle.
+  useEffect(() => {
+    const st = stateRef.current;
+    if (!st || !props.drawBounds) return;
+    const { renderer, camera, controls, scene } = st;
+    const dom = renderer.domElement;
+    const [x0, x1, y0, y1, z0, z1] = props.extent;
+    const cx = (x0 + x1) / 2;
+    const cy = (y0 + y1) / 2;
+    const zmid = (z0 + z1) / 2;
+    const span = Math.max(x1 - x0, y1 - y0);
+
+    // Snap top-down: look straight down -Z with +Y up, from well above the box.
+    const damp = controls.enableDamping;
+    controls.enableDamping = false;
+    controls.update();
+    camera.up.set(0, 1, 0);
+    camera.position.set(cx, cy, zmid + span * 2.0);
+    controls.target.set(cx, cy, zmid);
+    controls.update();
+    controls.enableDamping = damp;
+    controls.enabled = false; // no orbit while digitizing
+
+    const raycaster = new THREE.Raycaster();
+    const plane = new THREE.Plane(new THREE.Vector3(0, 0, 1), -zmid); // XY plane at z = zmid
+    const groundXY = (e: PointerEvent): THREE.Vector3 | null => {
+      const r = dom.getBoundingClientRect();
+      const ndc = new THREE.Vector2(
+        ((e.clientX - r.left) / r.width) * 2 - 1,
+        -((e.clientY - r.top) / r.height) * 2 + 1,
+      );
+      raycaster.setFromCamera(ndc, camera);
+      const hit = new THREE.Vector3();
+      return raycaster.ray.intersectPlane(plane, hit) ? hit : null;
+    };
+
+    let cornerA: THREE.Vector3 | null = null;
+    const rect = (a: THREE.Vector3, b: THREE.Vector3): THREE.Vector3[] => [
+      new THREE.Vector3(a.x, a.y, zmid),
+      new THREE.Vector3(b.x, a.y, zmid),
+      new THREE.Vector3(b.x, b.y, zmid),
+      new THREE.Vector3(a.x, b.y, zmid),
+    ];
+    const clearRubber = () => {
+      if (st.rubber) {
+        scene.remove(st.rubber);
+        st.rubber.geometry.dispose();
+        st.rubber = null;
+      }
+    };
+
+    const onMove = (e: PointerEvent) => {
+      if (!cornerA) return;
+      const b = groundXY(e);
+      if (!b) return;
+      clearRubber();
+      const loop = new THREE.LineLoop(
+        new THREE.BufferGeometry().setFromPoints(rect(cornerA, b)),
+        new THREE.LineBasicMaterial({ color: 0xfacc15 }), // amber while drawing
+      );
+      scene.add(loop);
+      st.rubber = loop;
+    };
+    const onDown = (e: PointerEvent) => {
+      const p = groundXY(e);
+      if (!p) return;
+      if (!cornerA) {
+        cornerA = p.clone();
+        return;
+      }
+      // Second click → finish.
+      const rx0 = Math.min(cornerA.x, p.x);
+      const rx1 = Math.max(cornerA.x, p.x);
+      const ry0 = Math.min(cornerA.y, p.y);
+      const ry1 = Math.max(cornerA.y, p.y);
+      cleanup();
+      props.onBoundsXY?.(rx0, rx1, ry0, ry1);
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") cleanup();
+    };
+
+    function cleanup() {
+      dom.removeEventListener("pointerdown", onDown);
+      dom.removeEventListener("pointermove", onMove);
+      window.removeEventListener("keydown", onKey);
+      clearRubber();
+      controls.enabled = true;
+    }
+
+    dom.addEventListener("pointerdown", onDown);
+    dom.addEventListener("pointermove", onMove);
+    window.addEventListener("keydown", onKey);
+    dom.style.cursor = "crosshair";
+    return () => {
+      cleanup();
+      dom.style.cursor = "";
+    };
+  }, [props.drawBounds]);
 
   // Apply an imported view (declared AFTER the extent re-center so it overrides the
   // auto-centered target). Fires whenever `importedView` is a new object (each Import).
