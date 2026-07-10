@@ -707,6 +707,7 @@ impl WasmStack {
         mesh_bytes: &[u8],
         role: u32,
         relation: u32,
+        extend_to_bounds: bool,
         range: f64,
         c_o: f64,
         i_res: f64,
@@ -723,29 +724,34 @@ impl WasmStack {
         let (verts, tris, _health) =
             crate::obj::normalize_and_check(&obj).map_err(|e| JsError::new(&e.to_string()))?;
 
-        // Derive the co-kriging fit inputs FROM the mesh: vertices = surface points (one interface);
-        // per-face (centroid, outward normal) = orientations. Face normals come from the
-        // winding-normalized triangles, so they point consistently outward (the sign source).
-        let mut sp_xyz = Vec::with_capacity(verts.len() * 3);
-        for v in &verts {
-            sp_xyz.extend_from_slice(v);
+        // The co-kriged field is only for the SMOOTH extension (extend_to_bounds) + the isovalue/type;
+        // the DEFAULT footprint-only path uses the mesh's LOCAL signed distance and never contours it.
+        // The cokriging solve is dense ~N³, so a large lidar mesh (≈10^6 vertices) would OOM the wasm
+        // heap ("unreachable"). SUBSAMPLE the fit inputs to a hard cap — a coarse field is plenty for a
+        // sign/isovalue; the EXACT geometry always comes from the full mesh (local distance), never the
+        // fit. Deterministic stride subsampling (native==wasm).
+        const MAX_FIT_POINTS: usize = 400;
+        const MAX_FIT_ORIS: usize = 120;
+        let pstride = (verts.len() / MAX_FIT_POINTS).max(1);
+        let mut sp_xyz = Vec::new();
+        let mut sp_interface = Vec::new();
+        for (i, v) in verts.iter().enumerate() {
+            if i % pstride == 0 {
+                sp_xyz.extend_from_slice(v);
+                sp_interface.push(0.0);
+            }
         }
-        let sp_interface = vec![0.0f64; verts.len()];
+        let ostride = (tris.len() / MAX_FIT_ORIS).max(1);
         let (mut ori_xyz, mut ori_pole) = (Vec::new(), Vec::new());
-        for t in &tris {
+        for (i, t) in tris.iter().enumerate() {
+            if i % ostride != 0 {
+                continue;
+            }
             let (a, b, c) = (verts[t[0]], verts[t[1]], verts[t[2]]);
-            let centroid = [
-                (a[0] + b[0] + c[0]) / 3.0,
-                (a[1] + b[1] + c[1]) / 3.0,
-                (a[2] + b[2] + c[2]) / 3.0,
-            ];
+            let centroid = [(a[0] + b[0] + c[0]) / 3.0, (a[1] + b[1] + c[1]) / 3.0, (a[2] + b[2] + c[2]) / 3.0];
             let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
             let ac = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
-            let n = [
-                ab[1] * ac[2] - ab[2] * ac[1],
-                ab[2] * ac[0] - ab[0] * ac[2],
-                ab[0] * ac[1] - ab[1] * ac[0],
-            ];
+            let n = [ab[1] * ac[2] - ab[2] * ac[1], ab[2] * ac[0] - ab[0] * ac[2], ab[0] * ac[1] - ab[1] * ac[0]];
             let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
             if len == 0.0 {
                 continue;
@@ -770,9 +776,13 @@ impl WasmStack {
             _ => None,
         };
         let mesh = TriMesh::new(verts, tris);
-        self.inner
-            .series
-            .push(StackElement::ImportedSurface(ImportedSurface { model, mesh, role, relation }));
+        self.inner.series.push(StackElement::ImportedSurface(ImportedSurface {
+            model,
+            mesh,
+            role,
+            relation,
+            extend_to_bounds,
+        }));
         Ok(())
     }
 

@@ -703,17 +703,201 @@ impl Boundary for AxisBox {
 /// Triangles are expected wound counter-clockwise as seen from OUTSIDE (outward
 /// normals), so the winding number is positive inside and the hit-triangle normal
 /// already points out of the domain.
+/// A median-split BVH over a mesh's triangles, so nearest-point and ray queries are O(log n) instead
+/// of O(n) — essential for large imported meshes (feature 004: a 320k-triangle lidar surface makes an
+/// unindexed linear scan per octree query billions of ops). Deterministic (median split on the
+/// longest centroid axis; stable ordering), so native and wasm build the identical tree.
+struct TriBvh {
+    nodes: Vec<BvhNode>,
+    /// Triangle indices, reordered by the build so each leaf is a contiguous slice.
+    order: Vec<u32>,
+}
+
+#[derive(Clone)]
+struct BvhNode {
+    min: [f64; 3],
+    max: [f64; 3],
+    /// Leaf (`count > 0`): `start` is the offset into `order`. Internal (`count == 0`): `start` is
+    /// the left child index; the right child is `start + 1`.
+    start: u32,
+    count: u32,
+}
+
+impl TriBvh {
+    fn build(verts: &[[f64; 3]], tris: &[[usize; 3]]) -> Self {
+        let n = tris.len();
+        let centroid: Vec<[f64; 3]> = tris
+            .iter()
+            .map(|t| {
+                let (a, b, c) = (verts[t[0]], verts[t[1]], verts[t[2]]);
+                [(a[0] + b[0] + c[0]) / 3.0, (a[1] + b[1] + c[1]) / 3.0, (a[2] + b[2] + c[2]) / 3.0]
+            })
+            .collect();
+        let tri_aabb = |ti: usize| -> ([f64; 3], [f64; 3]) {
+            let (a, b, c) = (verts[tris[ti][0]], verts[tris[ti][1]], verts[tris[ti][2]]);
+            let mut lo = a;
+            let mut hi = a;
+            for p in [b, c] {
+                for k in 0..3 {
+                    lo[k] = lo[k].min(p[k]);
+                    hi[k] = hi[k].max(p[k]);
+                }
+            }
+            (lo, hi)
+        };
+        let mut order: Vec<u32> = (0..n as u32).collect();
+        let mut nodes: Vec<BvhNode> = Vec::new();
+        if n == 0 {
+            nodes.push(BvhNode { min: [0.0; 3], max: [0.0; 3], start: 0, count: 0 });
+            return Self { nodes, order };
+        }
+        // Iterative build over `order` ranges to avoid deep recursion on huge meshes.
+        struct Task {
+            lo: usize,
+            hi: usize,
+            node: usize,
+        }
+        nodes.push(BvhNode { min: [0.0; 3], max: [0.0; 3], start: 0, count: 0 });
+        let mut stack = vec![Task { lo: 0, hi: n, node: 0 }];
+        const LEAF: usize = 4;
+        while let Some(Task { lo, hi, node }) = stack.pop() {
+            // Node AABB over the range.
+            let (mut nmin, mut nmax) = ([f64::MAX; 3], [f64::MIN; 3]);
+            for &ti in &order[lo..hi] {
+                let (l, h) = tri_aabb(ti as usize);
+                for k in 0..3 {
+                    nmin[k] = nmin[k].min(l[k]);
+                    nmax[k] = nmax[k].max(h[k]);
+                }
+            }
+            if hi - lo <= LEAF {
+                nodes[node] = BvhNode { min: nmin, max: nmax, start: lo as u32, count: (hi - lo) as u32 };
+                continue;
+            }
+            // Split on the longest axis at the centroid median.
+            let axis = {
+                let d = [nmax[0] - nmin[0], nmax[1] - nmin[1], nmax[2] - nmin[2]];
+                if d[0] >= d[1] && d[0] >= d[2] { 0 } else if d[1] >= d[2] { 1 } else { 2 }
+            };
+            let mid = (lo + hi) / 2;
+            order[lo..hi].select_nth_unstable_by(mid - lo, |&x, &y| {
+                centroid[x as usize][axis].partial_cmp(&centroid[y as usize][axis]).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let left = nodes.len();
+            nodes.push(BvhNode { min: [0.0; 3], max: [0.0; 3], start: 0, count: 0 });
+            nodes.push(BvhNode { min: [0.0; 3], max: [0.0; 3], start: 0, count: 0 });
+            nodes[node] = BvhNode { min: nmin, max: nmax, start: left as u32, count: 0 };
+            stack.push(Task { lo, hi: mid, node: left });
+            stack.push(Task { lo: mid, hi, node: left + 1 });
+        }
+        Self { nodes, order }
+    }
+
+    /// Squared distance from `p` to an AABB (0 if inside).
+    fn aabb_dist2(&self, node: usize, p: [f64; 3]) -> f64 {
+        let n = &self.nodes[node];
+        let mut d = 0.0;
+        for k in 0..3 {
+            let v = if p[k] < n.min[k] { n.min[k] - p[k] } else if p[k] > n.max[k] { p[k] - n.max[k] } else { 0.0 };
+            d += v * v;
+        }
+        d
+    }
+
+    /// Nearest triangle to `p` as `(tri, dist, closest_point)`, via best-first pruning.
+    fn nearest(&self, p: [f64; 3], verts: &[[f64; 3]], tris: &[[usize; 3]]) -> Option<(usize, f64, [f64; 3])> {
+        if self.order.is_empty() {
+            return None;
+        }
+        let mut best_d2 = f64::INFINITY;
+        let mut best: Option<(usize, [f64; 3])> = None;
+        let mut stack = vec![0usize];
+        while let Some(node) = stack.pop() {
+            if self.aabb_dist2(node, p) >= best_d2 {
+                continue;
+            }
+            let n = &self.nodes[node];
+            if n.count > 0 {
+                for &ti in &self.order[n.start as usize..(n.start + n.count) as usize] {
+                    let ti = ti as usize;
+                    let (a, b, c) = (verts[tris[ti][0]], verts[tris[ti][1]], verts[tris[ti][2]]);
+                    let cl = crate::weld::closest_point_on_triangle_pub(p, a, b, c);
+                    let d = sub(p, cl);
+                    let d2 = dot(d, d);
+                    if d2 < best_d2 {
+                        best_d2 = d2;
+                        best = Some((ti, cl));
+                    }
+                }
+            } else {
+                // Visit the nearer child first (cheap ordering heuristic).
+                let (l, r) = (n.start as usize, n.start as usize + 1);
+                if self.aabb_dist2(l, p) < self.aabb_dist2(r, p) {
+                    stack.push(r);
+                    stack.push(l);
+                } else {
+                    stack.push(l);
+                    stack.push(r);
+                }
+            }
+        }
+        best.map(|(t, cl)| (t, best_d2.sqrt(), cl))
+    }
+
+    /// Whether the ray `a → a+dir` (t ∈ [0,1]) hits an AABB (slab test), for ray-query pruning.
+    fn ray_hits_aabb(&self, node: usize, a: [f64; 3], dir: [f64; 3]) -> bool {
+        let n = &self.nodes[node];
+        let (mut t0, mut t1) = (0.0f64, 1.0f64);
+        for k in 0..3 {
+            let inv = 1.0 / dir[k];
+            let mut tn = (n.min[k] - a[k]) * inv;
+            let mut tf = (n.max[k] - a[k]) * inv;
+            if tn > tf {
+                std::mem::swap(&mut tn, &mut tf);
+            }
+            t0 = t0.max(tn);
+            t1 = t1.min(tf);
+            if t0 > t1 {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Collect all triangles whose AABB the ray crosses, calling `f(ti)` for each (dedup-free; the
+    /// caller does the exact ray–triangle test).
+    fn ray_candidates(&self, a: [f64; 3], dir: [f64; 3], mut f: impl FnMut(usize)) {
+        if self.order.is_empty() {
+            return;
+        }
+        let mut stack = vec![0usize];
+        while let Some(node) = stack.pop() {
+            if !self.ray_hits_aabb(node, a, dir) {
+                continue;
+            }
+            let n = &self.nodes[node];
+            if n.count > 0 {
+                for &ti in &self.order[n.start as usize..(n.start + n.count) as usize] {
+                    f(ti as usize);
+                }
+            } else {
+                stack.push(n.start as usize);
+                stack.push(n.start as usize + 1);
+            }
+        }
+    }
+}
+
 pub struct TriMesh {
     vertices: Vec<[f64; 3]>,
     triangles: Vec<[usize; 3]>,
+    bvh: TriBvh,
 }
 
 impl TriMesh {
     pub fn new(vertices: Vec<[f64; 3]>, triangles: Vec<[usize; 3]>) -> Self {
-        Self {
-            vertices,
-            triangles,
-        }
+        let bvh = TriBvh::build(&vertices, &triangles);
+        Self { vertices, triangles, bvh }
     }
 
     /// The three world-space corners of triangle `t`.
@@ -779,19 +963,21 @@ impl TriMesh {
     /// nearest-surface distance and the seam normal. `None` only for an empty mesh.
     /// Mirrors `mesh_clip::nearest_w_signed_among`'s clamped-distance selection.
     fn nearest_triangle_clamped(&self, p: [f64; 3]) -> Option<(usize, f64, [f64; 3])> {
-        let mut best_d2 = f64::INFINITY;
-        let mut best: Option<(usize, [f64; 3])> = None;
-        for ti in 0..self.triangles.len() {
-            let (a, b, c) = self.tri(ti);
-            let cl = crate::weld::closest_point_on_triangle_pub(p, a, b, c);
-            let d = sub(p, cl);
-            let d2 = dot(d, d);
-            if d2 < best_d2 {
-                best_d2 = d2;
-                best = Some((ti, cl));
-            }
+        self.bvh.nearest(p, &self.vertices, &self.triangles)
+    }
+
+    /// LOCAL signed distance to the mesh (feature 004): magnitude = clamped nearest-triangle
+    /// distance; sign from the side of the NEAREST triangle `p` is on (`dot(p − closest, normal)`),
+    /// NOT from a global winding number (undefined for an open sheet) or a fitted field. This is the
+    /// no-co-kriging exact-patch field for an imported terrain: negative below the surface, positive
+    /// above, zero on it. `None` for an empty mesh.
+    pub fn local_signed_distance(&self, p: [f64; 3]) -> Option<f64> {
+        let (t, d, cl) = self.nearest_triangle_clamped(p)?;
+        if d <= 1e-12 {
+            return Some(0.0);
         }
-        best.map(|(t, cl)| (t, best_d2.sqrt(), cl))
+        let s = if dot(sub(p, cl), self.tri_normal(t)) < 0.0 { -1.0 } else { 1.0 };
+        Some(s * d)
     }
 }
 
@@ -809,7 +995,7 @@ impl Boundary for TriMesh {
         let dir = sub(b, a);
         let mut best_t = f64::INFINITY;
         let mut hit: Option<([f64; 3], [f64; 3])> = None;
-        for ti in 0..self.triangles.len() {
+        self.bvh.ray_candidates(a, dir, |ti| {
             let (v0, v1, v2) = self.tri(ti);
             if let Some(t) = ray_triangle(a, dir, v0, v1, v2) {
                 if (0.0..=1.0).contains(&t) && t < best_t {
@@ -818,7 +1004,7 @@ impl Boundary for TriMesh {
                     hit = Some((p, self.tri_normal(ti)));
                 }
             }
-        }
+        });
         hit
     }
 
@@ -843,14 +1029,14 @@ impl Boundary for TriMesh {
         // does for its two band contacts — otherwise the contour cracks at the cell.
         let dir = sub(b, a);
         let mut count = 0;
-        for ti in 0..self.triangles.len() {
+        self.bvh.ray_candidates(a, dir, |ti| {
             let (v0, v1, v2) = self.tri(ti);
             if let Some(t) = ray_triangle(a, dir, v0, v1, v2) {
                 if (0.0..=1.0).contains(&t) {
                     count += 1;
                 }
             }
-        }
+        });
         count
     }
 }
@@ -960,6 +1146,35 @@ impl ScalarField for MeshSignedField<'_> {
         let n = self.mesh.surface_normal(p).unwrap_or([0.0, 0.0, 1.0]);
         let s = if self.sign.scalar_field(p) < self.iso { -1.0 } else { 1.0 };
         [s * n[0], s * n[1], s * n[2]]
+    }
+}
+
+/// The FOOTPRINT-ONLY exact field for an imported surface (feature 004): the mesh's LOCAL signed
+/// distance ([`TriMesh::local_signed_distance`] — sign from the nearest triangle's side, magnitude =
+/// clamped distance). Its zero set is the mesh EXACTLY, with NO co-kriging: the default path for a
+/// large imported terrain (a million-triangle lidar surface needs no field fit). Contour `{ < 0 }`
+/// clipped to the mesh's own bounds to get the below-contact solid within the data footprint.
+pub struct MeshLocalField<'a> {
+    mesh: &'a TriMesh,
+}
+
+impl<'a> MeshLocalField<'a> {
+    pub fn new(mesh: &'a TriMesh) -> Self {
+        Self { mesh }
+    }
+}
+
+impl ScalarField for MeshLocalField<'_> {
+    fn scalar_field(&self, p: [f64; 3]) -> f64 {
+        self.mesh.local_signed_distance(p).unwrap_or(0.0)
+    }
+    fn scalar_field_gradient(&self, p: [f64; 3]) -> [f64; 3] {
+        // The nearest facet's outward normal (oriented below→above), a good surface-normal proxy.
+        let n = self.mesh.surface_normal(p).unwrap_or([0.0, 0.0, 1.0]);
+        let s = if self.mesh.local_signed_distance(p).unwrap_or(0.0) < 0.0 { -1.0 } else { 1.0 };
+        // local_signed_distance already carries the sign; keep the gradient pointing outward.
+        let _ = s;
+        n
     }
 }
 

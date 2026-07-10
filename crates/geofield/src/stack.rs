@@ -81,7 +81,7 @@ use crate::mesh::Mesh;
 use crate::mesh_clip::{clip, ClipMesh, Keep};
 use crate::octree::{
     octree_dual_contour_scene, octree_dual_contour_shared, AxisBox, Boundary, ContactHalfSpace,
-    OctreeConfig, PlaneHalfSpace, Scene, SlabComplement, StitchedField, TriMesh,
+    MeshLocalField, OctreeConfig, PlaneHalfSpace, Scene, SlabComplement, StitchedField, TriMesh,
 };
 use crate::{clip_mesh_to_half_spaces, max_abs_field_in_box, BlockModel, ScalarField, SeriesModel};
 
@@ -366,7 +366,9 @@ pub enum ImportRole {
 /// [`MeshSignedField`] — sign from `model`, zero-set on the mesh); `model` supplies the field the
 /// stack machinery reads (lithology, present_at) and, in US2, the smooth extension beyond the bounds.
 pub struct ImportedSurface<M> {
-    /// The co-kriged field fit through the mesh (the SIGN field + `SeriesModel` behaviour).
+    /// A co-kriged field for the SMOOTH extension beyond the footprint (US2). Kept small (the fit is
+    /// decimated on ingress) — the DEFAULT footprint-only path never contours it, using the mesh's
+    /// LOCAL signed distance instead (no co-kriging for geometry). Also provides the isovalue/type.
     pub model: M,
     /// The exact imported triangle geometry (winding-normalized on ingress).
     pub mesh: TriMesh,
@@ -374,6 +376,10 @@ pub struct ImportedSurface<M> {
     pub role: ImportRole,
     /// The stratigraphic relation bit (erode/onlap/conformable) when the role is contact/erosion.
     pub relation: Option<Relation>,
+    /// When `true`, project the surface smoothly out to the domain box beyond its footprint (US2 —
+    /// via the kriged field). DEFAULT `false`: the surface exists ONLY within its data footprint (no
+    /// extrapolation) — the right default for a real lidar surface, and it needs no co-kriging.
+    pub extend_to_bounds: bool,
 }
 
 impl<M: SeriesModel> ImportedSurface<M> {
@@ -382,15 +388,11 @@ impl<M: SeriesModel> ImportedSurface<M> {
         self.model.interface_isovalues().last().copied()
     }
 
-    /// Is this surface's rock present at `p`? For a contact/erosion it is present BELOW its contact
-    /// (`field < iso`), the same convention as a bounded [`StackedSeries`]/[`Topography`]. Classified
-    /// against the kriged field (the exact geometry only matters for the MESHED surface, not for the
-    /// point-classification lithology lookup).
+    /// Is this surface's rock present at `p`? Present BELOW the contact — classified by the mesh's
+    /// LOCAL signed distance (sign from the nearest triangle), NOT the co-kriged field, so it is
+    /// correct and cheap even when the fit is a coarse decimation of a huge mesh.
     fn present_at(&self, p: [f64; 3]) -> bool {
-        match self.iso() {
-            Some(iso) => self.model.scalar_field(p) < iso,
-            None => false,
-        }
+        self.mesh.local_signed_distance(p).map(|d| d < 0.0).unwrap_or(false)
     }
 }
 
@@ -2234,24 +2236,30 @@ impl<M: SeriesModel + BlockModel> Stack<M> {
                 }
                 StackElement::ImportedSurface(im) => {
                     // A stratigraphic contact = ONE interface (the mesh), 2 units (below / above).
-                    // The primitive is `below(StitchedField)`: EXACT (mesh distance) inside the mesh's
-                    // footprint, SMOOTH (kriged distance) beyond it out to the box — one continuous
-                    // field, one contour, so the imported triangles are honored exactly inside the
-                    // bounds and projected smoothly to the boundary (feature 004 US2, research D3).
-                    // When the footprint spans the domain this is the pure exact patch (US1).
-                    let Some(iso) = im.iso() else { continue };
                     let Some((bmin, bmax)) = im.mesh.bounds() else { continue };
-                    let f = im.model.field();
-                    let stitched = StitchedField::new(
-                        &im.mesh,
-                        [bmin[0], bmin[1]],
-                        [bmax[0], bmax[1]],
-                        &f,
-                        iso,
-                    );
                     let bid = next_id;
                     next_id += 1;
-                    out.push((0, 0, 0, 255, bid, below_solid(&stitched, 0.0, min, size, ext_max, cfg)));
+                    // DEFAULT (footprint-only): contour the mesh's LOCAL signed distance — exact, no
+                    // co-kriging — clipped to the mesh's OWN bounds, so the surface exists only within
+                    // the data footprint (no extrapolation). This is the path a large lidar surface
+                    // takes. EXTEND: contour `StitchedField` (kriged smooth beyond the footprint) out
+                    // to the domain box (US2), for a surface the user asked to project to bounds.
+                    let prim = if im.extend_to_bounds {
+                        let Some(iso) = im.iso() else { continue };
+                        let f = im.model.field();
+                        let stitched =
+                            StitchedField::new(&im.mesh, [bmin[0], bmin[1]], [bmax[0], bmax[1]], &f, iso);
+                        below_solid(&stitched, 0.0, min, size, ext_max, cfg)
+                    } else {
+                        // Clip to the mesh's XY footprint but the FULL domain Z (the below-contact
+                        // solid fills from the floor up to the bed within the footprint).
+                        let fmin = [bmin[0], bmin[1], min[2]];
+                        let fmax = [bmax[0], bmax[1], ext_max[2]];
+                        let fsize = (fmax[0] - fmin[0]).max(fmax[1] - fmin[1]).max(fmax[2] - fmin[2]);
+                        let local = MeshLocalField::new(&im.mesh);
+                        below_solid(&local, 0.0, fmin, fsize, fmax, cfg)
+                    };
+                    out.push((0, 0, 0, 255, bid, prim));
                     let clip_refs = self.emit_clip_defs(&mut out, &mut next_id, i, min, size, ext_max, cfg);
                     // Below-the-contact unit (0) is always rock; the ABOVE unit (1) is the void owned
                     // by a younger element / Air — dropped when an older element lies beneath, exactly

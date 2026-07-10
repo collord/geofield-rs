@@ -21,7 +21,7 @@ fn imported_contact(bytes: &[u8]) -> (ImportedSurface<Model>, TriMesh) {
     let model = Model::fit(&Series::new(sps, oris), KernelOptions::default());
     let check = TriMesh::new(verts.clone(), tris.clone());
     (
-        ImportedSurface { model, mesh: TriMesh::new(verts, tris), role: ImportRole::Contact, relation: Some(Relation::Conformable) },
+        ImportedSurface { model, mesh: TriMesh::new(verts, tris), role: ImportRole::Contact, relation: Some(Relation::Conformable), extend_to_bounds: true },
         check,
     )
 }

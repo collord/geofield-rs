@@ -18,7 +18,7 @@ fn imported(role: ImportRole) -> ImportedSurface<Model> {
     let sps: Vec<SurfacePoint> = verts.iter().map(|&p| SurfacePoint::new(p, 0)).collect();
     let oris: Vec<Orientation> = verts.iter().zip(&normals).map(|(&p, &n)| Orientation::new(p, n)).collect();
     let model = Model::fit(&Series::new(sps, oris), KernelOptions::default());
-    ImportedSurface { model, mesh: TriMesh::new(verts, tris), role, relation: Some(Relation::Erode) }
+    ImportedSurface { model, mesh: TriMesh::new(verts, tris), role, relation: Some(Relation::Erode), extend_to_bounds: false }
 }
 
 /// A flat floor with three beds (z=300/500/700), fit natively.
