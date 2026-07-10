@@ -1,19 +1,21 @@
 <!-- SPECKIT START -->
 For technologies, project structure, shell commands, and other context, read the
-current plan: `specs/003-topography-lithology-solids/plan.md` (feature: topography,
-lithology catalog & solid volumes — promote the surface model to a named-volume model.
-A cross-cutting Rust + ABI + worker + UI change: a dedicated `StackElement::Topography`
-variant (singleton, youngest, erode-clip, Air above); make `unbounded_above` inert by
-deriving a series' top-unit keep/drop from whether a younger element caps it (net-new
-core logic, not a flag read); expose per-element unit coordinates on `DerivedView.units`;
-a UI-side lithology catalog (Air + Unknown fixed, inferred from bodies, user-added) with
-a many-to-one `(element, unit) → lithology` assignment serialized into the project JSON;
-reuse the capped-Scene mesher with topography as a universal top masker, skip Air, and
-wire the existing `RenderMode` to a Surfaces⇄Solids toggle that re-meshes without
-re-fitting, colouring solids by lithology and grouping OBJ by lithology). Its design
-source of record is `docs/topography_lithology_solids_spec.md`. The prior feature is
-`specs/002-enhanced-authoring/plan.md` (source of record
-`docs/enhanced_authoring_spec.md`); before it, `specs/001-stratigraphic-hierarchy/plan.md`
-(source of record `docs/stack_hierarchy_spec.md`). The project constitution is
-`.specify/memory/constitution.md`.
+current plan: `specs/004-imported-mesh-surfaces/plan.md` (feature: imported mesh
+surfaces — an imported `.obj` triangle mesh can be ANY surface a fitted one can be
+(contact/erosion/vein wall/topography), honoring the mesh EXACTLY inside its
+axis-aligned bounds and extending it SMOOTHLY to the domain box beyond them via a
+watertight seam. Resolved approach: reuse the co-kriging `Model::fit` (mesh vertices
+as points, normals as orientations, single interface) across the existing EUPL-kernel
+wasm boundary with the existing `DecimateConfig` point-budget; use the built `MeshSdf`
+as the exact-inside field; and PATCH-STITCH the exact patch (clipped to the mesh AABB)
+to the smooth kriged patch (outside AABB → box) with the `mesh_clip::clip` corefiner —
+NOT a scalar-field blend (avoids spurious phantom sheets). New: a ~50-line byte OBJ
+parser (`geofield/src/obj.rs`), a `StackElement::ImportedSurface` variant along the
+usual element-plumbing chain, and a distinct `.obj` import UI. Deliberately amends
+`docs/07_imported_mesh_field_proxy.md` (full-parity imports adopt a smooth far-field,
+confined to beyond the user's geometry). The prior feature is
+`specs/003-topography-lithology-solids/plan.md` (source of record
+`docs/topography_lithology_solids_spec.md`); before it,
+`specs/002-enhanced-authoring/plan.md` and `specs/001-stratigraphic-hierarchy/plan.md`.
+The project constitution is `.specify/memory/constitution.md`.
 <!-- SPECKIT END -->
