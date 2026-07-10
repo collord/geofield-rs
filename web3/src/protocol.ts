@@ -31,6 +31,15 @@ export interface SeriesJson {
    *  `add_topography` (pinned youngest, caps to Air); `relation`/`unboundedAbove`/`crossCut`
    *  are ignored. Its single interface is the ground. */
   topography?: boolean;
+  /** An IMPORTED mesh surface (feature 004). When set the worker calls `add_imported_surface`
+   *  with the `.obj` bytes; the engine parses + fits a field through the mesh. `relation` carries
+   *  the erode/onlap/conformable bit for a contact/erosion role; the point/orientation arrays are
+   *  ignored (the engine derives them from the mesh). */
+  importedMesh?: {
+    role: "contact" | "erosion" | "veinWall" | "topography";
+    /** The Wavefront `.obj` file bytes (browser reads the file; engine parses). */
+    bytes: Uint8Array;
+  };
 }
 
 /** Open contact sheets vs. closed lithology-unit solids (the web/ render modes). */

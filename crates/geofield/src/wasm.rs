@@ -21,9 +21,12 @@
 use std::sync::Once;
 use wasm_bindgen::prelude::*;
 
-use crate::octree::{octree_dual_contour, OctreeConfig};
+use crate::octree::{octree_dual_contour, OctreeConfig, TriMesh};
 use crate::remote::{self, RemoteModel};
-use crate::stack::{Envelope, Intrusion, Relation, Stack, StackElement, StackedSeries, Topography, Vein};
+use crate::stack::{
+    Envelope, ImportRole, ImportedSurface, Intrusion, Relation, Stack, StackElement, StackedSeries,
+    Topography, Vein,
+};
 use crate::{BlockModel, MeshModel};
 
 #[wasm_bindgen]
@@ -687,6 +690,89 @@ impl WasmStack {
         )?;
         // Pinned youngest (index 0) regardless of when it was added.
         self.inner.series.insert(0, StackElement::Topography(Topography { model }));
+        Ok(())
+    }
+
+    /// Fit and append an IMPORTED mesh surface (feature 004). `mesh_bytes` is a Wavefront `.obj`
+    /// file buffer (the browser reads the file; the ENGINE parses it, so no `std::fs` and the parser
+    /// stays BSD/wasm-safe). The imported triangles are honored exactly inside their bounds; a
+    /// co-kriged field fit THROUGH the mesh's vertices (+ face normals) supplies the sign and, in
+    /// US2, the smooth extension. `role`: `0=contact 1=erosion 2=veinWall 3=topography`. `relation`:
+    /// `0=erode 1=onlap 2=conformable` (used for contact/erosion). A malformed mesh is rejected with
+    /// a clear error (FR-011). Arg order ends with slices (no trailing scalar — the wasm-bindgen
+    /// trailing-arg pitfall).
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_imported_surface(
+        &mut self,
+        mesh_bytes: &[u8],
+        role: u32,
+        relation: u32,
+        range: f64,
+        c_o: f64,
+        i_res: f64,
+        gi_res: f64,
+        uni_degree: u32,
+        nugget: f64,
+        decimate_frac: f64,
+        fault_point: &[f64],
+        fault_normal: &[f64],
+    ) -> Result<(), JsError> {
+        install_panic_hook();
+        // Parse + winding-normalize + detect malformed (FR-008/FR-011).
+        let obj = crate::obj::parse_obj(mesh_bytes).map_err(|e| JsError::new(&e.to_string()))?;
+        let (verts, tris, _health) =
+            crate::obj::normalize_and_check(&obj).map_err(|e| JsError::new(&e.to_string()))?;
+
+        // Derive the co-kriging fit inputs FROM the mesh: vertices = surface points (one interface);
+        // per-face (centroid, outward normal) = orientations. Face normals come from the
+        // winding-normalized triangles, so they point consistently outward (the sign source).
+        let mut sp_xyz = Vec::with_capacity(verts.len() * 3);
+        for v in &verts {
+            sp_xyz.extend_from_slice(v);
+        }
+        let sp_interface = vec![0.0f64; verts.len()];
+        let (mut ori_xyz, mut ori_pole) = (Vec::new(), Vec::new());
+        for t in &tris {
+            let (a, b, c) = (verts[t[0]], verts[t[1]], verts[t[2]]);
+            let centroid = [
+                (a[0] + b[0] + c[0]) / 3.0,
+                (a[1] + b[1] + c[1]) / 3.0,
+                (a[2] + b[2] + c[2]) / 3.0,
+            ];
+            let ab = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+            let ac = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+            let n = [
+                ab[1] * ac[2] - ab[2] * ac[1],
+                ab[2] * ac[0] - ab[0] * ac[2],
+                ab[0] * ac[1] - ab[1] * ac[0],
+            ];
+            let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+            if len == 0.0 {
+                continue;
+            }
+            ori_xyz.extend_from_slice(&centroid);
+            ori_pole.extend_from_slice(&[n[0] / len, n[1] / len, n[2] / len]);
+        }
+
+        let model = self.fit_model(
+            &sp_xyz, &sp_interface, &ori_xyz, &ori_pole, range, c_o, i_res, gi_res, uni_degree,
+            nugget, decimate_frac, fault_point, fault_normal,
+        )?;
+
+        let role = match role {
+            1 => ImportRole::Erosion,
+            2 => ImportRole::VeinWall,
+            3 => ImportRole::Topography,
+            _ => ImportRole::Contact,
+        };
+        let relation = match role {
+            ImportRole::Contact | ImportRole::Erosion => Some(relation_from_code(relation)),
+            _ => None,
+        };
+        let mesh = TriMesh::new(verts, tris);
+        self.inner
+            .series
+            .push(StackElement::ImportedSurface(ImportedSurface { model, mesh, role, relation }));
         Ok(())
     }
 

@@ -143,10 +143,14 @@ function ElementNode(props: {
           ]
         : el.kind === "topography"
           ? [{ iface: el.ground, surfaceIndex: 0 }]
-          : [
-              { iface: el.envelopeOuter, surfaceIndex: 1 },
-              { iface: el.envelopeInner, surfaceIndex: 0 },
-            ];
+          : el.kind === "intrusion"
+            ? [
+                { iface: el.envelopeOuter, surfaceIndex: 1 },
+                { iface: el.envelopeInner, surfaceIndex: 0 },
+              ]
+            : // importedSurface: the geometry IS the mesh (no editable InterfaceData contacts).
+              // Its units still render from the derived view; the mesh row is shown separately.
+              [];
 
   const reorder = (
     <ReorderControls

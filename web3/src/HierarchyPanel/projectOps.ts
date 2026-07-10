@@ -163,6 +163,8 @@ function interfacesOf(el: ProjectElement): { iface: InterfaceData; role: string 
       { iface: el.hangingWall, role: `${el.name} · hanging wall` },
     ];
   if (el.kind === "topography") return [{ iface: el.ground, role: `${el.name} · ground` }];
+  // importedSurface has no editable InterfaceData (its geometry is the mesh).
+  if (el.kind === "importedSurface") return [];
   return [
     { iface: el.envelopeInner, role: `${el.name} · inner envelope` },
     { iface: el.envelopeOuter, role: `${el.name} · outer envelope` },
@@ -206,6 +208,8 @@ function mapInterface(
   if (el.kind === "topography") {
     return { ...el, ground: el.ground.id === interfaceId ? fn(el.ground) : el.ground };
   }
+  // importedSurface carries no editable InterfaceData — nothing to map.
+  if (el.kind === "importedSurface") return el;
   return {
     ...el,
     envelopeInner: el.envelopeInner.id === interfaceId ? fn(el.envelopeInner) : el.envelopeInner,

@@ -107,6 +107,18 @@ export type ProjectElement =
       id: string;
       name: string;
       ground: InterfaceData;
+    }
+  | {
+      // An IMPORTED mesh surface (feature 004). It carries the `.obj` TEXT (round-trips in the
+      // project JSON) and its role; the engine parses + fits a field through the mesh. For a
+      // contact/erosion role it also carries the Axis-A relation bit. No authored interfaces —
+      // the geometry IS the mesh.
+      kind: "importedSurface";
+      id: string;
+      name: string;
+      role: "contact" | "erosion" | "veinWall" | "topography";
+      relation: "erode" | "onlap" | "conformable";
+      objText: string; // the imported .obj file contents
     };
 
 export interface Project {
@@ -244,6 +256,21 @@ export function toSeriesJson(project: Project): SeriesJson[] {
         ...NO_FAULT,
       };
     }
+    if (el.kind === "importedSurface") {
+      // The geometry IS the mesh — no authored points/orientations. The engine parses the .obj
+      // bytes and fits a field through it; the fit arrays are empty and unused.
+      return {
+        name: el.name,
+        relation: RELATION_CODE[el.relation],
+        unboundedAbove: false,
+        sp_xyz: [],
+        sp_if: [],
+        ori_xyz: [],
+        ori_pole: [],
+        ...NO_FAULT,
+        importedMesh: { role: el.role, bytes: new TextEncoder().encode(el.objText) },
+      };
+    }
     // Cross-cutting bodies: relation/unboundedAbove are ignored by the core but emitted
     // with valid defaults; the two interfaces become ids 0/1.
     if (el.kind === "vein") {
@@ -305,9 +332,14 @@ export function validate(project: Project): ProjectValidation {
     } else if (el.kind === "intrusion") {
       checkInterface(el.id, el.envelopeInner);
       checkInterface(el.id, el.envelopeOuter);
-    } else {
+    } else if (el.kind === "topography") {
       // topography — one ground surface
       checkInterface(el.id, el.ground);
+    } else {
+      // importedSurface — the geometry is the mesh; it is valid iff it carries .obj text.
+      if (!el.objText || el.objText.trim().length === 0) {
+        hardErrors.push({ elementId: el.id, reason: "imported surface has no mesh" });
+      }
     }
   }
 

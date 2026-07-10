@@ -39,7 +39,7 @@ description: "Task list for Imported Mesh Surfaces"
 - [X] T005 [P] Ingress hygiene in `crates/geofield/src/obj.rs` (+ reuse `mesh::normalize_winding_per_component` / `mesh_clip::ClipMesh::winding_normalized`): normalize winding per connected component; DETECT-and-report (not repair) empty/holes/non-manifold/self-intersection with a clear error status (FR-011); tests over fixtures (c) and (d)
 - [X] T006 Add `StackElement::ImportedSurface { mesh, role, relation }` to `crates/geofield/src/stack.rs` and extend EVERY match over `StackElement` (`present_at`, `model`, meshing dispatch) so the variant compiles and is inert until meshed
 - [X] T007 [P] Add `StackElementDto::ImportedSurface` to `crates/geofield/src/schema.rs` (`to_dtos` + `from` round-trip); the DERIVED field/patches are NOT in the DTO (Principle III) — only mesh + role + relation
-- [ ] T008 `WasmStack::add_imported_surface(mesh_bytes, role, relation, decimate_frac, fault…)` skeleton in `crates/geofield/src/wasm.rs` (flat args per the wasm-bindgen trailing-arg constraint): parse (T004) → hygiene (T005) → build `MeshSdf` → push `StackElement::ImportedSurface`; the kriged fit is added in US2. Returns a clear error status on a rejected mesh
+- [X] T008 `WasmStack::add_imported_surface(mesh_bytes, role, relation, decimate_frac, fault…)` skeleton in `crates/geofield/src/wasm.rs` (flat args per the wasm-bindgen trailing-arg constraint): parse (T004) → hygiene (T005) → build `MeshSdf` → push `StackElement::ImportedSurface`; the kriged fit is added in US2. Returns a clear error status on a rejected mesh
 
 **Checkpoint**: patch-stitch proven; parser + element type + ABI skeleton exist; user stories can begin.
 
@@ -59,9 +59,9 @@ description: "Task list for Imported Mesh Surfaces"
 ### Implementation for User Story 1
 
 - [X] T011 [US1] Exact-patch mesher in `crates/geofield/src/stack.rs`: contour `MeshSdf` clipped to the mesh AABB into watertight unit solids (reuse `below_solid` / `octree_dual_contour_scene`); wire into the `StackElement::ImportedSurface` meshing dispatch (depends T006, T008)
-- [ ] T012 [P] [US1] Add `SeriesJson.importedMesh?` discriminator (sibling to `crossCut?`/`topography?`) in `web3/src/protocol.ts` per [contracts/protocol.md](./contracts/protocol.md)
-- [ ] T013 [P] [US1] Add `ProjectElement { kind: "importedSurface" }` to `web3/src/HierarchyPanel/project.ts` (+ `toSeriesJson` compile to `importedMesh`) and `.geoproj` save/load round-trip (FR-012); mesh embedded, derived NOT stored
-- [ ] T014 [US1] `buildStack` branch in `web3/src/worker.ts` → `stack.add_imported_surface(...)` (depends T008, T012)
+- [X] T012 [P] [US1] Add `SeriesJson.importedMesh?` discriminator (sibling to `crossCut?`/`topography?`) in `web3/src/protocol.ts` per [contracts/protocol.md](./contracts/protocol.md)
+- [X] T013 [P] [US1] Add `ProjectElement { kind: "importedSurface" }` to `web3/src/HierarchyPanel/project.ts` (+ `toSeriesJson` compile to `importedMesh`) and `.geoproj` save/load round-trip (FR-012); mesh embedded, derived NOT stored
+- [X] T014 [US1] `buildStack` branch in `web3/src/worker.ts` → `stack.add_imported_surface(...)` (depends T008, T012)
 - [ ] T015 [US1] Distinct ".obj import" affordance in `web3/src/main.tsx` (+ HierarchyPanel): read file bytes → add an `importedSurface` element → re-fit/re-mesh; element shows role/relation selection, rename, delete — kept separate from the `.geoproj` "Import" button (FR-013)
 - [ ] T016 [US1] Wire the imported surface as a stratigraphic contact in `crates/geofield/src/stack.rs`: its `MeshSdf` (iso 0) drives units above/below via the existing unit-derivation + `clip_maskers` machinery; lithology assignment flows through its derived units identically to a fitted surface (Principle III — reuse, not re-encode)
 
