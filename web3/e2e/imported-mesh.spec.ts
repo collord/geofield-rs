@@ -35,4 +35,15 @@ test("importing an .obj adds a mesh surface that fits and renders", async ({ pag
   await page.getByTestId("apply").click();
   await expect(page.getByText("status: done")).toBeVisible({ timeout: 30_000 });
   await expect(page.getByTestId("stale-scrim")).toHaveCount(0, { timeout: 30_000 });
+
+  // US2 extend-to-bounds: off by default; turning it on warns (a confirm dialog) then projects the
+  // surface to the domain box — a geometry edit that re-fits.
+  const extend = page.getByTestId("import-extend").locator("input[type=checkbox]");
+  await expect(extend).not.toBeChecked();
+  page.once("dialog", (d) => d.accept()); // accept the extrapolation warning
+  await extend.check();
+  await expect(extend).toBeChecked();
+  await page.getByTestId("apply").click();
+  await expect(page.getByText("status: done")).toBeVisible({ timeout: 30_000 });
+  await expect(page.getByTestId("stale-scrim")).toHaveCount(0, { timeout: 30_000 });
 });

@@ -42,6 +42,8 @@ export interface HierarchyPanelProps {
   onDeleteElement: (elementId: string) => void;
   /** Set an imported surface's role (feature 004). A geometry edit → re-fits on Apply. */
   onSetImportRole?: (elementId: string, role: "contact" | "erosion" | "veinWall" | "topography") => void;
+  /** Toggle projecting an imported surface to the domain bounds (feature 004 US2). */
+  onSetImportExtend?: (elementId: string, extend: boolean) => void;
   // unit ladder (US2/US3)
   /** Display name for a derived unit: the user's name if set, else "Unit {displayPos}" (the
    *  visual ladder position, 1 = top). The stored name is keyed by the stable `unitIndex`. */
@@ -203,6 +205,34 @@ function ElementNode(props: {
                 <option value="erosion">erosion</option>
                 <option value="topography">topography</option>
               </select>
+            )}
+            {el.kind === "importedSurface" && (
+              // Extend-to-bounds toggle (feature 004 US2): OFF by default (footprint-only, no
+              // extrapolation). Turning it on projects the surface to the domain box via co-kriging —
+              // warn, since extrapolating real (e.g. lidar) data beyond its footprint is often wrong.
+              <label
+                data-testid="import-extend"
+                title="Project this surface beyond its data footprint out to the domain box (co-kriged extrapolation). Off = use the mesh only where it has data."
+                style={{ fontSize: "0.8em", display: "inline-flex", alignItems: "center", gap: "0.25em" }}
+              >
+                <input
+                  type="checkbox"
+                  checked={el.extendToBounds}
+                  onChange={(e) => {
+                    if (
+                      e.target.checked &&
+                      !window.confirm(
+                        "Extend this imported surface beyond its data footprint, out to the domain bounds?\n\n" +
+                          "This EXTRAPOLATES the surface (co-kriging) into areas it has no data — often not physically meaningful for scanned/lidar data. Leave off to use the mesh only where it actually covers.",
+                      )
+                    ) {
+                      return; // cancelled — leave unchecked
+                    }
+                    p.onSetImportExtend?.(el.id, e.target.checked);
+                  }}
+                />
+                extend
+              </label>
             )}
             <span
               className={"validation-badge " + (validation?.ok ? "ok" : "warn")}

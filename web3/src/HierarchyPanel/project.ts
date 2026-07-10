@@ -119,6 +119,8 @@ export type ProjectElement =
       role: "contact" | "erosion" | "veinWall" | "topography";
       relation: "erode" | "onlap" | "conformable";
       objText: string; // the imported .obj file contents
+      /** Extend the surface smoothly to the domain box beyond its footprint (US2). Default false. */
+      extendToBounds: boolean;
     };
 
 export interface Project {
@@ -268,7 +270,11 @@ export function toSeriesJson(project: Project): SeriesJson[] {
         ori_xyz: [],
         ori_pole: [],
         ...NO_FAULT,
-        importedMesh: { role: el.role, bytes: new TextEncoder().encode(el.objText) },
+        importedMesh: {
+          role: el.role,
+          bytes: new TextEncoder().encode(el.objText),
+          extend: el.extendToBounds,
+        },
       };
     }
     // Cross-cutting bodies: relation/unboundedAbove are ignored by the core but emitted

@@ -36,6 +36,7 @@ import {
   addInterface,
   renameElement,
   setImportRole,
+  setImportExtend,
   deleteElement,
   reorderContainers,
   reorderWithin,
@@ -252,6 +253,8 @@ function App() {
   const onRenameElement = (elementId: string, name: string) => commit(renameElement(project, elementId, name));
   const onSetImportRole = (elementId: string, role: "contact" | "erosion" | "veinWall" | "topography") =>
     commit(setImportRole(project, elementId, role));
+  const onSetImportExtend = (elementId: string, extend: boolean) =>
+    commit(setImportExtend(project, elementId, extend));
   const onDeleteElement = (elementId: string) => commit(deleteElement(project, elementId));
 
   // --- reorder (US4) — wire the existing resolver output --------------------------------
@@ -373,6 +376,7 @@ function App() {
         role: "contact" as const,
         relation: "conformable" as const,
         objText,
+        extendToBounds: false, // footprint-only by default (no extrapolation)
       };
       commit({ ...project, elements: [el, ...project.elements] });
     } catch (err) {
@@ -566,6 +570,7 @@ function App() {
           onRenameElement={onRenameElement}
           onDeleteElement={onDeleteElement}
           onSetImportRole={onSetImportRole}
+          onSetImportExtend={onSetImportExtend}
           unitName={(elementId, unitIndex, displayPos) => unitNameOf(project, elementId, unitIndex, displayPos)}
           onRenameUnit={(elementId, unitIndex, name) => commitLithology(renameUnit(project, elementId, unitIndex, name))}
           catalog={catalogOf(project).lithologies}

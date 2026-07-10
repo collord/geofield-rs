@@ -304,6 +304,14 @@ export function setImportRole(
   );
 }
 
+/** Toggle whether an imported surface is projected to the domain bounds (feature 004 US2). Turning
+ *  it ON runs the co-kriged extrapolation beyond the data footprint — a geometry edit that re-fits. */
+export function setImportExtend(project: Project, elementId: string, extend: boolean): Project {
+  return mapElement(project, elementId, (el) =>
+    el.kind === "importedSurface" ? { ...el, extendToBounds: extend } : el,
+  );
+}
+
 // --- unit names (feature 003 §1) — units are DERIVED; only their display name is authored ---
 
 /** The `(element, unit)` coordinate key shared by unit names and lithology assignment. */

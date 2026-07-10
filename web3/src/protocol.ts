@@ -39,6 +39,9 @@ export interface SeriesJson {
     role: "contact" | "erosion" | "veinWall" | "topography";
     /** The Wavefront `.obj` file bytes (browser reads the file; engine parses). */
     bytes: Uint8Array;
+    /** Project the surface smoothly out to the domain box beyond its data footprint (US2). DEFAULT
+     *  `false`: footprint-only (no extrapolation — right for real lidar; needs no co-kriging). */
+    extend: boolean;
   };
 }
 

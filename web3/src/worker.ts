@@ -67,7 +67,15 @@ function buildStack(series: SeriesJson[]): WasmStack {
       // through the mesh; point/orientation arrays are unused. role 0=contact 1=erosion 2=veinWall
       // 3=topography. Arg order: bytes, role, relation, ...opts, decimate, ...faults.
       const roleCode = { contact: 0, erosion: 1, veinWall: 2, topography: 3 }[s.importedMesh.role];
-      stack.add_imported_surface(s.importedMesh.bytes, roleCode, s.relation, ...opts, NAN, ...faults);
+      stack.add_imported_surface(
+        s.importedMesh.bytes,
+        roleCode,
+        s.relation,
+        s.importedMesh.extend,
+        ...opts,
+        NAN,
+        ...faults,
+      );
     } else if (s.topography) {
       // Singleton ground surface (feature 003): pinned youngest by add_topography (insert-0),
       // caps the model to Air above. No relation/unbounded/crossCut. Emitted first by toSeriesJson.
