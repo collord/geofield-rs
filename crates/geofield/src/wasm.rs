@@ -901,6 +901,24 @@ impl WasmStack {
             .unwrap_or(0)
     }
 
+    /// CONTACT-mode surface for an IMPORTED element (feature 004): its raw triangles (the mesh IS the
+    /// surface — no contouring, exact + instant, at any world coordinate). Empty `WasmMesh` if element
+    /// `series` is not an imported surface. The solid-mode unit solids come from the recipe path.
+    pub fn imported_surface_contact(&self, series: usize) -> WasmMesh {
+        use crate::stack::StackElement;
+        match self.inner.series.get(series) {
+            Some(StackElement::ImportedSurface(im)) => im.mesh.to_mesh().into(),
+            _ => EMPTY_MESH(),
+        }
+    }
+
+    /// Whether element `series` is an imported surface (so the contact-mode worker routes it to
+    /// `imported_surface_contact` instead of the series-only interface mesher).
+    pub fn is_imported_surface(&self, series: usize) -> bool {
+        use crate::stack::StackElement;
+        matches!(self.inner.series.get(series), Some(StackElement::ImportedSurface(_)))
+    }
+
     /// The flattened global lithology label at a point, encoding `(series, unit)` as
     /// `series * 1000 + unit`. JS decodes with `Math.floor(v/1000)` and `v % 1000`.
     pub fn lithology_label(&self, x: f64, y: f64, z: f64) -> u32 {

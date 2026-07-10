@@ -26,6 +26,11 @@ test("importing an .obj adds a mesh surface that fits and renders", async ({ pag
   // The imported surface appears as an element in the hierarchy (named from the file).
   await expect(page.getByText("mesh-span-domain")).toBeVisible();
 
+  // GEOMETRY actually rendered (regression guard): Export OBJ is enabled only when surfaces.length>0,
+  // so an enabled Export OBJ means the imported contact meshed and is in the scene (the contact-mode
+  // path — previously broken: the imported surface only meshed in solid mode).
+  await expect(page.getByTestId("export-obj")).toBeEnabled();
+
   // US3 role parity: the imported surface exposes a role selector; switching it to erosion is a
   // geometry edit that re-fits and re-meshes (the clip changes) — status returns to done.
   const role = page.getByTestId("import-role");

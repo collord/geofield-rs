@@ -940,6 +940,25 @@ impl TriMesh {
         omega / (4.0 * std::f64::consts::PI)
     }
 
+    /// The raw imported geometry as a renderable open-sheet [`crate::mesh::Mesh`] (feature 004): the
+    /// CONTACT-mode surface for an imported element is just its triangles — no contouring needed (the
+    /// mesh IS the surface). Normals are left empty; the viewer computes them.
+    pub fn to_mesh(&self) -> crate::mesh::Mesh {
+        let mut positions = Vec::with_capacity(self.vertices.len() * 3);
+        for v in &self.vertices {
+            positions.push(v[0] as f32);
+            positions.push(v[1] as f32);
+            positions.push(v[2] as f32);
+        }
+        let mut indices = Vec::with_capacity(self.triangles.len() * 3);
+        for t in &self.triangles {
+            indices.push(t[0] as u32);
+            indices.push(t[1] as u32);
+            indices.push(t[2] as u32);
+        }
+        crate::mesh::Mesh { positions, normals: Vec::new(), indices }
+    }
+
     /// Axis-aligned bounds `(min, max)` of the mesh vertices (feature 004: the coverage box that
     /// separates the exact interior from the smooth projection). `None` for an empty mesh.
     pub fn bounds(&self) -> Option<([f64; 3], [f64; 3])> {

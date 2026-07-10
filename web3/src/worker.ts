@@ -137,6 +137,16 @@ function collectSurfaces(
       }
       continue;
     }
+    // An IMPORTED surface (feature 004): the contact sheet IS its triangles — return them directly
+    // (no contouring; exact + instant at any world coordinate). Series-only interface meshing can't
+    // handle it (it's not a fitted Series). Solid mode composes unit solids via the recipe path.
+    if (series[si]?.importedMesh != null) {
+      const m = stack.imported_surface_contact(si);
+      if (m.triangle_count > 0) {
+        out.push({ series: si, block: 0, interface: 0, positions: m.positions(), normals: m.normals(), indices: m.indices() });
+      }
+      continue;
+    }
     // Topography, OR a cross-cut body with weld OFF (the escape hatch): mesh own surfaces as open
     // sheets, one per interface, the original independent way.
     const isSheetElement = series[si]?.crossCut != null || series[si]?.topography === true;
