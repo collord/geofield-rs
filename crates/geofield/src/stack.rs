@@ -666,6 +666,29 @@ impl<M: SeriesModel> Stack<M> {
                         }
                     }
                 }
+                // A younger IMPORTED surface clips older elements per its ROLE (feature 004 US3),
+                // reusing the SAME masker geometry as the fitted equivalents:
+                //   * Erosion   → older survives ABOVE the imported surface (`field > iso`), like a
+                //                 younger erode series (gated by `include_erode`).
+                //   * Topography→ older survives BELOW it (`field < iso`) — the model caps to Air
+                //                 above, like the fitted topography.
+                //   * Contact (conformable) contributes NO clip; a VeinWall role is a documented
+                //                 seam (a single imported sheet is not a band).
+                StackElement::ImportedSurface(im) => match im.role {
+                    ImportRole::Erosion => {
+                        if include_erode {
+                            if let Some(iso) = im.iso() {
+                                out.push(Masker::Halfspace { field: im.model.field(), iso, below: false });
+                            }
+                        }
+                    }
+                    ImportRole::Topography => {
+                        if let Some(iso) = im.iso() {
+                            out.push(Masker::Halfspace { field: im.model.field(), iso, below: true });
+                        }
+                    }
+                    ImportRole::Contact | ImportRole::VeinWall => {}
+                },
                 _ => {}
             }
         }
