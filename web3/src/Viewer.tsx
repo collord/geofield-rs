@@ -3,7 +3,7 @@
 // data's bounding box. Adapted/simplified from web/src/Viewer.tsx. Colour is by series index
 // in contact mode, or by lithology (from the catalog) in solid mode — see `colorBy` (feature 003).
 
-import { useEffect, useRef } from "react";
+import { useEffect, useMemo, useRef } from "react";
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import type { SurfacePayload } from "./protocol";
@@ -42,35 +42,79 @@ function makeLabel(text: string, color: number, pos: [number, number, number]): 
   return sprite;
 }
 
-/** Build the labeled X/Y/Z axes spanning the data bounding box (lines from the box origin
- *  corner along each edge + a billboard letter just past each axis end). */
-function buildAxes(extent: Extent): THREE.Group {
-  const [x0, x1, y0, y1, z0, z1] = extent;
+/** Axis-aligned bounds (min,max) over ALL surface positions — the DATA extent, which for imported
+ *  world-coordinate (e.g. UTM) meshes is nowhere near the origin/model-box. `null` if no data. */
+function dataBounds(surfaces: SurfacePayload[]): { min: [number, number, number]; max: [number, number, number] } | null {
+  let has = false;
+  const min: [number, number, number] = [Infinity, Infinity, Infinity];
+  const max: [number, number, number] = [-Infinity, -Infinity, -Infinity];
+  for (const s of surfaces) {
+    const p = s.positions;
+    for (let i = 0; i + 2 < p.length; i += 3) {
+      has = true;
+      for (let k = 0; k < 3; k++) {
+        const v = p[i + k];
+        if (v < min[k]) min[k] = v;
+        if (v > max[k]) max[k] = v;
+      }
+    }
+  }
+  return has ? { min, max } : null;
+}
+
+/** Point the camera at the centre of a box from ABOVE-SOUTH-EAST (X=East, Y=North, Z=Up), at a
+ *  distance that fits the whole box in view. The industry-standard default geological view; works at
+ *  any world coordinate (frames the DATA, not the origin). */
+function frameAboveSE(
+  camera: THREE.PerspectiveCamera,
+  controls: OrbitControls,
+  min: [number, number, number],
+  max: [number, number, number],
+) {
+  const c = new THREE.Vector3((min[0] + max[0]) / 2, (min[1] + max[1]) / 2, (min[2] + max[2]) / 2);
+  const r = 0.5 * Math.hypot(max[0] - min[0], max[1] - min[1], max[2] - min[2]) || 1;
+  const fovV = (camera.fov * Math.PI) / 180;
+  const fovH = 2 * Math.atan(Math.tan(fovV / 2) * camera.aspect);
+  const fov = Math.min(fovV, fovH);
+  const dist = (r / Math.sin(fov / 2)) * 1.15; // 15% margin so nothing clips the frame
+  // above-south-east direction: +East(+X), −North(−Y = south), +Up(+Z), normalized.
+  const dir = new THREE.Vector3(1, -1, 1).normalize();
+  const damp = controls.enableDamping;
+  controls.enableDamping = false;
+  controls.update();
+  camera.up.set(0, 0, 1); // Z is up (geological convention), so orbit + framing stay upright
+  camera.position.copy(c).addScaledVector(dir, dist);
+  // Keep near/far sensible for the data scale so world-coordinate meshes don't clip.
+  camera.near = Math.max(dist * 1e-3, 0.01);
+  camera.far = dist * 100;
+  camera.updateProjectionMatrix();
+  controls.target.copy(c);
+  controls.update();
+  controls.enableDamping = damp;
+}
+
+/** A small direction-only axes gnomon (X/Y/Z), placed at a reasonable OFFSET below the data box's
+ *  min corner — for orientation, not scale (the bounds box conveys scale). Sized to a fraction of the
+ *  data extent so it reads at any world scale. */
+function buildGnomon(min: [number, number, number], max: [number, number, number]): THREE.Group {
+  const span = Math.max(max[0] - min[0], max[1] - min[1], max[2] - min[2]) || 1;
+  const len = span * 0.15;
+  const off = span * 0.08;
+  const o: [number, number, number] = [min[0] - off, min[1] - off, min[2] - off]; // just outside the box
   const g = new THREE.Group();
-  const pad = 0.08 * Math.max(x1 - x0, y1 - y0, z1 - z0); // label offset past the box
-
-  const axis = (from: [number, number, number], to: [number, number, number], color: number) => {
-    const geom = new THREE.BufferGeometry().setFromPoints([
-      new THREE.Vector3(...from),
-      new THREE.Vector3(...to),
-    ]);
-    g.add(new THREE.Line(geom, new THREE.LineBasicMaterial({ color })));
+  const axis = (d: [number, number, number], color: number, letter: string) => {
+    const end: [number, number, number] = [o[0] + d[0] * len, o[1] + d[1] * len, o[2] + d[2] * len];
+    g.add(new THREE.Line(
+      new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(...o), new THREE.Vector3(...end)]),
+      new THREE.LineBasicMaterial({ color }),
+    ));
+    const label = makeLabel(letter, color, [o[0] + d[0] * len * 1.2, o[1] + d[1] * len * 1.2, o[2] + d[2] * len * 1.2]);
+    label.scale.setScalar(len * 0.4);
+    g.add(label);
   };
-
-  // Axes run along the box edges meeting at the (x0,y0,z0) corner.
-  axis([x0, y0, z0], [x1, y0, z0], AXIS_COLOR.x);
-  axis([x0, y0, z0], [x0, y1, z0], AXIS_COLOR.y);
-  axis([x0, y0, z0], [x0, y0, z1], AXIS_COLOR.z);
-
-  g.add(makeLabel("X", AXIS_COLOR.x, [x1 + pad, y0, z0]));
-  g.add(makeLabel("Y", AXIS_COLOR.y, [x0, y1 + pad, z0]));
-  g.add(makeLabel("Z", AXIS_COLOR.z, [x0, y0, z1 + pad]));
-
-  // Scale the billboard letters to a readable fraction of the domain.
-  const labelSize = 0.06 * Math.max(x1 - x0, y1 - y0, z1 - z0);
-  g.children.forEach((c) => {
-    if (c instanceof THREE.Sprite) c.scale.setScalar(labelSize);
-  });
+  axis([1, 0, 0], AXIS_COLOR.x, "X"); // East
+  axis([0, 1, 0], AXIS_COLOR.y, "Y"); // North
+  axis([0, 0, 1], AXIS_COLOR.z, "Z"); // Up
   return g;
 }
 
@@ -130,6 +174,8 @@ export function Viewer(props: {
    *  Viewer calls `onBoundsXY(x0,x1,y0,y1)` with the drawn rectangle (model coords) and exits. */
   drawBounds?: { nonce: number };
   onBoundsXY?: (x0: number, x1: number, y0: number, y1: number) => void;
+  /** Bump to reframe the camera on the current data (above-SE, fit) — a "Fit view" button. */
+  fitNonce?: number;
 }) {
   const mountRef = useRef<HTMLDivElement | null>(null);
   const stateRef = useRef<{
@@ -141,6 +187,7 @@ export function Viewer(props: {
     axes: THREE.Group | null;
     boundsBox: THREE.LineSegments | null;
     rubber: THREE.LineLoop | null; // live rectangle during digitization
+    framedKey: string | null; // the data-bounds key we last auto-framed (frame only on NEW data)
   } | null>(null);
 
   // One-time three.js setup.
@@ -154,6 +201,7 @@ export function Viewer(props: {
     const scene = new THREE.Scene();
     scene.background = new THREE.Color(0xf0f2f5);
     const camera = new THREE.PerspectiveCamera(50, mount.clientWidth / mount.clientHeight, 1, 1e5);
+    camera.up.set(0, 0, 1); // Z is up (X=East, Y=North, Z=Up) — geological convention
     camera.position.set(1600, 1600, 1600);
     scene.add(new THREE.AmbientLight(0xffffff, 0.7));
     const dir = new THREE.DirectionalLight(0xffffff, 0.6);
@@ -169,7 +217,7 @@ export function Viewer(props: {
     controls.target.set(500, 500, 500);
     controls.update();
 
-    stateRef.current = { renderer, scene, camera, controls, group, axes: null, boundsBox: null, rubber: null };
+    stateRef.current = { renderer, scene, camera, controls, group, axes: null, boundsBox: null, rubber: null, framedKey: null };
     if (props.viewApiRef) {
       props.viewApiRef.current = {
         getView: () => ({
@@ -195,8 +243,12 @@ export function Viewer(props: {
     };
   }, []);
 
-  // Rebuild the labeled axes whenever the data extent changes, and center the orbit target
-  // on the box so rotation pivots around the data.
+  // The DATA extent (bounding box of the rendered surfaces) — the thing to frame + orient to. For
+  // imported world-coordinate meshes this is nowhere near the origin/model-box.
+  const dataBox = useMemo(() => dataBounds(props.surfaces), [props.surfaces]);
+
+  // The direction-only axes gnomon, placed just outside the data box (fallback: the model extent for
+  // a blank project). Rebuilt when the box changes.
   useEffect(() => {
     const st = stateRef.current;
     if (!st) return;
@@ -204,14 +256,35 @@ export function Viewer(props: {
       st.scene.remove(st.axes);
       st.axes = null;
     }
-    const axes = buildAxes(props.extent);
-    st.scene.add(axes);
-    st.axes = axes;
+    const [ex0, ex1, ey0, ey1, ez0, ez1] = props.extent;
+    const min = dataBox ? dataBox.min : ([ex0, ey0, ez0] as [number, number, number]);
+    const max = dataBox ? dataBox.max : ([ex1, ey1, ez1] as [number, number, number]);
+    const gnomon = buildGnomon(min, max);
+    st.scene.add(gnomon);
+    st.axes = gnomon;
+  }, [dataBox, props.extent]);
 
-    const [x0, x1, y0, y1, z0, z1] = props.extent;
-    st.controls.target.set((x0 + x1) / 2, (y0 + y1) / 2, (z0 + z1) / 2);
-    st.controls.update();
-  }, [props.extent]);
+  // Auto-frame the camera on NEW data (above-south-east, fit-to-extent). Keyed on the data box, so a
+  // re-mesh of the SAME data (same box) does NOT reframe — it never fights the user's orbit. Runs
+  // BEFORE the importedView effect, so a saved-view project-import overrides it. Also drives `fitNonce`.
+  useEffect(() => {
+    const st = stateRef.current;
+    if (!st || !dataBox) return;
+    const key = dataBox.min.join(",") + "|" + dataBox.max.join(",");
+    if (st.framedKey === key) return; // same data already framed — leave the user's orbit alone
+    st.framedKey = key;
+    frameAboveSE(st.camera, st.controls, dataBox.min, dataBox.max);
+  }, [dataBox]);
+
+  // "Fit view" on demand: reframe above-SE on the current data (or the model extent if no data).
+  useEffect(() => {
+    const st = stateRef.current;
+    if (!st || !props.fitNonce) return;
+    const [ex0, ex1, ey0, ey1, ez0, ez1] = props.extent;
+    const min = dataBox ? dataBox.min : ([ex0, ey0, ez0] as [number, number, number]);
+    const max = dataBox ? dataBox.max : ([ex1, ey1, ez1] as [number, number, number]);
+    frameAboveSE(st.camera, st.controls, min, max);
+  }, [props.fitNonce]);
 
   // The model-bounds wireframe box — rebuilt on extent change, shown/hidden by `showBounds`.
   useEffect(() => {

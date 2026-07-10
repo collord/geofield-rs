@@ -126,6 +126,7 @@ function App() {
   // `drawNonce` bumps to (re)enter top-down 2-point digitization; `pendingBounds` holds the drawn
   // XY rectangle while the user completes the prism with minZ/maxZ.
   const [showBounds, setShowBounds] = useState(false);
+  const [fitNonce, setFitNonce] = useState(0);
   const [drawNonce, setDrawNonce] = useState(0);
   const [pendingBounds, setPendingBounds] = useState<{ x0: number; x1: number; y0: number; y1: number } | null>(null);
   const drawBounds = useMemo(() => (drawNonce ? { nonce: drawNonce } : undefined), [drawNonce]);
@@ -556,6 +557,14 @@ function App() {
             </label>
             <button
               type="button"
+              data-testid="fit-view"
+              title="Frame the camera on the data (above-south-east, fit to extent)."
+              onClick={() => setFitNonce((n) => n + 1)}
+            >
+              Fit view
+            </button>
+            <button
+              type="button"
               data-testid="draw-bounds"
               title="Draw the model bounds: top-down view, click two corners of the rectangle, then set the Z range."
               onClick={() => setDrawNonce((n) => n + 1)}
@@ -716,6 +725,7 @@ function App() {
           showBounds={showBounds}
           drawBounds={drawBounds}
           onBoundsXY={onBoundsXY}
+          fitNonce={fitNonce}
         />
         {pendingBounds && (
           <ZRangeForm
