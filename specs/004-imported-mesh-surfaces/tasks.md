@@ -98,15 +98,15 @@ description: "Task list for Imported Mesh Surfaces"
 
 ### Tests for User Story 3
 
-- [ ] T022 [P] [US3] Native per-role invariant tests `crates/geofield/tests/imported_mesh_roles.rs`: erosion truncates older units (INV-6); veinWall bounds a body; topography caps to Air above / rock below — each mirroring the fitted-equivalent invariant
-- [ ] T023 [P] [US3] Playwright `web3/e2e/imported-mesh.spec.ts` (extend): assign the imported surface as erosion → older units truncate; as topography → Air cap; save then reload → the surface + role persist (FR-012)
+- [X] T022 [P] [US3] Native per-role invariant tests `crates/geofield/tests/imported_mesh_roles.rs`: erosion truncates older units (INV-6); veinWall bounds a body; topography caps to Air above / rock below — each mirroring the fitted-equivalent invariant
+- [X] T023 [P] [US3] Playwright `web3/e2e/imported-mesh.spec.ts` (extend): assign the imported surface as erosion → older units truncate; as topography → Air cap; save then reload → the surface + role persist (FR-012)
 
 ### Implementation for User Story 3
 
-- [ ] T024 [US3] Erosion role in `crates/geofield/src/stack.rs`: the imported surface participates in `clip_maskers` as a younger erode exactly as a fitted erosion does (reuse; no new masker) — respects the `erode ⇒ deposit-above` convention
+- [X] T024 [US3] Erosion role in `crates/geofield/src/stack.rs`: the imported surface participates in `clip_maskers` as a younger erode exactly as a fitted erosion does (reuse; no new masker) — respects the `erode ⇒ deposit-above` convention
 - [ ] T025 [US3] Vein/intrusion wall role in `crates/geofield/src/stack.rs`: the imported surface serves as a band wall via the existing `band_solid` / vein path
-- [ ] T026 [US3] Topography role in `crates/geofield/src/stack.rs`: the imported surface serves as the ground cap (Air above / rock below) via the existing topography machinery
-- [ ] T027 [US3] Units / lithology / OBJ-export parity: confirm the imported surface's derived units flow through `DerivedView.units` (with the elevation-ordering already in place), lithology assignment, and solid-mode OBJ-by-lithology grouping identically to a fitted surface — extend the UI role/relation controls in `web3/src/HierarchyPanel/` to cover the imported element
+- [X] T026 [US3] Topography role in `crates/geofield/src/stack.rs`: the imported surface serves as the ground cap (Air above / rock below) via the existing topography machinery
+- [X] T027 [US3] Units / lithology / OBJ-export parity: confirm the imported surface's derived units flow through `DerivedView.units` (with the elevation-ordering already in place), lithology assignment, and solid-mode OBJ-by-lithology grouping identically to a fitted surface — extend the UI role/relation controls in `web3/src/HierarchyPanel/` to cover the imported element
 
 **Checkpoint**: an imported mesh is a drop-in for any fitted surface. Full parity.
 

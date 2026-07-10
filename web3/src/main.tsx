@@ -35,6 +35,7 @@ import {
   deleteInterface,
   addInterface,
   renameElement,
+  setImportRole,
   deleteElement,
   reorderContainers,
   reorderWithin,
@@ -249,6 +250,8 @@ function App() {
     commit(deleteInterface(project, elementId, interfaceId));
   const onAddInterface = (elementId: string) => commit(addInterface(project, elementId));
   const onRenameElement = (elementId: string, name: string) => commit(renameElement(project, elementId, name));
+  const onSetImportRole = (elementId: string, role: "contact" | "erosion" | "veinWall" | "topography") =>
+    commit(setImportRole(project, elementId, role));
   const onDeleteElement = (elementId: string) => commit(deleteElement(project, elementId));
 
   // --- reorder (US4) — wire the existing resolver output --------------------------------
@@ -562,6 +565,7 @@ function App() {
           onAddInterface={onAddInterface}
           onRenameElement={onRenameElement}
           onDeleteElement={onDeleteElement}
+          onSetImportRole={onSetImportRole}
           unitName={(elementId, unitIndex, displayPos) => unitNameOf(project, elementId, unitIndex, displayPos)}
           onRenameUnit={(elementId, unitIndex, name) => commitLithology(renameUnit(project, elementId, unitIndex, name))}
           catalog={catalogOf(project).lithologies}

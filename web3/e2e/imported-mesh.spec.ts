@@ -25,4 +25,14 @@ test("importing an .obj adds a mesh surface that fits and renders", async ({ pag
 
   // The imported surface appears as an element in the hierarchy (named from the file).
   await expect(page.getByText("mesh-span-domain")).toBeVisible();
+
+  // US3 role parity: the imported surface exposes a role selector; switching it to erosion is a
+  // geometry edit that re-fits and re-meshes (the clip changes) — status returns to done.
+  const role = page.getByTestId("import-role");
+  await expect(role).toBeVisible();
+  await role.selectOption("erosion");
+  await expect(page.getByTestId("apply")).toBeVisible();
+  await page.getByTestId("apply").click();
+  await expect(page.getByText("status: done")).toBeVisible({ timeout: 30_000 });
+  await expect(page.getByTestId("stale-scrim")).toHaveCount(0, { timeout: 30_000 });
 });

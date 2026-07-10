@@ -292,6 +292,18 @@ export function renameElement(project: Project, elementId: string, name: string)
   return mapElement(project, elementId, (el) => ({ ...el, name }));
 }
 
+/** Set the role of an IMPORTED surface (feature 004): contact/erosion/veinWall/topography. A
+ *  geometry-affecting edit (the role changes how it clips) — the caller commits + re-fits. */
+export function setImportRole(
+  project: Project,
+  elementId: string,
+  role: "contact" | "erosion" | "veinWall" | "topography",
+): Project {
+  return mapElement(project, elementId, (el) =>
+    el.kind === "importedSurface" ? { ...el, role } : el,
+  );
+}
+
 // --- unit names (feature 003 §1) — units are DERIVED; only their display name is authored ---
 
 /** The `(element, unit)` coordinate key shared by unit names and lithology assignment. */

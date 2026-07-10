@@ -40,6 +40,8 @@ export interface HierarchyPanelProps {
   onAddInterface: (elementId: string) => void;
   onRenameElement: (elementId: string, name: string) => void;
   onDeleteElement: (elementId: string) => void;
+  /** Set an imported surface's role (feature 004). A geometry edit → re-fits on Apply. */
+  onSetImportRole?: (elementId: string, role: "contact" | "erosion" | "veinWall" | "topography") => void;
   // unit ladder (US2/US3)
   /** Display name for a derived unit: the user's name if set, else "Unit {displayPos}" (the
    *  visual ladder position, 1 = top). The stored name is keyed by the stable `unitIndex`. */
@@ -183,6 +185,25 @@ function ElementNode(props: {
             {reorder}
             <span className="kind-icon" data-kind={el.kind} />
             <span className="container-name">{el.name}</span>
+            {el.kind === "importedSurface" && (
+              // Role selector for an imported surface (feature 004): contact / erosion / topography.
+              // Changing it re-clips older elements; a geometry edit that re-fits on Apply.
+              <select
+                data-testid="import-role"
+                value={el.role}
+                onChange={(e) =>
+                  p.onSetImportRole?.(
+                    el.id,
+                    e.target.value as "contact" | "erosion" | "veinWall" | "topography",
+                  )
+                }
+                aria-label="imported surface role"
+              >
+                <option value="contact">contact</option>
+                <option value="erosion">erosion</option>
+                <option value="topography">topography</option>
+              </select>
+            )}
             <span
               className={"validation-badge " + (validation?.ok ? "ok" : "warn")}
               title={validation?.ok ? "well constrained" : validation?.detail ?? ""}
