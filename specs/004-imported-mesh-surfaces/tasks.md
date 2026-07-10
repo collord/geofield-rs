@@ -116,11 +116,11 @@ description: "Task list for Imported Mesh Surfaces"
 
 **Purpose**: the Constitution gates this feature touches + calibration.
 
-- [ ] T028 [P] Re-verify native↔wasm `f64` parity for the imported-surface paths (parser, patch-stitch, fit-marshalling) — pinned natively + asserted as a design invariant + the Playwright cross-target run (INV-7, SC-007; Principle I/V)
-- [ ] T029 [P] Confirm the EUPL/BSD + wasm seam is intact: the OBJ parser is BSD in `geofield` with no `std::fs`; the kernel is still absent from `geofield.wasm`; no native-only dep entered a wasm-reachable path (Principle V)
+- [X] T028 [P] Re-verify native↔wasm `f64` parity for the imported-surface paths (parser, patch-stitch, fit-marshalling) — pinned natively + asserted as a design invariant + the Playwright cross-target run (INV-7, SC-007; Principle I/V)
+- [X] T029 [P] Confirm the EUPL/BSD + wasm seam is intact: the OBJ parser is BSD in `geofield` with no `std::fs`; the kernel is still absent from `geofield.wasm`; no native-only dep entered a wasm-reachable path (Principle V)
 - [ ] T030 [P] Extend invariant tests to pin failure modes of the new path: absence of a spurious phantom sheet in the transition band, and seam watertightness under a non-convex import (Principle I)
-- [ ] T031 [P] Update status claims to what landed: `docs/07_imported_mesh_field_proxy.md`, this spec/plan, and any README Scope — log the coverage bounds (coarse far-field FR-006, AABB-not-tight coverage, `.obj`-only, no repair, no coordinate transform) where a reader sees them (Principle IV)
-- [ ] T032 Calibrate tolerances as PINNED NUMBERS (not vague) from the T003 spike: INV-3 in-coverage deviation, INV-4 seam crease angle, the decimation `point_budget`, and the working octree depth — recorded in the tests (Principle I/IV)
+- [X] T031 [P] Update status claims to what landed: `docs/07_imported_mesh_field_proxy.md`, this spec/plan, and any README Scope — log the coverage bounds (coarse far-field FR-006, AABB-not-tight coverage, `.obj`-only, no repair, no coordinate transform) where a reader sees them (Principle IV)
+- [X] T032 Calibrate tolerances as PINNED NUMBERS (not vague) from the T003 spike: INV-3 in-coverage deviation, INV-4 seam crease angle, the decimation `point_budget`, and the working octree depth — recorded in the tests (Principle I/IV)
 
 ---
 
