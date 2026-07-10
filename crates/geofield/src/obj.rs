@@ -234,6 +234,59 @@ pub fn parse_obj(bytes: &[u8]) -> Result<ObjMesh, ObjError> {
     Ok(ObjMesh { vertices: welded, triangles, normals })
 }
 
+/// The result of preparing a parsed [`ObjMesh`] for meshing (feature 004 FR-008/FR-011): winding
+/// normalized per connected component, plus a HEALTH report of what the import is (not a repair).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MeshHealth {
+    /// Edges used by exactly ONE triangle — a boundary/hole rim. An open sheet (e.g. a bed) has a
+    /// boundary loop and this is expected & fine; a solid that should be closed will show its holes.
+    pub boundary_edges: usize,
+    /// Edges shared by MORE than two triangles — non-manifold. These make a closed solid ill-defined;
+    /// reported (not repaired) so the caller can warn.
+    pub non_manifold_edges: usize,
+}
+
+impl MeshHealth {
+    /// A closed, manifold surface has no boundary and no non-manifold edges.
+    pub fn is_closed_manifold(&self) -> bool {
+        self.boundary_edges == 0 && self.non_manifold_edges == 0
+    }
+}
+
+/// Winding-normalize the parsed geometry per connected component (reusing the engine's
+/// [`crate::mesh::normalize_winding_per_component`] — the same routine `ClipMesh::winding_normalized`
+/// uses), and compute its [`MeshHealth`]. Returns the cleaned `(vertices, triangles)` ready to build
+/// a `TriMesh`, or [`ObjError::NoTriangles`] if nothing meshable survives. This is the ingress
+/// hygiene step (FR-008 normalize, FR-011 detect-and-report) — it never repairs holes/non-manifold.
+pub fn normalize_and_check(mesh: &ObjMesh) -> Result<(Vec<[f64; 3]>, Vec<[usize; 3]>, MeshHealth), ObjError> {
+    let tris_u32: Vec<[u32; 3]> = mesh
+        .triangles
+        .iter()
+        .map(|t| [t[0] as u32, t[1] as u32, t[2] as u32])
+        .collect();
+    let (verts, tris) = crate::mesh::normalize_winding_per_component(&mesh.vertices, &tris_u32);
+    if tris.is_empty() {
+        return Err(ObjError::NoTriangles);
+    }
+    // Edge incidence: an undirected edge (min,max) counted across all triangles.
+    let mut inc: std::collections::HashMap<(u32, u32), u32> = std::collections::HashMap::new();
+    for t in &tris {
+        for &(a, b) in &[(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+            let e = if a < b { (a, b) } else { (b, a) };
+            *inc.entry(e).or_insert(0) += 1;
+        }
+    }
+    let health = MeshHealth {
+        boundary_edges: inc.values().filter(|&&c| c == 1).count(),
+        non_manifold_edges: inc.values().filter(|&&c| c > 2).count(),
+    };
+    let tris_usize: Vec<[usize; 3]> = tris
+        .into_iter()
+        .map(|t| [t[0] as usize, t[1] as usize, t[2] as usize])
+        .collect();
+    Ok((verts, tris_usize, health))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -297,6 +350,28 @@ mod tests {
     fn rejects_empty_and_non_utf8() {
         assert_eq!(parse_obj(b""), Err(ObjError::NoVertices));
         assert_eq!(parse_obj(&[0xff, 0xfe, 0x00]), Err(ObjError::NotUtf8));
+    }
+
+    #[test]
+    fn normalize_fixes_inconsistent_winding() {
+        // The bad-winding fixture has one triangle wound backwards; normalization makes the
+        // component consistently wound so the two triangles agree (their shared edge is used once
+        // in each direction → the sheet has a single boundary loop, no non-manifold edge).
+        let obj = parse_obj(BAD_WIND).expect("valid geometry");
+        let (_v, tris, health) = normalize_and_check(&obj).expect("meshable");
+        assert_eq!(tris.len(), 2);
+        assert_eq!(health.non_manifold_edges, 0, "consistent winding ⇒ no non-manifold edge");
+        // An open quad (two tris) has 4 boundary edges (the rim) and 1 shared interior edge.
+        assert_eq!(health.boundary_edges, 4, "open bed sheet has a boundary rim");
+    }
+
+    #[test]
+    fn normalize_reports_closed_manifold() {
+        // A closed tetrahedron: 4 triangles, every edge shared by exactly 2 → closed + manifold.
+        let src = b"v 0 0 0\nv 1 0 0\nv 0 1 0\nv 0 0 1\nf 1 3 2\nf 1 2 4\nf 1 4 3\nf 2 3 4\n";
+        let obj = parse_obj(src).expect("valid");
+        let (_v, _t, health) = normalize_and_check(&obj).expect("meshable");
+        assert!(health.is_closed_manifold(), "tetrahedron is closed + manifold: {health:?}");
     }
 
     #[test]
