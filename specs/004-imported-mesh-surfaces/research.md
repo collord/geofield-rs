@@ -60,7 +60,15 @@ All Technical-Context unknowns resolved against the current codebase. Citations 
 - Contouring the **kriged field** gives a watertight solid whose dividing surface equals the mesh **only where the kriged fit reproduces the mesh** — exact for a PLANAR imported bed (kriging is exact through coplanar constraints), but only *approximate between vertices* for a CURVED/dense mesh. So "kriged contour" satisfies INV-3 (exact-inside) for planar imports and within-tolerance for gently-curved ones, but NOT bit-exact for arbitrary meshes.
 - **True** exact-inside for an arbitrary curved mesh needs the mesh triangles used *directly* as the contact face (not a contour), closed into a solid using the kriged sign — a mesh-direct "close an open sheet into a half-space solid" operation that does not exist yet. This is a bounded seam (Principle IV), NOT simple reuse of `below_solid`.
 
-**Decision needed (user):** for v1, is "exact for planar / within-tolerance for curved, via the kriged contour" acceptable for US1 (reuse-maximal, ships now), with mesh-direct exactness for curved meshes as a documented refinement seam? Or must US1 deliver mesh-direct exactness for arbitrary curved imports up front (a larger geometry task)? This gates how US1's mesher (T011) is built.
+**RESOLVED (mesh-direct spike, 2026-07-09) — mesh-direct exactness is cheap; use it.** The user chose "spike the mesh-direct op first." The spike (`imported_mesh_spike.rs::mesh_direct_exact_patch_is_watertight_and_on_the_mesh`) proves a tiny `MeshSignedField` ScalarField wrapper does it:
+
+```
+scalar_field(p) = sign(kriged(p) - iso) * mesh.surface_distance(p)   // ±clamped distance to the triangles
+```
+
+Its zero-set is the mesh triangles **exactly** (distance 0), with a well-defined sign from the kriged field (which half is "below the contact") — solving the open-sheet no-sign problem. Contoured with the EXISTING `octree_dual_contour_scene` (cap:true) clipped to the AABB box, the result is: `contact_verts=315` on the mesh, **`max_dz=0.728`** (within one octree cell → exact to resolution, INV-3), **`open_edges=0 nonmanifold=0`** (watertight, INV-1/2). ~15 lines, no new corefiner, and it is **exact for ANY mesh** (curved included — the magnitude is the true triangle distance, so the contour follows the triangles at octree resolution), NOT just planar.
+
+**Decision:** US1's exact-patch mesher (T011) uses `MeshSignedField` + `octree_dual_contour_scene`. The kriged fit supplies only the SIGN (and, in US2, the smooth far-field beyond the bounds). The "kriged-approximation-for-curved" fallback is unnecessary and dropped. This is the reuse-maximal AND fully-exact path.
 
 ---
 
