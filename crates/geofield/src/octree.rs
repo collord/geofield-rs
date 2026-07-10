@@ -909,6 +909,44 @@ impl ScalarField for MeshSdf {
     }
 }
 
+/// The EXACT-PATCH field for an IMPORTED OPEN sheet (feature 004): a signed distance whose zero set
+/// is the mesh triangles EXACTLY, with the sign taken from a separate `sign` field (the co-kriged fit
+/// through the mesh) rather than the mesh's own winding number — which is undefined for an open sheet.
+///
+/// `value(p) = sign(sign_field(p) − iso) · dist_to_mesh(p)` : zero ON the mesh (distance 0), negative
+/// on the `sign_field < iso` half ("below the contact"), positive on the other. Contouring
+/// `{value < 0}` with the octree reproduces the imported triangles at cell resolution — for ANY mesh
+/// (curved included), since the magnitude is the true clamped distance to the triangles. This closes
+/// an open imported sheet into a watertight half-space solid using the EXISTING contourer; no
+/// corefiner, no invented far field (the caller clips to the mesh's bounds). Spike-validated:
+/// `imported_mesh_spike::mesh_direct_exact_patch_is_watertight_and_on_the_mesh`.
+pub struct MeshSignedField<'a> {
+    mesh: &'a TriMesh,
+    sign: &'a dyn ScalarField,
+    iso: f64,
+}
+
+impl<'a> MeshSignedField<'a> {
+    pub fn new(mesh: &'a TriMesh, sign: &'a dyn ScalarField, iso: f64) -> Self {
+        Self { mesh, sign, iso }
+    }
+}
+
+impl ScalarField for MeshSignedField<'_> {
+    fn scalar_field(&self, p: [f64; 3]) -> f64 {
+        let d = self.mesh.surface_distance(p).unwrap_or(0.0); // ±clamped nearest-triangle distance ≥ 0
+        let s = if self.sign.scalar_field(p) < self.iso { -1.0 } else { 1.0 };
+        s * d
+    }
+    fn scalar_field_gradient(&self, p: [f64; 3]) -> [f64; 3] {
+        // The vertex lies on the mesh, so the nearest facet's outward normal (oriented by the sign
+        // field) is the surface gradient — the same choice `MeshSdf` makes on-surface.
+        let n = self.mesh.surface_normal(p).unwrap_or([0.0, 0.0, 1.0]);
+        let s = if self.sign.scalar_field(p) < self.iso { -1.0 } else { 1.0 };
+        [s * n[0], s * n[1], s * n[2]]
+    }
+}
+
 // Small vector helpers for the TriMesh boundary (kept local — the rest of the
 // contourer works in raw [f64; 3] and doesn't need a vec type).
 fn sub(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {

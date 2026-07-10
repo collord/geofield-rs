@@ -81,7 +81,7 @@ use crate::mesh::Mesh;
 use crate::mesh_clip::{clip, ClipMesh, Keep};
 use crate::octree::{
     octree_dual_contour_scene, octree_dual_contour_shared, AxisBox, Boundary, ContactHalfSpace,
-    OctreeConfig, PlaneHalfSpace, Scene, SlabComplement,
+    MeshSignedField, OctreeConfig, PlaneHalfSpace, Scene, SlabComplement, TriMesh,
 };
 use crate::{clip_mesh_to_half_spaces, max_abs_field_in_box, BlockModel, ScalarField, SeriesModel};
 
@@ -324,6 +324,12 @@ pub enum StackElement<M> {
     Series(StackedSeries<M>),
     Vein(Vein<M>),
     Intrusion(Intrusion<M>),
+    /// An IMPORTED mesh used as a model surface (feature 004). Unlike a fitted element it carries
+    /// the exact triangle geometry alongside a co-kriged field fit THROUGH that mesh; the exact
+    /// geometry is honored inside the mesh's bounds and the field extends it smoothly beyond
+    /// (US2). In v1 it plays a stratigraphic-contact role (present below its surface, like a
+    /// bounded series). Its field is `model` (the kriged fit); its geometry is `mesh`.
+    ImportedSurface(ImportedSurface<M>),
     /// The ground surface. Pinned youngest (index 0), at most one per stack. Its single
     /// interface is the ground; ABOVE it is Air (no rock), BELOW it everything older is
     /// present. Mechanically the youngest erosional surface — it contributes the ABOVE-side
@@ -338,6 +344,54 @@ pub enum StackElement<M> {
 pub struct Topography<M> {
     /// The fitted ground field. Its top interface isovalue is the ground contact.
     pub model: M,
+}
+
+/// Which surface role an [`ImportedSurface`] plays — the same roles a fitted surface can (feature
+/// 004 FR-002). v1 wires `Contact` (a stratigraphic bed); the others are the US3 role-parity seam.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImportRole {
+    /// A stratigraphic contact (a bed): present below its surface, like a bounded series.
+    Contact,
+    /// An erosion surface: truncates older elements at the imported surface (US3).
+    Erosion,
+    /// A cross-cutting wall (vein/intrusion band edge) (US3).
+    VeinWall,
+    /// The ground surface capping the model to Air (US3).
+    Topography,
+}
+
+/// An imported triangle mesh used as a model surface (feature 004). It carries BOTH the exact
+/// geometry (`mesh`, winding-normalized) and a co-kriged field (`model`) fit through that mesh's
+/// vertices + normals. The exact geometry is honored inside the mesh's axis-aligned bounds (via
+/// [`MeshSignedField`] — sign from `model`, zero-set on the mesh); `model` supplies the field the
+/// stack machinery reads (lithology, present_at) and, in US2, the smooth extension beyond the bounds.
+pub struct ImportedSurface<M> {
+    /// The co-kriged field fit through the mesh (the SIGN field + `SeriesModel` behaviour).
+    pub model: M,
+    /// The exact imported triangle geometry (winding-normalized on ingress).
+    pub mesh: TriMesh,
+    /// Which surface role it plays.
+    pub role: ImportRole,
+    /// The stratigraphic relation bit (erode/onlap/conformable) when the role is contact/erosion.
+    pub relation: Option<Relation>,
+}
+
+impl<M: SeriesModel> ImportedSurface<M> {
+    /// The imported contact's isovalue — its single interface (the mesh) in the kriged field.
+    fn iso(&self) -> Option<f64> {
+        self.model.interface_isovalues().last().copied()
+    }
+
+    /// Is this surface's rock present at `p`? For a contact/erosion it is present BELOW its contact
+    /// (`field < iso`), the same convention as a bounded [`StackedSeries`]/[`Topography`]. Classified
+    /// against the kriged field (the exact geometry only matters for the MESHED surface, not for the
+    /// point-classification lithology lookup).
+    fn present_at(&self, p: [f64; 3]) -> bool {
+        match self.iso() {
+            Some(iso) => self.model.scalar_field(p) < iso,
+            None => false,
+        }
+    }
 }
 
 impl<M: SeriesModel> Topography<M> {
@@ -367,6 +421,7 @@ impl<M: SeriesModel> StackElement<M> {
             StackElement::Vein(v) => v.present_at(p),
             StackElement::Intrusion(it) => it.present_at(p),
             StackElement::Topography(t) => t.present_at(p),
+            StackElement::ImportedSurface(im) => im.present_at(p),
         }
     }
 
@@ -378,6 +433,7 @@ impl<M: SeriesModel> StackElement<M> {
             StackElement::Vein(v) => &v.model,
             StackElement::Intrusion(it) => &it.model,
             StackElement::Topography(t) => &t.model,
+            StackElement::ImportedSurface(im) => &im.model,
         }
     }
 
@@ -2150,6 +2206,35 @@ impl<M: SeriesModel + BlockModel> Stack<M> {
                         out.push((i, 0, 0, 0, bid, Mesh::default()));
                         for &(kind, id) in &clip_refs {
                             out.push((i, 0, 0, kind, id, Mesh::default()));
+                        }
+                    }
+                }
+                StackElement::ImportedSurface(im) => {
+                    // A stratigraphic contact = ONE interface (the mesh), 2 units (below / above).
+                    // The EXACT-PATCH primitive is `below(MeshSignedField)`: its zero-set is the
+                    // imported triangles (sign from the kriged field), so the contact honors the
+                    // mesh exactly (feature 004 research D3). Mirrors the Series arm for n=1.
+                    let Some(iso) = im.iso() else { continue };
+                    let f = im.model.field();
+                    let signed = MeshSignedField::new(&im.mesh, &f, iso);
+                    let bid = next_id;
+                    next_id += 1;
+                    out.push((0, 0, 0, 255, bid, below_solid(&signed, 0.0, min, size, ext_max, cfg)));
+                    let clip_refs = self.emit_clip_defs(&mut out, &mut next_id, i, min, size, ext_max, cfg);
+                    // Below-the-contact unit (0) is always rock; the ABOVE unit (1) is the void owned
+                    // by a younger element / Air — dropped when an older element lies beneath, exactly
+                    // as `present_unit_count` drops a bounded series' top void unit.
+                    let has_older = i + 1 < self.series.len();
+                    let n_units = if has_older { 1 } else { 2 };
+                    for u in 0..n_units {
+                        if u == 0 {
+                            out.push((i, 0, 0, 0, bid, Mesh::default())); // Base = below(mesh)
+                        } else {
+                            out.push((i, 0, 1, 3, 0, Mesh::default())); // BaseBox (top fill unit)
+                            out.push((i, 0, 1, 2, bid, Mesh::default())); // − below(mesh)
+                        }
+                        for &(kind, id) in &clip_refs {
+                            out.push((i, 0, u, kind, id, Mesh::default()));
                         }
                     }
                 }

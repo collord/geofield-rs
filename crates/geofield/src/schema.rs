@@ -87,6 +87,18 @@ pub enum StackElementDto {
         name: String,
         surfaces: Vec<u32>,
     },
+    /// An IMPORTED mesh surface (feature 004). One interface (the mesh). Carries its role and, for a
+    /// contact/erosion role, the same Axis-A relation bit a fitted contact would. The DERIVED
+    /// field/patches are never in the DTO (Principle III) — only the declared role + relation.
+    ImportedSurface {
+        id: String,
+        name: String,
+        surfaces: Vec<u32>,
+        /// The surface role: "contact" | "erosion" | "veinWall" | "topography".
+        role: String,
+        /// Axis A — present for contact/erosion, `None` otherwise.
+        relation: Option<RelationDto>,
+    },
 }
 
 /// The **effective relationship** the core derives for display (design doc §6.6).
@@ -214,6 +226,19 @@ impl<M: SeriesModel> Stack<M> {
                         name: format!("topography {i}"),
                         surfaces: t.model.interface_ids(),
                     },
+                    StackElement::ImportedSurface(im) => StackElementDto::ImportedSurface {
+                        id,
+                        name: format!("imported {i}"),
+                        surfaces: im.model.interface_ids(),
+                        role: match im.role {
+                            crate::stack::ImportRole::Contact => "contact",
+                            crate::stack::ImportRole::Erosion => "erosion",
+                            crate::stack::ImportRole::VeinWall => "veinWall",
+                            crate::stack::ImportRole::Topography => "topography",
+                        }
+                        .to_string(),
+                        relation: im.relation.map(Into::into),
+                    },
                 }
             })
             .collect()
@@ -256,6 +281,13 @@ impl<M: SeriesModel> Stack<M> {
                 // Topography reuses the erode clip mechanism and reads as Erode in the UI's
                 // effective-relation chip (it is the youngest erosional surface, §2.1).
                 StackElement::Topography(_) => EffectiveRelation::Erode,
+                // An imported surface reads by its declared relation (contact/erosion) or as a
+                // cross-cut for a wall role.
+                StackElement::ImportedSurface(im) => match im.relation {
+                    Some(Relation::Erode) => EffectiveRelation::Erode,
+                    Some(Relation::Onlap) => EffectiveRelation::Onlap,
+                    Some(Relation::Conformable) | None => EffectiveRelation::Conformable,
+                },
             };
             effective_relation.push((id.clone(), eff));
 
@@ -282,6 +314,8 @@ impl<M: SeriesModel> Stack<M> {
             let unit_count = match e {
                 StackElement::Series(_) if n_ifaces > 0 => n_ifaces + 1,
                 StackElement::Vein(_) | StackElement::Intrusion(_) if has_iface => 1,
+                // An imported contact has ONE interface (the mesh) ⇒ 2 units (below / above).
+                StackElement::ImportedSurface(_) if has_iface => 2,
                 _ => 0, // topography (Air only), or a field-less element
             };
             // Emit TOP-of-stack first: the mesher's unit index runs with ASCENDING isovalue, so
