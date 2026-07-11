@@ -81,7 +81,7 @@ use crate::mesh::Mesh;
 use crate::mesh_clip::{clip, ClipMesh, Keep};
 use crate::octree::{
     octree_dual_contour_scene, octree_dual_contour_shared, AxisBox, Boundary, ContactHalfSpace,
-    MeshLocalField, OctreeConfig, PlaneHalfSpace, Scene, SlabComplement, StitchedField, TriMesh,
+    OctreeConfig, PlaneHalfSpace, Scene, SlabComplement, StitchedField, TriMesh,
 };
 use crate::{clip_mesh_to_half_spaces, max_abs_field_in_box, BlockModel, ScalarField, SeriesModel};
 
@@ -2239,11 +2239,14 @@ impl<M: SeriesModel + BlockModel> Stack<M> {
                     let Some((bmin, bmax)) = im.mesh.bounds() else { continue };
                     let bid = next_id;
                     next_id += 1;
-                    // DEFAULT (footprint-only): contour the mesh's LOCAL signed distance — exact, no
-                    // co-kriging — clipped to the mesh's OWN bounds, so the surface exists only within
-                    // the data footprint (no extrapolation). This is the path a large lidar surface
-                    // takes. EXTEND: contour `StitchedField` (kriged smooth beyond the footprint) out
-                    // to the domain box (US2), for a surface the user asked to project to bounds.
+                    // DEFAULT (footprint-only): the below-contact solid is the mesh's OWN triangles
+                    // sealed into a watertight prism (down to a floor below the domain) — EXACT, no
+                    // field, no contour. We already have the geometry; re-fielding + re-contouring a real
+                    // curved lidar TIN was where every watertightness bug lived (nearest-triangle sign
+                    // flips, raster creases, adaptive-depth T-junctions → Manifold rejected the primitive
+                    // → empty volume view). Manifold's `∩ domainBox` (executeRecipe) does the lateral clip
+                    // and side/bottom caps. EXTEND: contour `StitchedField` (kriged smooth beyond the
+                    // footprint) out to the domain box (US2), for a surface projected to bounds.
                     let prim = if im.extend_to_bounds {
                         let Some(iso) = im.iso() else { continue };
                         let f = im.model.field();
@@ -2251,13 +2254,13 @@ impl<M: SeriesModel + BlockModel> Stack<M> {
                             StitchedField::new(&im.mesh, [bmin[0], bmin[1]], [bmax[0], bmax[1]], &f, iso);
                         below_solid(&stitched, 0.0, min, size, ext_max, cfg)
                     } else {
-                        // Clip to the mesh's XY footprint but the FULL domain Z (the below-contact
-                        // solid fills from the floor up to the bed within the footprint).
-                        let fmin = [bmin[0], bmin[1], min[2]];
-                        let fmax = [bmax[0], bmax[1], ext_max[2]];
-                        let fsize = (fmax[0] - fmin[0]).max(fmax[1] - fmin[1]).max(fmax[2] - fmin[2]);
-                        let local = MeshLocalField::new(&im.mesh);
-                        below_solid(&local, 0.0, fmin, fsize, fmax, cfg)
+                        // Floor the prism BELOW the domain so `∩ domainBox` yields the full-height column
+                        // under the terrain (the margin mirrors `below_solid`'s overhang). The sheet
+                        // laterally encloses the domain, so the top covers it; Manifold trims the rest.
+                        let cell = size / (1u32 << cfg.max_depth.max(1)) as f64;
+                        let floor = min[2] - cell * 3.0;
+                        let Some(prim) = im.mesh.close_sheet_below(floor) else { continue };
+                        prim
                     };
                     out.push((0, 0, 0, 255, bid, prim));
                     let clip_refs = self.emit_clip_defs(&mut out, &mut next_id, i, min, size, ext_max, cfg);

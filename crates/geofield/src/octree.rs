@@ -906,6 +906,69 @@ impl TriMesh {
         (self.vertices[i], self.vertices[j], self.vertices[k])
     }
 
+    /// Seal this open TERRAIN sheet into a WATERTIGHT closed solid = "everything below the surface,
+    /// down to `floor_z`", by extruding it into a prism: the sheet's EXACT triangles form the top; a
+    /// mirror of them (same connectivity, flattened to `floor_z`, wound opposite) forms the bottom; and
+    /// a vertical skirt joins the two along the boundary loop. Every interior edge is shared by two top
+    /// AND two bottom triangles; every boundary edge is closed by one top, one bottom, and two skirt
+    /// triangles — so the result is closed by construction (no contour, no field, no QEF). This is the
+    /// volume-mesher primitive for an imported contact: hand it to Manifold, whose `∩ domainBox` does
+    /// the lateral clip + side/bottom caps. Assumes the sheet's triangles are wound so their normals
+    /// face UP (out of the below-solid); the top keeps that winding, the bottom is reversed to face
+    /// DOWN. `None` for an empty mesh.
+    pub fn close_sheet_below(&self, floor_z: f64) -> Option<Mesh> {
+        if self.triangles.is_empty() {
+            return None;
+        }
+        let nv = self.vertices.len();
+        let mut positions: Vec<f32> = Vec::with_capacity(nv * 6);
+        // Top ring [0, nv): the sheet as-is. Bottom ring [nv, 2·nv): flattened to the floor.
+        for v in &self.vertices {
+            positions.extend_from_slice(&[v[0] as f32, v[1] as f32, v[2] as f32]);
+        }
+        for v in &self.vertices {
+            positions.extend_from_slice(&[v[0] as f32, v[1] as f32, floor_z as f32]);
+        }
+        let bot = nv as u32; // index offset of the bottom ring
+
+        // 6 idx per triangle (top + bottom); the boundary skirt adds a bounded remainder (grown as met).
+        let mut indices: Vec<u32> = Vec::with_capacity(self.triangles.len() * 6);
+        for t in &self.triangles {
+            let (i, j, k) = (t[0] as u32, t[1] as u32, t[2] as u32);
+            indices.extend_from_slice(&[i, j, k]); // top: keeps up-facing winding
+            // bottom: same tri on the floor ring, REVERSED so its normal faces down (outward).
+            indices.extend_from_slice(&[bot + i, bot + k, bot + j]);
+        }
+
+        // Skirt: each boundary edge (incident to exactly ONE triangle) becomes a vertical quad joining
+        // its top edge to its floor edge. The undirected edge count gives boundary membership; the
+        // DIRECTED edge from the owning triangle gives the outward-consistent winding.
+        let mut count: std::collections::HashMap<(u32, u32), u32> = std::collections::HashMap::new();
+        for t in &self.triangles {
+            for &(a, b) in &[(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+                let (a, b) = (a as u32, b as u32);
+                let key = if a < b { (a, b) } else { (b, a) };
+                *count.entry(key).or_insert(0) += 1;
+            }
+        }
+        for t in &self.triangles {
+            for &(a, b) in &[(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+                let (a, b) = (a as u32, b as u32);
+                let key = if a < b { (a, b) } else { (b, a) };
+                if count[&key] != 1 {
+                    continue; // interior edge — already double-covered by adjacent triangles
+                }
+                // Directed boundary edge a→b (top). Wall quad (a, b, b_floor, a_floor). Wind the two
+                // triangles so the wall's outward normal is consistent with the top edge direction.
+                let (af, bf) = (bot + a, bot + b);
+                indices.extend_from_slice(&[a, bf, b]);
+                indices.extend_from_slice(&[a, af, bf]);
+            }
+        }
+
+        Some(Mesh { positions, normals: Vec::new(), indices })
+    }
+
     /// Outward (CCW) geometric normal of triangle `t`, normalized.
     fn tri_normal(&self, t: usize) -> [f64; 3] {
         let (a, b, c) = self.tri(t);
