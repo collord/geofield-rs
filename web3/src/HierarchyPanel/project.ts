@@ -96,8 +96,13 @@ export type ProjectElement =
       kind: "intrusion";
       id: string;
       name: string;
+      /** "solid" = a filled body bounded by ONE envelope (a stock/pluton — engine `Single`);
+       *  "shell" = a hollow-cored body between an inner and outer envelope (a ring dike / cored
+       *  pluton — engine `Shell`). In "solid" mode `envelopeInner` is retained but unused (not
+       *  shown, not compiled). Absent on old saved projects ⇒ treated as "shell" (back-compat). */
+      mode: "solid" | "shell";
       envelopeInner: InterfaceData;
-      envelopeOuter: InterfaceData; // equal to inner => a single envelope
+      envelopeOuter: InterfaceData; // "shell": the outer wall; "solid": the sole envelope
     }
   | {
       // The singleton topography surface (feature 003 §2). One interface — the ground; Air
@@ -150,6 +155,13 @@ export interface Project {
     seamClip?: boolean;
     /** The "edges" (wireframe) toggle. */
     edges?: boolean;
+    /** The authored points/normals overlay toggle (parametric surfaces). */
+    overlay?: boolean;
+    /** Size multipliers for the points/normals overlay (each defaults to 1.0). All three scale a
+     *  width/100 baseline, so they're scale-invariant across models of any world size. */
+    overlayPointScale?: number;
+    overlayArrowScale?: number;
+    overlayLabelScale?: number;
   };
 }
 
@@ -179,6 +191,21 @@ export function dipDirToPole(dipDeg: number, dipDirDeg: number): [number, number
   const ny = Math.sin(d) * Math.cos(a);
   const nz = Math.cos(d);
   return [nx, ny, nz]; // already unit; points up out of the footwall
+}
+
+/** The GEOMETRIC up-pointing surface normal for a plane of dip `dipDeg` / dip-direction `dipDirDeg`
+ *  (same X=East, Y=North, Z=Up, azimuth-clockwise-from-North convention). This is the true pole ⊥
+ *  the plane, for VISUALIZATION only — NOT the fit constraint.
+ *
+ *  It differs from `dipDirToPole` by the SIGN of the horizontal component: the fit vector leans
+ *  DOWN-dip (toward the dip azimuth), whereas the geometric up-normal leans UP-dip (away from it),
+ *  which is what a "normal arrow" over a surface should show. They coincide only at dip 0 (both
+ *  straight up) and are horizontally opposite at dip 90 (a vertical plane's two horizontal normals).
+ *  Do NOT feed this to the kriging fit — use `dipDirToPole` there. */
+export function dipDirToNormal(dipDeg: number, dipDirDeg: number): [number, number, number] {
+  const d = (dipDeg * Math.PI) / 180;
+  const a = (dipDirDeg * Math.PI) / 180;
+  return [-Math.sin(d) * Math.sin(a), -Math.sin(d) * Math.cos(a), Math.cos(d)];
 }
 
 // ============================================================================
@@ -223,6 +250,85 @@ function flattenInterfaces(
     }
   });
   return { sp_xyz, sp_if, ori_xyz, ori_pole };
+}
+
+// ============================================================================
+// Authored points/normals overlay payload (viewer-agnostic; parametric surfaces only)
+// ============================================================================
+
+/** One authored contact point, world-space, tagged with its 1-based row number (matching the
+ *  data modal's table) and a color index (the element's position, for the viewer palette). */
+export interface OverlayPoint {
+  pos: [number, number, number];
+  row: number;
+  colorIndex: number;
+}
+/** One authored orientation reading, rendered as a surface-normal arrow.
+ *
+ *  ⚠️ CONVENTION — READ BEFORE CHANGING. The data TABLE stores the geologic standard: `dip` (degrees
+ *  below horizontal) and `dipDir` (azimuth of steepest DESCENT, clockwise from North). Those are NOT
+ *  vector components. `dir` here is the true GEOMETRIC up-normal (⊥ the surface), from
+ *  `dipDirToNormal(dip, dipDir)`. Three distinct vectors are easy to confuse:
+ *    • dip vector      — down-slope INTO the surface (what "dips 30° toward 090°" pictures).
+ *    • up-normal (dir) — ⊥ the surface, pointing UP-and-up-dip. What this arrow draws.
+ *    • fit pole        — `dipDirToPole`, the kriging constraint; leans DOWN-dip, horizontal-flipped
+ *                        from the up-normal. Do NOT draw this — it lies flat & faces down-dip at δ=90.
+ *  Flip is intentionally NOT applied, so it's the normal of the datum as typed, before the element's
+ *  relation/flip sign. */
+export interface OverlayNormal {
+  pos: [number, number, number]; // world position of the reading (arrow tail)
+  dir: [number, number, number]; // true up-normal (unit), from dipDirToNormal — NOT the fit pole or dip vector
+  row: number;
+  colorIndex: number;
+}
+export interface AuthoredOverlay {
+  points: OverlayPoint[];
+  normals: OverlayNormal[];
+}
+
+/** The parametric interfaces of an element, in presentation order (matches `interfacesOf` in
+ *  projectOps + the panel's contact rows). Imported-mesh surfaces have NONE (geometry is the mesh). */
+function overlayInterfaces(el: ProjectElement): InterfaceData[] {
+  switch (el.kind) {
+    case "series":
+      return el.interfaces;
+    case "vein":
+      return [el.footWall, el.hangingWall];
+    case "intrusion":
+      return (el.mode ?? "shell") === "solid"
+        ? [el.envelopeOuter]
+        : [el.envelopeInner, el.envelopeOuter];
+    case "topography":
+      return [el.ground];
+    case "importedSurface":
+      return [];
+  }
+}
+
+/** Flatten every parametric surface's authored points + orientations into a viewer-agnostic,
+ *  world-space overlay payload. Row numbers are 1-based PER INTERFACE (matching the data modal).
+ *
+ *  Normals: the table's geologic `dip`/`dipDir` are converted to the true geometric up-normal via
+ *  `dipDirToNormal` (⊥ the surface — NOT the fit's `dipDirToPole`, which leans down-dip and lies flat
+ *  at δ=90; see OverlayNormal's note). No flip is applied, so it's the normal of the datum as typed,
+ *  before the element's relation/flip sign — an inspection view of the reading itself. Pure: same
+ *  project ⇒ identical payload. */
+export function buildAuthoredOverlay(project: Project): AuthoredOverlay {
+  const points: OverlayPoint[] = [];
+  const normals: OverlayNormal[] = [];
+  project.elements.forEach((el, colorIndex) => {
+    for (const iface of overlayInterfaces(el)) {
+      iface.points.forEach((p, i) => {
+        points.push({ pos: [p.x, p.y, p.z], row: i + 1, colorIndex });
+      });
+      iface.orientations.forEach((o, i) => {
+        // The true GEOMETRIC up-normal (⊥ the surface), NOT the fit's dipDirToPole constraint —
+        // so the arrow reads as perpendicular to the surface it annotates. See dipDirToNormal.
+        normals.push({ pos: [o.x, o.y, o.z], dir: dipDirToNormal(o.dip, o.dipDir), row: i + 1, colorIndex });
+      });
+    }
+  });
+  return { points, normals };
 }
 
 /** The SINGLE seam between the authoring model and the existing fit path. Pure: same
@@ -289,7 +395,18 @@ export function toSeriesJson(project: Project): SeriesJson[] {
         crossCut: { kind: "vein", footWall: 0, hangingWall: 1 },
       };
     }
-    // intrusion
+    // intrusion. "solid" ⇒ one envelope, compiled as equal indices (the worker's documented
+    // single-envelope encoding, protocol.ts §crossCut). "shell" ⇒ distinct inner/outer walls.
+    if ((el.mode ?? "shell") === "solid") {
+      return {
+        name: el.name,
+        relation: RELATION_CODE.erode,
+        unboundedAbove: false,
+        ...flattenInterfaces([el.envelopeOuter]),
+        ...NO_FAULT,
+        crossCut: { kind: "intrusion", envelopeInner: 0, envelopeOuter: 0 },
+      };
+    }
     return {
       name: el.name,
       relation: RELATION_CODE.erode,
@@ -336,8 +453,9 @@ export function validate(project: Project): ProjectValidation {
       checkInterface(el.id, el.footWall);
       checkInterface(el.id, el.hangingWall);
     } else if (el.kind === "intrusion") {
-      checkInterface(el.id, el.envelopeInner);
+      // "solid" mode uses only the outer envelope; the retained inner is not compiled.
       checkInterface(el.id, el.envelopeOuter);
+      if ((el.mode ?? "shell") === "shell") checkInterface(el.id, el.envelopeInner);
     } else if (el.kind === "topography") {
       // topography — one ground surface
       checkInterface(el.id, el.ground);

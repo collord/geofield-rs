@@ -21,6 +21,7 @@ import {
   loadProject,
   saveProject,
   toSeriesJson,
+  buildAuthoredOverlay,
   validate,
   exportProjectJson,
   importProjectJson,
@@ -37,6 +38,7 @@ import {
   renameElement,
   setImportRole,
   setImportExtend,
+  setIntrusionMode,
   deleteElement,
   reorderContainers,
   reorderWithin,
@@ -102,6 +104,31 @@ function ZRangeForm(props: {
   );
 }
 
+/** One overlay-size slider (0.1×–5×) with a numeric readout. Scales a width/100 baseline, so the
+ *  same value reads sensibly on a model of any world size. */
+function OverlaySlider(props: {
+  label: string;
+  testid: string;
+  value: number;
+  onChange: (v: number) => void;
+}) {
+  return (
+    <label className="overlay-size-slider" style={{ display: "inline-flex", alignItems: "center", gap: "0.35em", fontSize: "0.8em" }}>
+      <span>{props.label}</span>
+      <input
+        type="range"
+        data-testid={props.testid}
+        min={0.1}
+        max={5}
+        step={0.1}
+        value={props.value}
+        onChange={(e) => props.onChange(Number(e.target.value))}
+      />
+      <span style={{ width: "2.5em", textAlign: "right" }}>{props.value.toFixed(1)}×</span>
+    </label>
+  );
+}
+
 function App() {
   const [project, setProject] = useState<Project>(() => loadProject() ?? blankProject());
   const [dirty, setDirty] = useState(false);
@@ -126,13 +153,21 @@ function App() {
   // `drawNonce` bumps to (re)enter top-down 2-point digitization; `pendingBounds` holds the drawn
   // XY rectangle while the user completes the prism with minZ/maxZ.
   const [showBounds, setShowBounds] = useState(false);
+  // Authored points/normals overlay (parametric surfaces): a display toggle + three size sliders
+  // (each a scale on a width/100 baseline, so scale-invariant). Persisted in Project.view.
+  const [showOverlay, setShowOverlay] = useState(false);
+  const [overlayPointScale, setOverlayPointScale] = useState(1);
+  const [overlayArrowScale, setOverlayArrowScale] = useState(1);
+  const [overlayLabelScale, setOverlayLabelScale] = useState(1);
   const [fitNonce, setFitNonce] = useState(0);
   const [drawNonce, setDrawNonce] = useState(0);
   const [pendingBounds, setPendingBounds] = useState<{ x0: number; x1: number; y0: number; y1: number } | null>(null);
   const drawBounds = useMemo(() => (drawNonce ? { nonce: drawNonce } : undefined), [drawNonce]);
+  // Authored points/normals overlay payload — rebuilt only when the elements change (pure).
+  const authoredData = useMemo(() => buildAuthoredOverlay(project), [project]);
   // Camera round-trip: the Viewer fills `viewApiRef` with a getter (read on Export);
   // `importedView` (a new object per Import) is pushed back to re-apply a saved view.
-  const viewApiRef = useRef<{ getView: () => ViewState } | null>(null);
+  const viewApiRef = useRef<{ getView: () => ViewState; debugCounts: () => { spheres: number; arrows: number } } | null>(null);
   const [importedView, setImportedView] = useState<ViewState | undefined>(undefined);
   const [status, setStatus] = useState<string>("idle");
   const [addMenuOpen, setAddMenuOpen] = useState(false);
@@ -307,6 +342,8 @@ function App() {
     commit(setImportRole(project, elementId, role));
   const onSetImportExtend = (elementId: string, extend: boolean) =>
     commit(setImportExtend(project, elementId, extend));
+  const onSetIntrusionMode = (elementId: string, mode: "solid" | "shell") =>
+    commit(setIntrusionMode(project, elementId, mode));
 
   // Draw model bounds (feature): the Viewer reports the drawn XY rectangle; show the wireframe and
   // open the minZ/maxZ form to complete the prism.
@@ -355,10 +392,13 @@ function App() {
       __loadProject?: (p: Project) => void;
       __surfaces?: SurfacePayload[];
       __getView?: () => ViewState | undefined;
+      __overlayCounts?: () => { spheres: number; arrows: number } | undefined;
       __exactSpikeDigest?: () => Promise<string | undefined>;
     };
     w.__reorderContainers = onReorderContainers;
     w.__moveSurface = onMoveSurface;
+    // Points/normals overlay geometry counts, for the overlay e2e (e2e/points-normals.spec.ts).
+    w.__overlayCounts = () => viewApiRef.current?.debugCounts();
     // Test hooks (harmless in the demo): inject a Project directly (skips the file picker)
     // and expose the rendered surfaces for geometric assertions. Used by the flipped-erosion
     // QEF-spike regression spec (e2e/qef-spike.spec.ts). `__getView` reads the current camera
@@ -403,6 +443,10 @@ function App() {
       setRenderMode(mode);
       setSeamClip(clip);
       if (p.view.edges !== undefined) setWireframe(p.view.edges);
+      if (p.view.overlay !== undefined) setShowOverlay(p.view.overlay);
+      if (p.view.overlayPointScale !== undefined) setOverlayPointScale(p.view.overlayPointScale);
+      if (p.view.overlayArrowScale !== undefined) setOverlayArrowScale(p.view.overlayArrowScale);
+      if (p.view.overlayLabelScale !== undefined) setOverlayLabelScale(p.view.overlayLabelScale);
       setImportedView({ camera: p.view.camera, target: p.view.target, up: p.view.up, fov: p.view.fov });
     }
     if (p.elements.length > 0 && validate(p).canApply) runStack(p, undefined, mode, clip);
@@ -420,7 +464,16 @@ function App() {
     });
   const onExport = () => {
     const cam = viewApiRef.current?.getView();
-    const view = cam && { ...cam, renderMode, seamClip, edges: wireframe };
+    const view = cam && {
+      ...cam,
+      renderMode,
+      seamClip,
+      edges: wireframe,
+      overlay: showOverlay,
+      overlayPointScale,
+      overlayArrowScale,
+      overlayLabelScale,
+    };
     exportProjectJson(view ? { ...project, view } : project);
   };
   const onImportFile = async (file: File) => {
@@ -555,6 +608,18 @@ function App() {
               />
               edges
             </label>
+            <label
+              className="debug-toggle"
+              title="Overlay the authored contact points (spheres) and surface normals (arrows — the geometric up-normal ⊥ each surface, derived from the reading's dip/dip-direction) that define each parametric surface, labeled by row number. Imported meshes have none."
+            >
+              <input
+                type="checkbox"
+                data-testid="points-normals-toggle"
+                checked={showOverlay}
+                onChange={(e) => setShowOverlay(e.target.checked)}
+              />
+              points/normals
+            </label>
             <button
               type="button"
               data-testid="fit-view"
@@ -621,6 +686,30 @@ function App() {
               manifold
             </label>
           </div>
+          {/* Overlay size sliders — shown only when the points/normals overlay is on. Each is a
+              scale multiplier on the width/100 baseline (default 1.0×), so scale-invariant. */}
+          {showOverlay && (
+            <div className="overlay-size-controls" data-testid="overlay-size-controls">
+              <OverlaySlider
+                label="point size"
+                testid="overlay-point-size"
+                value={overlayPointScale}
+                onChange={setOverlayPointScale}
+              />
+              <OverlaySlider
+                label="arrow length"
+                testid="overlay-arrow-size"
+                value={overlayArrowScale}
+                onChange={setOverlayArrowScale}
+              />
+              <OverlaySlider
+                label="label size"
+                testid="overlay-label-size"
+                value={overlayLabelScale}
+                onChange={setOverlayLabelScale}
+              />
+            </div>
+          )}
         </div>
 
         {/* Apply / Cancel bar (shown only when dirty) */}
@@ -667,6 +756,7 @@ function App() {
           onDeleteElement={onDeleteElement}
           onSetImportRole={onSetImportRole}
           onSetImportExtend={onSetImportExtend}
+          onSetIntrusionMode={onSetIntrusionMode}
           unitName={(elementId, unitIndex, displayPos) => unitNameOf(project, elementId, unitIndex, displayPos)}
           onRenameUnit={(elementId, unitIndex, name) => commitLithology(renameUnit(project, elementId, unitIndex, name))}
           catalog={catalogOf(project).lithologies}
@@ -723,6 +813,9 @@ function App() {
           viewApiRef={viewApiRef}
           importedView={importedView}
           showBounds={showBounds}
+          authoredData={authoredData}
+          showAuthored={showOverlay}
+          overlaySizes={{ point: overlayPointScale, arrow: overlayArrowScale, label: overlayLabelScale }}
           drawBounds={drawBounds}
           onBoundsXY={onBoundsXY}
           fitNonce={fitNonce}

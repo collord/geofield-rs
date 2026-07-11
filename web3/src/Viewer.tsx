@@ -7,6 +7,7 @@ import { useEffect, useMemo, useRef } from "react";
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import type { SurfacePayload } from "./protocol";
+import type { AuthoredOverlay } from "./HierarchyPanel/project";
 
 const SERIES_COLORS = [0x4f83cc, 0xcc7a4f, 0x6aa84f, 0x9b59b6, 0xc0392b];
 
@@ -139,6 +140,83 @@ function buildBoundsBox(extent: Extent): THREE.LineSegments {
   return new THREE.LineSegments(geom, new THREE.LineBasicMaterial({ color: 0x22d3ee })); // cyan
 }
 
+/** Build the authored points/normals overlay for parametric surfaces. `unit` is the size baseline
+ *  (data width / 100); the three `sizes` multipliers scale spheres / arrows / labels off it. Points
+ *  become labeled spheres; orientations become labeled arrows (tail at the reading). Colored by the
+ *  element's palette index (matching the mesh series colors). */
+function buildAuthoredOverlay(
+  data: AuthoredOverlay,
+  unit: number,
+  sizes: { point: number; arrow: number; label: number },
+): THREE.Group {
+  const g = new THREE.Group();
+  const color = (i: number) => SERIES_COLORS[i % SERIES_COLORS.length];
+  const sphereR = unit * sizes.point;
+  const arrowLen = unit * sizes.arrow * 8; // ×8 so 1.0× reads sensibly vs a 1.0× sphere
+  const labelScale = unit * sizes.label * 4; // ×4 tuned so 1.0× is legible at the sphere's scale
+  // One shared sphere geometry (all points same radius); per-point material only for color reuse.
+  const sphereGeom = new THREE.SphereGeometry(sphereR, 16, 12);
+  const mats = new Map<number, THREE.MeshLambertMaterial>();
+  const matFor = (c: number) => {
+    let m = mats.get(c);
+    if (!m) {
+      m = new THREE.MeshLambertMaterial({ color: c });
+      mats.set(c, m);
+    }
+    return m;
+  };
+
+  for (const p of data.points) {
+    const c = color(p.colorIndex);
+    const mesh = new THREE.Mesh(sphereGeom, matFor(c));
+    mesh.position.set(...p.pos);
+    g.add(mesh);
+    // Label offset up by a sphere-radius so it doesn't sit inside the sphere.
+    const label = makeLabel(String(p.row), c, [p.pos[0], p.pos[1], p.pos[2] + sphereR * 1.5]);
+    label.scale.setScalar(labelScale);
+    g.add(label);
+  }
+
+  for (const n of data.normals) {
+    // `n.dir` is the true geometric up-normal (⊥ the surface), converted from the table's geologic
+    // dip/dip-direction upstream (buildAuthoredOverlay → dipDirToNormal). It is NOT the down-dip
+    // vector nor the fit pole: the arrow points UP-and-up-dip, out of the surface. See OverlayNormal.
+    const c = color(n.colorIndex);
+    const d = new THREE.Vector3(...n.dir);
+    if (d.lengthSq() === 0) continue; // degenerate pole — skip
+    d.normalize();
+    const tail = new THREE.Vector3(...n.pos);
+    const arrow = new THREE.ArrowHelper(d, tail, arrowLen, c, arrowLen * 0.25, arrowLen * 0.12);
+    g.add(arrow);
+    const tip = tail.clone().addScaledVector(d, arrowLen * 1.1);
+    const label = makeLabel(String(n.row), c, [tip.x, tip.y, tip.z]);
+    label.scale.setScalar(labelScale);
+    g.add(label);
+  }
+  return g;
+}
+
+/** Dispose everything an overlay group owns (geometries, materials, label textures) before dropping
+ *  it — sphere geometry is shared so dispose it once; ArrowHelper owns its own line/cone. */
+function disposeOverlay(g: THREE.Group): void {
+  const seenGeom = new Set<THREE.BufferGeometry>();
+  g.traverse((o) => {
+    if (o instanceof THREE.Mesh) {
+      if (!seenGeom.has(o.geometry)) {
+        seenGeom.add(o.geometry);
+        o.geometry.dispose();
+      }
+      (o.material as THREE.Material).dispose();
+    } else if (o instanceof THREE.Sprite) {
+      const m = o.material as THREE.SpriteMaterial;
+      m.map?.dispose();
+      m.dispose();
+    } else if (o instanceof THREE.ArrowHelper) {
+      o.dispose();
+    }
+  });
+}
+
 /** Convert a "#rrggbb" hex string to a three.js numeric colour. */
 function hexToNum(hex: string): number {
   return parseInt(hex.replace("#", ""), 16) || 0x888888;
@@ -163,8 +241,15 @@ export function Viewer(props: {
   /** Debug: surface keys (see `surfaceKey`) to HIDE. Absent/empty ⇒ show all. */
   hiddenKeys?: Set<string>;
   /** Filled by the Viewer with a `getView()` so the parent can capture the current
-   *  camera on Export. */
-  viewApiRef?: { current: { getView: () => ViewState } | null };
+   *  camera on Export, and `debugCounts()` for tests to assert overlay geometry got built. */
+  viewApiRef?: { current: { getView: () => ViewState; debugCounts: () => { spheres: number; arrows: number } } | null };
+  /** The authored points/normals overlay for parametric surfaces (viewer-agnostic, world-space).
+   *  Absent/empty ⇒ nothing to draw. */
+  authoredData?: AuthoredOverlay;
+  /** Show the authored points/normals overlay. */
+  showAuthored?: boolean;
+  /** Size multipliers for the overlay (each defaults to 1.0). All scale a width/100 baseline. */
+  overlaySizes?: { point: number; arrow: number; label: number };
   /** When set (a NEW object), the Viewer applies this camera state — used on Import to
    *  restore a saved view. Applied after the extent re-center so it wins. */
   importedView?: ViewState;
@@ -188,6 +273,7 @@ export function Viewer(props: {
     boundsBox: THREE.LineSegments | null;
     rubber: THREE.LineLoop | null; // live rectangle during digitization
     framedKey: string | null; // the data-bounds key we last auto-framed (frame only on NEW data)
+    overlay: THREE.Group | null; // authored points/normals overlay
   } | null>(null);
 
   // One-time three.js setup.
@@ -217,7 +303,7 @@ export function Viewer(props: {
     controls.target.set(500, 500, 500);
     controls.update();
 
-    stateRef.current = { renderer, scene, camera, controls, group, axes: null, boundsBox: null, rubber: null, framedKey: null };
+    stateRef.current = { renderer, scene, camera, controls, group, axes: null, boundsBox: null, rubber: null, framedKey: null, overlay: null };
     if (props.viewApiRef) {
       props.viewApiRef.current = {
         getView: () => ({
@@ -226,6 +312,17 @@ export function Viewer(props: {
           up: camera.up.toArray() as [number, number, number],
           fov: camera.fov,
         }),
+        // Overlay geometry counts (spheres = points, arrows = normals) for test assertions.
+        debugCounts: () => {
+          const ov = stateRef.current?.overlay;
+          let spheres = 0;
+          let arrows = 0;
+          ov?.traverse((o) => {
+            if (o instanceof THREE.Mesh && (o.geometry as THREE.BufferGeometry).type === "SphereGeometry") spheres++;
+            if (o instanceof THREE.ArrowHelper) arrows++;
+          });
+          return { spheres, arrows };
+        },
       };
     }
     let raf = 0;
@@ -301,6 +398,34 @@ export function Viewer(props: {
       st.boundsBox = box;
     }
   }, [props.extent, props.showBounds]);
+
+  // Authored points/normals overlay (parametric surfaces). Rebuilt when the data, visibility, sizes,
+  // or the size baseline change; disposed + removed on hide. Mirrors the showBounds idiom.
+  const sizes = props.overlaySizes;
+  useEffect(() => {
+    const st = stateRef.current;
+    if (!st) return;
+    if (st.overlay) {
+      st.scene.remove(st.overlay);
+      disposeOverlay(st.overlay);
+      st.overlay = null;
+    }
+    if (!props.showAuthored || !props.authoredData) return;
+    if (props.authoredData.points.length === 0 && props.authoredData.normals.length === 0) return;
+    // Size baseline = data width / 100 (scale-invariant). Fall back to the model extent when there
+    // are no meshes yet (e.g. authored-but-not-yet-fitted), so the overlay is still sized sanely.
+    const span = dataBox
+      ? Math.max(dataBox.max[0] - dataBox.min[0], dataBox.max[1] - dataBox.min[1], dataBox.max[2] - dataBox.min[2])
+      : Math.max(props.extent[1] - props.extent[0], props.extent[3] - props.extent[2], props.extent[5] - props.extent[4]);
+    const unit = (span || 1) / 100;
+    const overlay = buildAuthoredOverlay(props.authoredData, unit, {
+      point: sizes?.point ?? 1,
+      arrow: sizes?.arrow ?? 1,
+      label: sizes?.label ?? 1,
+    });
+    st.scene.add(overlay);
+    st.overlay = overlay;
+  }, [props.authoredData, props.showAuthored, sizes?.point, sizes?.arrow, sizes?.label, dataBox, props.extent]);
 
   // 2-point BOUNDS DIGITIZATION (feature: draw model bounds). Fires when `drawBounds` is a new
   // object: snap top-down, disable orbit, and capture two ground-plane clicks into a rectangle.

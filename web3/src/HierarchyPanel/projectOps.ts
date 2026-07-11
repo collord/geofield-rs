@@ -136,19 +136,21 @@ export function addSurface(
     };
   }
 
-  // intrusion
+  // intrusion — defaults to a SOLID body (one envelope, the common stock/pluton). The inner
+  // envelope is created but unused until the user switches to shell (ring dike / cored pluton).
   const envelopeInner = emptyInterface("inner envelope");
   const envelopeOuter = emptyInterface("outer envelope");
   const el: ProjectElement = {
     kind: "intrusion",
     id: newId("el"),
     name: `Intrusion ${name}`,
+    mode: "solid",
     envelopeInner,
     envelopeOuter,
   };
   return {
     project: { ...project, elements: [...project.elements, el] },
-    openInterface: { elementId: el.id, interfaceId: envelopeInner.id },
+    openInterface: { elementId: el.id, interfaceId: envelopeOuter.id },
   };
 }
 
@@ -165,6 +167,9 @@ function interfacesOf(el: ProjectElement): { iface: InterfaceData; role: string 
   if (el.kind === "topography") return [{ iface: el.ground, role: `${el.name} · ground` }];
   // importedSurface has no editable InterfaceData (its geometry is the mesh).
   if (el.kind === "importedSurface") return [];
+  // "solid" mode edits only the sole envelope; "shell" exposes both walls.
+  if ((el.mode ?? "shell") === "solid")
+    return [{ iface: el.envelopeOuter, role: `${el.name} · envelope` }];
   return [
     { iface: el.envelopeInner, role: `${el.name} · inner envelope` },
     { iface: el.envelopeOuter, role: `${el.name} · outer envelope` },
@@ -310,6 +315,14 @@ export function setImportExtend(project: Project, elementId: string, extend: boo
   return mapElement(project, elementId, (el) =>
     el.kind === "importedSurface" ? { ...el, extendToBounds: extend } : el,
   );
+}
+
+/** Switch an intrusion between a SOLID body (one envelope — engine `Single`) and a hollow SHELL
+ *  (inner + outer envelope — engine `Shell`). A geometry edit that re-fits: solid compiles the
+ *  outer envelope alone as a single-envelope body; shell compiles both walls as a band. The
+ *  retained inner envelope's authored points survive a round-trip through solid mode. */
+export function setIntrusionMode(project: Project, elementId: string, mode: "solid" | "shell"): Project {
+  return mapElement(project, elementId, (el) => (el.kind === "intrusion" ? { ...el, mode } : el));
 }
 
 // --- unit names (feature 003 §1) — units are DERIVED; only their display name is authored ---

@@ -44,6 +44,8 @@ export interface HierarchyPanelProps {
   onSetImportRole?: (elementId: string, role: "contact" | "erosion" | "veinWall" | "topography") => void;
   /** Toggle projecting an imported surface to the domain bounds (feature 004 US2). */
   onSetImportExtend?: (elementId: string, extend: boolean) => void;
+  /** Switch an intrusion between solid (one envelope) and shell (inner+outer). Geometry edit. */
+  onSetIntrusionMode?: (elementId: string, mode: "solid" | "shell") => void;
   // unit ladder (US2/US3)
   /** Display name for a derived unit: the user's name if set, else "Unit {displayPos}" (the
    *  visual ladder position, 1 = top). The stored name is keyed by the stable `unitIndex`. */
@@ -148,10 +150,12 @@ function ElementNode(props: {
         : el.kind === "topography"
           ? [{ iface: el.ground, surfaceIndex: 0 }]
           : el.kind === "intrusion"
-            ? [
-                { iface: el.envelopeOuter, surfaceIndex: 1 },
-                { iface: el.envelopeInner, surfaceIndex: 0 },
-              ]
+            ? (el.mode ?? "shell") === "solid"
+              ? [{ iface: el.envelopeOuter, surfaceIndex: 0 }]
+              : [
+                  { iface: el.envelopeOuter, surfaceIndex: 1 },
+                  { iface: el.envelopeInner, surfaceIndex: 0 },
+                ]
             : // importedSurface: the geometry IS the mesh (no editable InterfaceData contacts).
               // Its units still render from the derived view; the mesh row is shown separately.
               [];
@@ -233,6 +237,22 @@ function ElementNode(props: {
                 />
                 extend
               </label>
+            )}
+            {el.kind === "intrusion" && (
+              // Solid vs shell (feature: imported mesh surfaces). Solid = one envelope (a filled
+              // stock/pluton). Shell = a hollow-cored body between an inner and outer wall (ring
+              // dike / cored pluton). A geometry edit that re-fits on Apply. Switching to solid
+              // hides the inner envelope but preserves its authored points.
+              <select
+                data-testid="intrusion-mode"
+                value={el.mode ?? "shell"}
+                onChange={(e) => p.onSetIntrusionMode?.(el.id, e.target.value as "solid" | "shell")}
+                aria-label="intrusion mode"
+                title="Solid = a filled body bounded by one envelope. Shell = a hollow-cored body between an inner and outer envelope (ring dike / cored pluton)."
+              >
+                <option value="solid">solid</option>
+                <option value="shell">shell</option>
+              </select>
             )}
             <span
               className={"validation-badge " + (validation?.ok ? "ok" : "warn")}
