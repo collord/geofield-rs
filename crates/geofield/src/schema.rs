@@ -485,9 +485,10 @@ mod tests {
 
     // ===== Feature 003: topography DTO + DerivedView.units =====
 
-    /// A legacy scenario carrying the now-DEPRECATED `unbounded_above` slot still parses,
-    /// either value, without error (§3.2, T014). The flag is accepted-but-ignored — its
-    /// presence in JSON must never be a parse failure for an existing serialized project.
+    /// A serialized scenario carrying the `unbounded_above` slot parses with either value
+    /// without error. The flag is preserved (parsed into the DTO and round-tripped, see the
+    /// derived-view / round-trip tests above) — this pins that neither value is ever a parse
+    /// failure for an existing serialized project.
     #[test]
     fn legacy_unbounded_above_slot_still_parses() {
         for v in ["true", "false"] {

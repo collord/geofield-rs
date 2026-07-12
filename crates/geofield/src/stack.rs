@@ -459,9 +459,12 @@ impl<M: SeriesModel> StackElement<M> {
         }
     }
 
-    /// Axis B (DEPRECATED, inert) — was `true` only for an unbounded-above series. Fill-upward
-    /// is now universal (`docs/topography_lithology_solids_spec.md` §3); nothing in the engine
-    /// branches on this any more. Retained for the legacy `floor()` constructor / tests only.
+    /// Axis B — `true` only for an unbounded-above (floor-like) series: one whose top contact is
+    /// an internal subdivision, so its topmost unit fills upward until a younger element caps it,
+    /// rather than a bounding/erosion contact where the series' rock ends. Load-bearing: both
+    /// [`Stack::global_unit`] (fill-upward short-circuit) and [`Stack::present_unit_count`]
+    /// (keep-vs-drop the top void unit) branch on it. (`docs/topography_lithology_solids_spec.md`
+    /// §3 sketched retiring this in favour of universal fill-upward; that was not carried through.)
     pub fn unbounded_above(&self) -> bool {
         matches!(self, StackElement::Series(s) if s.unbounded_above)
     }
@@ -1448,19 +1451,18 @@ impl<M: SeriesModel + BlockModel> Stack<M> {
     ///     and with it the volume that daylights against that erosion. So an unbounded-above
     ///     series keeps ALL its units → `block_unit_count`.
     ///
-    /// **Fill-upward is now universal** (`docs/topography_lithology_solids_spec.md` §3):
-    /// every series keeps ALL its units, and clipping — younger erosions, cross-cutting
-    /// bodies, and topography (all already applied by [`Stack::clip_maskers`] when the unit
-    /// solid is meshed) — removes the parts that are not rock. The old `unbounded_above`
-    /// branch (drop the top "void" unit for a bounded series) is GONE: that void is no longer
-    /// a per-series property but is supplied by the cap above (topography → Air, or a younger
-    /// element). The floor's long-standing keep-all behaviour is now every series' behaviour;
-    /// the top unit daylights against whatever caps it, exactly as the floor's already did.
+    /// So this function reads `unbounded_above` and drops the top "void" unit for a bounded
+    /// series that has an older element beneath it (see the inline rationale below) — matching
+    /// [`Stack::global_unit`], which likewise gives a bounded series only its below-`iso_top`
+    /// rock and gives an `unbounded_above` series the fill-upward it needs. Clipping of the
+    /// KEPT units (younger erosions, cross-cutting bodies, topography) is applied separately by
+    /// [`Stack::clip_maskers`] when the unit solid is meshed.
     ///
-    /// `unbounded_above` is therefore **inert here** — this function no longer reads it
-    /// (staged deprecation: the slot is retained-but-ignored, §3.2). In a topography-less
-    /// stack a formerly-bounded series' top unit fills to the box ceiling, which is the
-    /// honest "no ground surface defined yet" state.
+    /// (Note: `docs/topography_lithology_solids_spec.md` §3 sketched a "universal fill-upward"
+    /// migration that would retire `unbounded_above` and keep ALL units for every series. That
+    /// migration was NOT carried through — the flag is load-bearing here and in `global_unit`,
+    /// distinguishing an internal subdivision from a true bounding/erosion contact. Do not treat
+    /// the flag as inert.)
     ///
     /// Returns 0 for a field-less block.
     pub fn present_unit_count(&self, i: usize, b: usize) -> usize {
@@ -4388,33 +4390,30 @@ mod tests {
         ])
     }
 
-    /// THE missing-volume regression, now under **universal fill-upward**
-    /// (`docs/topography_lithology_solids_spec.md` §3). Every series keeps ALL its units —
-    /// the floor always did (its topmost unit is the rock slab that daylights against the
-    /// eroding surface), and that keep-all is now every series' behaviour. The old "a bounded
-    /// series drops its topmost void unit" rule is GONE: that void is no longer a per-series
-    /// property but is supplied by the cap above (a younger erosion here; topography in the
-    /// full model). [`Stack::present_unit_count`] therefore equals [`Stack::block_unit_count`]
-    /// for every series, and `unbounded_above` is inert in that decision. The geometric
-    /// guarantee that actually mattered — the floor's top slab meshes with volume and
-    /// daylights ON the erosion contact — is unchanged and still pinned below.
+    /// THE missing-volume regression: the FLOOR keeps ALL its units — its topmost unit is the
+    /// rock slab that daylights against the eroding surface, so [`Stack::present_unit_count`]
+    /// equals [`Stack::block_unit_count`] for an `unbounded_above` series. A BOUNDED series
+    /// beneath a younger element still DROPS its top "void" unit (that void is owned by the
+    /// older element filling upward into it) — so `unbounded_above` is load-bearing in this
+    /// decision, NOT inert. The geometric guarantee that actually matters — the floor's top
+    /// slab meshes with volume and daylights ON the erosion contact — is pinned below.
     #[test]
     fn every_series_keeps_all_units_and_floor_top_daylights() {
         let stack = basement_under_erosion();
         let cfg = OctreeConfig { max_depth: 6, min_depth: 2, qef_threshold: 1e-6, cap: true };
         let ext = [1000.0, 1000.0, 1000.0];
 
-        // Series 1 is the floor (its `unbounded_above` slot is now inert for the unit count,
-        // but still marks the fill-upward series in `global_unit` for a topography-less stack).
-        assert!(stack.series[1].unbounded_above(), "series 1 is the (legacy) fill-upward floor");
+        // Series 1 is the floor: `unbounded_above` makes it keep all units here (below) and
+        // fill upward in `global_unit`.
+        assert!(stack.series[1].unbounded_above(), "series 1 is the fill-upward floor");
         assert_eq!(stack.series[1].relation(), None, "the floor has no Axis-A relation");
 
-        // 3 interfaces ⇒ 4 units; under universal fill-upward EVERY series keeps all units.
+        // 3 interfaces ⇒ 4 units; the unbounded_above floor keeps ALL of them (top unit is rock).
         assert_eq!(stack.block_unit_count(1, 0), 4, "3-contact floor has 4 units");
         assert_eq!(
             stack.present_unit_count(1, 0),
             4,
-            "universal fill-upward: the floor keeps ALL units (top unit is rock, not a void)"
+            "the unbounded_above floor keeps ALL units (top unit is rock, not a void)"
         );
         // The younger Erode series sits over the floor, so its top "void" unit (above its erosion
         // unconformity) belongs to the OLDER floor beneath — not to the erode series. It must be
@@ -4806,17 +4805,20 @@ mod tests {
         );
     }
 
-    // ===== Topography, universal fill-upward, and unit derivation (feature 003) =====
+    // ===== Topography, fill-upward, and unit derivation (feature 003) =====
 
     /// Build a `Topography` element from a flat ground plane at `z = z_ground`.
     fn topography_at(z_ground: f64) -> StackElement<Model> {
         StackElement::Topography(Topography { model: dipping_plane(z_ground, 0.0, 0.0) })
     }
 
-    /// **Inert-flag ORACLE** (`docs/topography_lithology_solids_spec.md` §3.2, SC-009): a
-    /// series with `unbounded_above = false` AND nothing younger capping it still fills
-    /// upward. This pins the NEW universal default (not a self-consistency guard): the flag
-    /// is dead in the keep/drop decision — every series keeps all its units regardless of it.
+    /// A LONE bounded series (`unbounded_above = false`, nothing older beneath it) still keeps
+    /// ALL its units and fills upward. The keep/drop of the top void unit is gated on
+    /// `!unbounded_above && has_older` ([`Stack::present_unit_count`]): with no older element to
+    /// own the void above the top contact, there is nothing to overlap, so the top unit fills to
+    /// the box ceiling — the honest "no ground surface defined yet" state. (This is the
+    /// `has_older == false` arm; the drop itself is pinned by
+    /// `every_series_keeps_all_units_and_floor_top_daylights`.)
     #[test]
     fn bounded_series_with_no_cap_still_fills_upward() {
         // A single "bounded" series (unbounded_above=false), no younger element above it.
@@ -4824,13 +4826,12 @@ mod tests {
         assert!(!bounded.unbounded_above, "fixture: the series is flagged bounded");
         let stack = Stack::new(vec![bounded.into()]);
 
-        // Universal fill-upward: it keeps ALL its units (1 interface ⇒ 2 units), exactly as a
-        // floor would — the flag no longer drops the top unit.
+        // No older element ⇒ no void to drop: it keeps ALL its units (1 interface ⇒ 2 units).
         assert_eq!(stack.block_unit_count(0, 0), 2, "1-contact series has 2 units");
         assert_eq!(
             stack.present_unit_count(0, 0),
             2,
-            "a bounded series with no younger cap keeps ALL units (the flag is inert)"
+            "a lone bounded series (nothing older) keeps ALL units"
         );
     }
 
