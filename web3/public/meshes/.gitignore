@@ -1,0 +1,3 @@
+# Imported .obj meshes are external assets referenced by `objPath` (see README.md); they are
+# placed here per-machine, not committed (a lidar mesh is multi-MB). The dir + README are tracked.
+*.obj

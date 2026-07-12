@@ -25,6 +25,7 @@ import {
   validate,
   exportProjectJson,
   importProjectJson,
+  slimForExport,
   newId,
 } from "./HierarchyPanel/project";
 import {
@@ -394,6 +395,8 @@ function App() {
       __getView?: () => ViewState | undefined;
       __overlayCounts?: () => { spheres: number; arrows: number } | undefined;
       __exactSpikeDigest?: () => Promise<string | undefined>;
+      __slimForExport?: (p: Project) => Project;
+      __importProjectJson?: (jsonText: string) => Promise<Project>;
     };
     w.__reorderContainers = onReorderContainers;
     w.__moveSurface = onMoveSurface;
@@ -404,6 +407,10 @@ function App() {
     // QEF-spike regression spec (e2e/qef-spike.spec.ts). `__getView` reads the current camera
     // (so a viewpoint can be grabbed/asserted, and shared for repro).
     w.__loadProject = loadFreshProject;
+    // Externalized-mesh round-trip hooks (e2e/mesh-path-roundtrip.spec.ts): slim a project for export
+    // and re-load a slim JSON (re-fetching path-only meshes). Harmless in the demo.
+    w.__slimForExport = slimForExport;
+    w.__importProjectJson = (jsonText: string) => importProjectJson(new File([jsonText], "rt.geoproj.json"));
     w.__surfaces = surfaces;
     w.__getView = () => viewApiRef.current?.getView();
     // Stage 0 exact-corefiner determinism gate (e2e/exact-determinism.spec.ts, docs/12 §2.3). Runs
@@ -500,6 +507,10 @@ function App() {
         role: "contact" as const,
         relation: "conformable" as const,
         objText,
+        // Record an external reference so EXPORT can drop the (often multi-MB) inline `objText` and
+        // the loader re-fetches from `public/meshes/<file>`. The user places the .obj there; the live
+        // session still uses the `objText` just read, so import works with no server round-trip.
+        objPath: `meshes/${file.name}`,
         extendToBounds: false, // footprint-only by default (no extrapolation)
       };
       commit({ ...project, elements: [el, ...project.elements] });

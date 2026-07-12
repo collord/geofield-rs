@@ -114,16 +114,24 @@ export type ProjectElement =
       ground: InterfaceData;
     }
   | {
-      // An IMPORTED mesh surface (feature 004). It carries the `.obj` TEXT (round-trips in the
-      // project JSON) and its role; the engine parses + fits a field through the mesh. For a
-      // contact/erosion role it also carries the Axis-A relation bit. No authored interfaces —
-      // the geometry IS the mesh.
+      // An IMPORTED mesh surface (feature 004). It carries the `.obj` TEXT and its role; the engine
+      // parses + fits a field through the mesh. For a contact/erosion role it also carries the Axis-A
+      // relation bit. No authored interfaces — the geometry IS the mesh.
       kind: "importedSurface";
       id: string;
       name: string;
       role: "contact" | "erosion" | "veinWall" | "topography";
       relation: "erode" | "onlap" | "conformable";
-      objText: string; // the imported .obj file contents
+      /** The `.obj` file contents. Always present in the LIVE project (needed to fit) and in
+       *  localStorage autosave. On EXPORT it is dropped when `objPath` is set (a lidar mesh is ~MBs);
+       *  the loader re-hydrates it by fetching `objPath`. May be "" transiently between load and
+       *  hydration for a path-only imported file. */
+      objText: string;
+      /** OPTIONAL external reference: a path under the app's static `meshes/` dir (e.g.
+       *  `meshes/lidar.obj`), fetched at `/<objPath>`. When present, EXPORT omits `objText` and the
+       *  loader re-fetches from here — so a big mesh lives as a file, not inline JSON. Absent for a
+       *  mesh with no external copy (then `objText` is the only source and always round-trips). */
+      objPath?: string;
       /** Extend the surface smoothly to the domain box beyond its footprint (US2). Default false. */
       extendToBounds: boolean;
     };
@@ -506,9 +514,22 @@ export function loadProject(): Project | null {
   }
 }
 
+/** Slim a project for EXPORT: for any imported surface with an external `objPath`, drop the inline
+ *  `objText` (the mesh lives as a file under `public/meshes/`; the loader re-fetches it). A mesh with
+ *  NO `objPath` keeps its `objText` so it still round-trips self-contained. Purely for serialization —
+ *  the in-memory / autosaved project is never slimmed (it needs `objText` to fit without a fetch). */
+export function slimForExport(p: Project): Project {
+  return {
+    ...p,
+    elements: p.elements.map((el) =>
+      el.kind === "importedSurface" && el.objPath ? { ...el, objText: "" } : el,
+    ),
+  };
+}
+
 /** Download the project as `<name>.geoproj.json` (the demo's portable "save file"). */
 export function exportProjectJson(p: Project): void {
-  const blob = new Blob([JSON.stringify(p, null, 2)], { type: "application/json" });
+  const blob = new Blob([JSON.stringify(slimForExport(p), null, 2)], { type: "application/json" });
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;
@@ -519,14 +540,41 @@ export function exportProjectJson(p: Project): void {
   URL.revokeObjectURL(url);
 }
 
-/** Parse a `.geoproj.json` File back into a Project. Caller confirms-if-dirty before use. */
+/** Parse a `.geoproj.json` File back into a Project. Caller confirms-if-dirty before use. Any imported
+ *  surface exported path-only (has `objPath`, empty `objText`) is RE-HYDRATED by fetching the mesh from
+ *  the static `meshes/` dir — so a slimmed export is restored to a fittable project. A missing file
+ *  throws with the offending path, so a broken reference is a clear error, not a silent blank render. */
 export async function importProjectJson(file: File): Promise<Project> {
   const text = await file.text();
   const p = JSON.parse(text) as Project;
   if (p.version !== 1 || !Array.isArray(p.elements)) {
     throw new Error("not a valid .geoproj.json (version 1) file");
   }
-  return p;
+  return hydrateMeshPaths(p);
+}
+
+/** Fetch `objText` for any imported surface that carries an `objPath` but no inline text (a slimmed
+ *  export). Resolved against the app's base URL (`meshes/<file>` → `<base>meshes/<file>`). */
+export async function hydrateMeshPaths(p: Project): Promise<Project> {
+  const base = (import.meta as { env?: { BASE_URL?: string } }).env?.BASE_URL ?? "/";
+  const elements = await Promise.all(
+    p.elements.map(async (el) => {
+      if (el.kind !== "importedSurface" || !el.objPath || (el.objText && el.objText.length > 0)) {
+        return el;
+      }
+      const url = base.replace(/\/$/, "") + "/" + el.objPath.replace(/^\//, "");
+      const res = await fetch(url).catch(() => null);
+      const ct = res?.headers.get("content-type") ?? "";
+      // A dev/preview SPA server answers unknown routes with index.html (200 OK) — so a MISSING mesh
+      // must be caught by content, not just status: reject an HTML body or one with no OBJ vertices.
+      const body = res && res.ok ? await res.text() : null;
+      if (body == null || ct.includes("text/html") || !/^\s*v\s/m.test(body)) {
+        throw new Error(`mesh not found for "${el.name}": ${el.objPath} (expected an .obj under public/${el.objPath})`);
+      }
+      return { ...el, objText: body };
+    }),
+  );
+  return { ...p, elements };
 }
 
 // ============================================================================
