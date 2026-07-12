@@ -7,7 +7,7 @@
 // The dipping-plane / multi-bed-floor geology is preserved so a seeded template fits to a
 // meaningful picture — the round-trip anchor in quickstart.md.
 
-import type { InterfaceData, Project, ProjectElement } from "./HierarchyPanel/project";
+import type { InterfaceData, OrientationRow, Project, ProjectElement } from "./HierarchyPanel/project";
 import { newId } from "./HierarchyPanel/project";
 
 export interface Template {
@@ -151,6 +151,37 @@ function curvedContactFloor(): ProjectElement {
   };
 }
 
+/** A near-CLOSED spherical envelope for a SOLID intrusion: `count` points sampled on a sphere of
+ *  `radius` about `center`, each carrying an OUTWARD orientation (dip/dipDir from the radial pole),
+ *  so the co-kriged field's `field < iso` interior is the blob. A single-envelope (solid) intrusion
+ *  reads this as its sole bounding surface. A Fibonacci lattice gives an even, deterministic spread. */
+function sphereEnvelope(
+  name: string,
+  center: { x: number; y: number; z: number },
+  radius: number,
+  count = 24,
+): InterfaceData {
+  const points: { x: number; y: number; z: number }[] = [];
+  const orientations: OrientationRow[] = [];
+  const golden = Math.PI * (3 - Math.sqrt(5)); // ~2.399963 rad
+  for (let i = 0; i < count; i++) {
+    const w = 1 - (2 * i + 1) / count; // z in (−1, 1), centred
+    const r = Math.sqrt(Math.max(0, 1 - w * w));
+    const theta = golden * i;
+    const nx = Math.cos(theta) * r;
+    const ny = Math.sin(theta) * r;
+    const nz = w;
+    const p = { x: center.x + radius * nx, y: center.y + radius * ny, z: center.z + radius * nz };
+    points.push(p);
+    // Outward radial pole (nx,ny,nz) → dip off vertical, dipDir clockwise from +Y.
+    const dip = (Math.acos(Math.max(-1, Math.min(1, nz))) * 180) / Math.PI;
+    let dipDir = (Math.atan2(nx, ny) * 180) / Math.PI;
+    if (dipDir < 0) dipDir += 360;
+    orientations.push({ x: p.x, y: p.y, z: p.z, dip, dipDir });
+  }
+  return { id: newId("iface"), name, points, orientations };
+}
+
 export const TEMPLATES: Template[] = [
   {
     id: "blank",
@@ -214,6 +245,107 @@ export const TEMPLATES: Template[] = [
       ],
       extent: EXTENT,
     }),
+  },
+  {
+    id: "combined-geohistory",
+    name: "Combined geo-history",
+    description:
+      "The full story in one model: a 3-bed conformable stack, a solid intrusion punched through it, an oblique erosion surface truncating the top, a fresh bed deposited on that unconformity, and a near-vertical vein cutting across everything. Toggle to Solids to see the units; 'manifold' seals the vein↔rock seam.",
+    build: () => {
+      // Element order is YOUNGEST FIRST (matches add_* order). The vein (cross-cutter) is youngest,
+      // then the post-erosion cover package, the intrusion, and the basal stack oldest.
+      const stack: ProjectElement = {
+        kind: "series",
+        id: newId("el"),
+        name: "basal strata",
+        relation: "conformable",
+        unboundedAbove: true,
+        // A tight 3-bed stack low in the box, leaving headroom for the erosion (~600) and the
+        // post-erosion cover package above it.
+        interfaces: [
+          dippingInterface("bed 1", 200, 0, 0),
+          dippingInterface("bed 2", 320, 0, 0),
+          dippingInterface("bed 3", 440, 0, 0),
+        ],
+      };
+      const intrusion: ProjectElement = {
+        kind: "intrusion",
+        id: newId("el"),
+        name: "stock",
+        mode: "solid",
+        // Solid mode: `envelopeOuter` is the sole bounding surface; `envelopeInner` is retained but
+        // unused (we point it at the same sphere so the data is well-formed if toggled to shell).
+        envelopeInner: sphereEnvelope("core (unused in solid)", { x: 480, y: 500, z: 380 }, 175),
+        envelopeOuter: sphereEnvelope("envelope", { x: 480, y: 500, z: 380 }, 175),
+      };
+      // The post-erosion package: an ERODE series whose LOWER interface is the oblique unconformity
+      // (truncating everything below) and whose UPPER interface is a bed WITHIN the new deposits — so
+      // "a layer deposited above the erosional contact" is a visible second unit, not a separate
+      // element. `erode` already implies deposit-above (the package fills UP from the unconformity).
+      const erosion: ProjectElement = {
+        kind: "series",
+        id: newId("el"),
+        name: "post-erosion cover",
+        relation: "erode",
+        // The `erode` relation already fills upward to the box ceiling (it negates the fit pole,
+        // so the field increases upward and `present_at` is an upward-unbounded half-space above
+        // the erosion surface — see project.ts flattenInterfaces). Authoring `unboundedAbove: true`
+        // here would additionally trip global_unit's fill-upward short-circuit and make the cover
+        // claim BELOW its own unconformity, burying the older basal stack. Bounded, like the
+        // validated `erosional-unconformity` scenario.
+        unboundedAbove: false,
+        interfaces: [
+          dippingInterface("erosion surface", 600, 0.35, 0), // the unconformity (oblique)
+          dippingInterface("cover bed", 800, 0.1, 0), // a bed within the cover, gently dipping
+        ],
+      };
+      const vein: ProjectElement = {
+        kind: "vein",
+        id: newId("el"),
+        name: "late vein",
+        // Near-vertical, slightly dipping so it's oblique to the grid (the robust cross-cut case).
+        footWall: dippingWall("foot wall", 470, 0.12),
+        hangingWall: dippingWall("hanging wall", 560, 0.12),
+      };
+
+      // Bake a lithology catalog so the demo renders with distinct colours out of the box (unassigned
+      // units render grey "Unknown"). Keys are `${elementId}:${unitIndex}`; the basal stack's 4 units
+      // are the 3 beds + its truncated top, the cover + intrusion + vein each one body unit.
+      const litho = (id: string, name: string, color: string) =>
+        ({ id, name, color, kind: "user" as const });
+      const catalog = {
+        lithologies: [
+          { id: "air", name: "Air", color: "#ffffff", kind: "air" as const },
+          { id: "unknown", name: "Unknown", color: "#c8c8cd", kind: "unknown" as const },
+          litho("l-ss", "Sandstone", "#d9b06a"),
+          litho("l-sh", "Shale", "#6f7d55"),
+          litho("l-ls", "Limestone", "#9fb1c4"),
+          litho("l-base", "Basement", "#7a6b5d"),
+          litho("l-int", "Granite (stock)", "#c0554e"),
+          litho("l-cov", "Cover sand", "#e6d18a"),
+          litho("l-cov2", "Cover marl", "#b7c99a"),
+          litho("l-vein", "Quartz vein", "#8a63b8"),
+        ],
+        assignment: {
+          [`${stack.id}:0`]: "l-base", // below bed 1
+          [`${stack.id}:1`]: "l-ss", //   bed 1 → bed 2
+          [`${stack.id}:2`]: "l-sh", //   bed 2 → bed 3
+          [`${stack.id}:3`]: "l-ls", //   bed 3 → erosion (truncated top)
+          [`${intrusion.id}:0`]: "l-int",
+          [`${erosion.id}:0`]: "l-cov", //  unconformity → cover bed (lower post-erosion unit)
+          [`${erosion.id}:1`]: "l-cov2", // cover bed → top (upper post-erosion unit)
+          [`${vein.id}:0`]: "l-vein",
+        } as Record<string, string>,
+      };
+
+      return {
+        version: 1,
+        name: "combined-geohistory",
+        extent: EXTENT,
+        elements: [vein, erosion, intrusion, stack],
+        catalog,
+      };
+    },
   },
   {
     id: "cross-cutting-vein-dipping",
