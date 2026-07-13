@@ -1,0 +1,18 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "if": "Bash(*playwright test*)",
+            "command": "bash \"$CLAUDE_PROJECT_DIR/web3/scripts/prebuild-for-e2e.sh\" >&2",
+            "timeout": 600,
+            "statusMessage": "Rebuilding web3 bundle before e2e…"
+          }
+        ]
+      }
+    ]
+  }
+}
