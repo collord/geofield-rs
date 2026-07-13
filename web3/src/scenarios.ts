@@ -348,6 +348,66 @@ export const TEMPLATES: Template[] = [
     },
   },
   {
+    id: "erosion-over-stack",
+    name: "Erosion over conformal stack — repro",
+    description:
+      "DIAGNOSTIC: a 2-unit ERODE cover over a 3-bed conformal stack, no cross-cutting bodies. Isolates the multi-interface-erode-over-conformal-stack composition: the basal stack's top unit (Limestone) MUST truncate at the erosion contact and NOT reach the model top; the cover's two units sit ABOVE it. If Limestone daylights above the erosion, the erode-clip of an older conformal series' TOP unit is the bug.",
+    build: () => {
+      const stack: ProjectElement = {
+        kind: "series",
+        id: newId("el"),
+        name: "basal strata",
+        relation: "conformable",
+        unboundedAbove: true,
+        interfaces: [
+          dippingInterface("bed 1", 200, 0, 0),
+          dippingInterface("bed 2", 320, 0, 0),
+          dippingInterface("bed 3", 440, 0, 0),
+        ],
+      };
+      const erosion: ProjectElement = {
+        kind: "series",
+        id: newId("el"),
+        name: "post-erosion cover",
+        relation: "erode",
+        unboundedAbove: false,
+        interfaces: [
+          dippingInterface("erosion surface", 600, 0.35, 0),
+          dippingInterface("cover bed", 800, 0.1, 0),
+        ],
+      };
+      const litho = (id: string, name: string, color: string) =>
+        ({ id, name, color, kind: "user" as const });
+      const catalog = {
+        lithologies: [
+          { id: "air", name: "Air", color: "#ffffff", kind: "air" as const },
+          { id: "unknown", name: "Unknown", color: "#c8c8cd", kind: "unknown" as const },
+          litho("l-ss", "Sandstone", "#d9b06a"),
+          litho("l-sh", "Shale", "#6f7d55"),
+          litho("l-ls", "Limestone", "#9fb1c4"),
+          litho("l-base", "Basement", "#7a6b5d"),
+          litho("l-cov", "Cover sand", "#e6d18a"),
+          litho("l-cov2", "Cover marl", "#b7c99a"),
+        ],
+        assignment: {
+          [`${stack.id}:0`]: "l-base",
+          [`${stack.id}:1`]: "l-ss",
+          [`${stack.id}:2`]: "l-sh",
+          [`${stack.id}:3`]: "l-ls",
+          [`${erosion.id}:0`]: "l-cov",
+          [`${erosion.id}:1`]: "l-cov2",
+        } as Record<string, string>,
+      };
+      return {
+        version: 1,
+        name: "erosion-over-stack",
+        extent: EXTENT,
+        elements: [erosion, stack],
+        catalog,
+      };
+    },
+  },
+  {
     id: "cross-cutting-vein-dipping",
     name: "Cross-cutting vein (dipping) — repro",
     description:
