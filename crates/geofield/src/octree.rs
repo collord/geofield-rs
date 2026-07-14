@@ -1260,6 +1260,44 @@ impl ScalarField for MeshLocalField<'_> {
     }
 }
 
+/// A [`Boundary`] half-space of an imported mesh's EXACT surface (zero set of its local signed
+/// distance), keeping the `sdf < 0` (below) side when `below`, else the `sdf > 0` (above) side.
+/// Owns a [`MeshLocalField`] (a thin `&TriMesh` borrow) so the boundary is self-contained — the
+/// mesh-SDF equivalent of [`ContactHalfSpace`], used to truncate older elements at an imported
+/// erosion without going through a fitted field.
+pub struct MeshHalfSpace<'a> {
+    field: MeshLocalField<'a>,
+    below: bool,
+}
+
+impl<'a> MeshHalfSpace<'a> {
+    pub fn new(mesh: &'a TriMesh, below: bool) -> Self {
+        Self { field: MeshLocalField::new(mesh), below }
+    }
+}
+
+impl Boundary for MeshHalfSpace<'_> {
+    fn inside(&self, p: [f64; 3]) -> bool {
+        let f = self.field.scalar_field(p);
+        if self.below { f < 0.0 } else { f > 0.0 }
+    }
+
+    fn edge_crossing(&self, a: [f64; 3], b: [f64; 3]) -> Option<([f64; 3], [f64; 3])> {
+        let fa = self.field.scalar_field(a);
+        let fb = self.field.scalar_field(b);
+        if (fa < 0.0) == (fb < 0.0) {
+            return None;
+        }
+        let t = fa / (fa - fb);
+        let p = [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
+        Some((p, normalize(self.field.scalar_field_gradient(p))))
+    }
+
+    fn surface_normal(&self, p: [f64; 3]) -> Option<[f64; 3]> {
+        Some(normalize(self.field.scalar_field_gradient(p)))
+    }
+}
+
 /// The STITCHED exact-inside / smooth-outside field for an imported surface projected to the domain
 /// boundary (feature 004 US2). Inside the mesh's xy footprint it is the signed distance to the EXACT
 /// mesh (as [`MeshSignedField`]); OUTSIDE it is the signed distance to the SMOOTH co-kriged surface

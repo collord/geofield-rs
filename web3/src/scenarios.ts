@@ -408,6 +408,67 @@ export const TEMPLATES: Template[] = [
     },
   },
   {
+    id: "erosion-over-stack-imported",
+    name: "Erosion over stack (imported meshes)",
+    description:
+      "The SAME geology as 'Erosion over conformal stack' — a 2-unit erode cover over a 3-bed conformal stack — but every surface is an IMPORTED ~100k-vertex .obj mesh (value-noise-perturbed) instead of a fitted parametric surface. Exercises feature-004 role parity (contact + erosion roles, erode/conformable relations) against realistic irregular surfaces. Meshes live under public/meshes/ (regenerate with gen_erosion_meshes.rs); the erosion surface must still truncate the beds below it.",
+    build: () => {
+      const litho = (id: string, name: string, color: string) =>
+        ({ id, name, color, kind: "user" as const });
+      // Each surface is an importedSurface referencing an .obj by path; objText is hydrated on
+      // seed (main.tsx onSeed → hydrateMeshPaths). Order is youngest-first, mirroring the
+      // parametric template: cover bed, erosion surface, then the three basal beds.
+      const imported = (
+        name: string,
+        file: string,
+        role: "contact" | "erosion",
+        relation: "erode" | "conformable",
+      ) => ({
+        kind: "importedSurface" as const,
+        id: newId("el"),
+        name,
+        role,
+        relation,
+        objText: "",
+        objPath: `meshes/${file}`,
+        // Meshes already span the full [0,1000]² footprint — no smooth extrapolation needed.
+        extendToBounds: false,
+      });
+      const cover = imported("cover bed", "erosion-stack-cover.obj", "contact", "conformable");
+      const erosion = imported("erosion surface", "erosion-stack-erosion.obj", "erosion", "erode");
+      const bed3 = imported("bed 3", "erosion-stack-bed3.obj", "contact", "conformable");
+      const bed2 = imported("bed 2", "erosion-stack-bed2.obj", "contact", "conformable");
+      const bed1 = imported("bed 1", "erosion-stack-bed1.obj", "contact", "conformable");
+      const catalog = {
+        lithologies: [
+          { id: "air", name: "Air", color: "#ffffff", kind: "air" as const },
+          { id: "unknown", name: "Unknown", color: "#c8c8cd", kind: "unknown" as const },
+          litho("l-ss", "Sandstone", "#d9b06a"),
+          litho("l-sh", "Shale", "#6f7d55"),
+          litho("l-ls", "Limestone", "#9fb1c4"),
+          litho("l-base", "Basement", "#7a6b5d"),
+          litho("l-cov", "Cover sand", "#e6d18a"),
+          litho("l-cov2", "Cover marl", "#b7c99a"),
+        ],
+        // Each imported contact has one unit (index 0) — the rock BELOW its surface.
+        assignment: {
+          [`${bed1.id}:0`]: "l-base",
+          [`${bed2.id}:0`]: "l-ss",
+          [`${bed3.id}:0`]: "l-sh",
+          [`${erosion.id}:0`]: "l-cov",
+          [`${cover.id}:0`]: "l-cov2",
+        } as Record<string, string>,
+      };
+      return {
+        version: 1,
+        name: "erosion-over-stack-imported",
+        extent: EXTENT,
+        elements: [cover, erosion, bed3, bed2, bed1],
+        catalog,
+      };
+    },
+  },
+  {
     id: "cross-cutting-vein-dipping",
     name: "Cross-cutting vein (dipping) — repro",
     description:

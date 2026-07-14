@@ -5,6 +5,10 @@ import { defineConfig, devices } from "@playwright/test";
 // (assumes `npm run wasm && npm run build` have produced dist/ + the wasm artifacts).
 export default defineConfig({
   testDir: "./e2e",
+  // `*.manual.spec.ts` are heavy diagnostic harnesses (e.g. dump-volumes: dumps ~100 MB of
+  // booleaned solids for the native partition test). They are NOT part of the functional gate —
+  // run one explicitly by name (`playwright test dump-volumes.manual`).
+  testIgnore: "**/*.manual.spec.ts",
   fullyParallel: true,
   forbidOnly: !!process.env.CI,
   retries: 0,

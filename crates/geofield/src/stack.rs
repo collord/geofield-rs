@@ -81,7 +81,7 @@ use crate::mesh::Mesh;
 use crate::mesh_clip::{clip, ClipMesh, Keep};
 use crate::octree::{
     octree_dual_contour_scene, octree_dual_contour_shared, AxisBox, Boundary, ContactHalfSpace,
-    OctreeConfig, PlaneHalfSpace, Scene, SlabComplement, StitchedField, TriMesh,
+    MeshHalfSpace, OctreeConfig, PlaneHalfSpace, Scene, SlabComplement, StitchedField, TriMesh,
 };
 use crate::{clip_mesh_to_half_spaces, max_abs_field_in_box, BlockModel, ScalarField, SeriesModel};
 
@@ -502,22 +502,31 @@ pub struct SeriesMeshes {
 /// COMPLEMENT of a band (`SlabExterior`) — "outside the slab", a union the older
 /// [`SlabComplement`] boundary expresses directly (ANDing two half-spaces would instead
 /// keep the older surface INSIDE the band — the inverted-clip bug this type replaces).
-enum Masker<F> {
+enum Masker<'a, F> {
     /// Keep the older surface on one side of a contact: `field < iso` if `below`, else
     /// `field > iso`. (Erode top = `below=false`; intrusion-single exterior = `below=false`.)
     Halfspace { field: F, iso: f64, below: bool },
     /// Keep the older surface OUTSIDE the band `[lo, hi]` (`field < lo || field > hi`).
     /// (Vein / shell intrusion.)
     SlabExterior { field: F, lo: f64, hi: f64 },
+    /// Keep the older surface on one side of an IMPORTED mesh's EXACT surface, using the mesh's
+    /// local signed distance ([`MeshLocalField`], zero-set = the mesh exactly) rather than a fitted
+    /// field. `below=true` keeps the `sdf < 0` (below the sheet) side. Used by the imported-erosion
+    /// role so its truncation honors the mesh EXACTLY (feature 004's principle) and does not depend
+    /// on a decimated single-surface krige, whose level set can drift far from the sheet and wrongly
+    /// engulf older rock that lies wholly below the erosion.
+    MeshHalfspace { mesh: &'a TriMesh, below: bool },
 }
 
-impl<F: ScalarField> Masker<F> {
+impl<F: ScalarField> Masker<'_, F> {
     /// Borrow this masker as a [`Boundary`] contributor (ANDed into the older element's
     /// Scene). `Box<dyn>` so both half-space and slab-complement kinds unify.
     fn boundary(&self) -> Box<dyn Boundary + '_> {
         match self {
             Masker::Halfspace { field, iso, below } => Box::new(ContactHalfSpace::new(field, *iso, *below)),
             Masker::SlabExterior { field, lo, hi } => Box::new(SlabComplement::new(field, *lo, *hi)),
+            // The mesh SDF's zero set is the surface; `below` selects the surviving side.
+            Masker::MeshHalfspace { mesh, below } => Box::new(MeshHalfSpace::new(mesh, *below)),
         }
     }
 }
@@ -611,7 +620,7 @@ impl<M: SeriesModel> Stack<M> {
     ///
     /// The owned fields live in the returned [`Masker`]s so the borrowed boundaries (built via
     /// [`Masker::boundary`]) outlive them.
-    fn clip_maskers(&self, i: usize) -> Vec<Masker<M::Field<'_>>> {
+    fn clip_maskers(&self, i: usize) -> Vec<Masker<'_, M::Field<'_>>> {
         self.clip_maskers_filtered(i, true)
     }
 
@@ -619,11 +628,11 @@ impl<M: SeriesModel> Stack<M> {
     /// path ([`Self::mesh_one_erode_clipped`]), which closes the erode seam by mesh–mesh clip instead,
     /// so the erode masker must NOT also field-clip the contact (that would end it short of the
     /// surface and leave nothing for `clip` to trim). Veins/intrusions/topography/onlap still apply.
-    fn clip_maskers_excluding_erode(&self, i: usize) -> Vec<Masker<M::Field<'_>>> {
+    fn clip_maskers_excluding_erode(&self, i: usize) -> Vec<Masker<'_, M::Field<'_>>> {
         self.clip_maskers_filtered(i, false)
     }
 
-    fn clip_maskers_filtered(&self, i: usize, include_erode: bool) -> Vec<Masker<M::Field<'_>>> {
+    fn clip_maskers_filtered(&self, i: usize, include_erode: bool) -> Vec<Masker<'_, M::Field<'_>>> {
         let mut out = Vec::new();
         // (1) Younger bodies clipping element `i` (topography / erode / vein / intrusion).
         for ej in &self.series[..i] {
@@ -679,18 +688,21 @@ impl<M: SeriesModel> Stack<M> {
                 //                 above, like the fitted topography.
                 //   * Contact (conformable) contributes NO clip; a VeinWall role is a documented
                 //                 seam (a single imported sheet is not a band).
+                // An imported surface truncates older elements via its EXACT mesh (local signed
+                // distance, zero-set = the sheet), NOT its fitted field — the field is a decimated
+                // single-surface krige whose level set can drift far from the mesh and wrongly clip
+                // older rock that lies wholly on one side (feature 004: honor the mesh exactly). Rock
+                // survives BELOW the surface (`sdf < 0`) for BOTH the erode and topography roles:
+                //   * Erosion   → older rock is preserved below the unconformity, cover fills above.
+                //   * Topography→ the model caps to Air above the ground; older survives below it.
                 StackElement::ImportedSurface(im) => match im.role {
                     ImportRole::Erosion => {
                         if include_erode {
-                            if let Some(iso) = im.iso() {
-                                out.push(Masker::Halfspace { field: im.model.field(), iso, below: false });
-                            }
+                            out.push(Masker::MeshHalfspace { mesh: &im.mesh, below: true });
                         }
                     }
                     ImportRole::Topography => {
-                        if let Some(iso) = im.iso() {
-                            out.push(Masker::Halfspace { field: im.model.field(), iso, below: true });
-                        }
+                        out.push(Masker::MeshHalfspace { mesh: &im.mesh, below: true });
                     }
                     ImportRole::Contact | ImportRole::VeinWall => {}
                 },
@@ -2140,11 +2152,57 @@ impl<M: SeriesModel + BlockModel> Stack<M> {
                     below_solid(&field, iso, min, size, ext_max, cfg),
                 ),
                 Masker::SlabExterior { field, lo, hi } => (2u32, band_solid(&field, lo, hi, min, size, ext_max, cfg)),
+                // Clip older elements at an imported EROSION/topography using the mesh's OWN sealed
+                // below-prism — the SAME `close_sheet_below` primitive that meshes the surface's base
+                // geometry, so it is watertight and Manifold-ingestible (a fresh mesh-SDF contour over
+                // the full box is native-watertight by edge count but Manifold rejects it as non-
+                // manifold, dropping every older unit that references it). `below=true` keeps older
+                // rock BELOW the surface → Intersect (kind 1) with that below-prism.
+                Masker::MeshHalfspace { mesh, below } => {
+                    let cell = size / (1u32 << cfg.max_depth.max(1)) as f64;
+                    let floor = min[2] - cell * 3.0;
+                    match mesh.close_sheet_below(floor) {
+                        Some(prim) => (if below { 1u32 } else { 2u32 }, prim),
+                        None => continue, // degenerate sheet — no clip contributed
+                    }
+                }
             };
             out.push((0, 0, 0, 255, id, mesh));
             refs.push((kind, id));
         }
         refs
+    }
+
+    /// The below-prism of the nearest OLDER imported CONTACT beneath a conformable imported contact
+    /// at `i`, as a fresh subtract primitive — or `None` if there is no such sibling.
+    ///
+    /// Independent imported contacts each emit a full-height below-prism (down to a floor under the
+    /// domain); with no subtraction they OVERLAP (each spans the whole column below its own surface),
+    /// so a conformable stack of imported meshes renders as interpenetrating prisms, not slabs. A
+    /// conformable series solves this by slab-differencing WITHIN one field (`below(iso_u) −
+    /// below(iso_{u-1})`, above); imported contacts are separate elements, so we mirror it here by
+    /// subtracting the next-older imported contact's own below-prism — turning `below(this)` into the
+    /// slab between the two surfaces. Only conformable/contact siblings count: an erosion surface
+    /// truncates via its clip masker instead, and a cross-cut body is not a stacking floor.
+    fn older_imported_contact_prism(
+        &self,
+        i: usize,
+        min: [f64; 3],
+        size: f64,
+        cfg: OctreeConfig,
+    ) -> Option<Mesh> {
+        for j in (i + 1)..self.series.len() {
+            if let StackElement::ImportedSurface(older) = &self.series[j] {
+                // Skip vein-wall / erosion roles: only a stratigraphic contact forms the slab floor.
+                if older.role != ImportRole::Contact && older.role != ImportRole::Erosion {
+                    continue;
+                }
+                let cell = size / (1u32 << cfg.max_depth.max(1)) as f64;
+                let floor = min[2] - cell * 3.0;
+                return older.mesh.close_sheet_below(floor);
+            }
+        }
+        None
     }
 
     /// THE unified volume mesher: a boolean RECIPE over single-level-set PRIMITIVES that the boolean
@@ -2265,15 +2323,35 @@ impl<M: SeriesModel + BlockModel> Stack<M> {
                         prim
                     };
                     out.push((0, 0, 0, 255, bid, prim));
+                    // Each imported surface owns the SLAB between itself and the next-OLDER imported
+                    // surface below it: `below(this) − below(next-older)`. Without this every surface's
+                    // below-prism runs to the domain floor and they OVERLAP as nested full-height
+                    // columns (the reported bug — a 3D-grid partition test found 60% of interior points
+                    // inside ≥2 volumes). This applies to a CONTACT and an EROSION surface alike (an
+                    // erosion's below-rock is the cover unit deposited on the unconformity — still a
+                    // slab bounded below by the next-older contact); the erode CLIP (clip_refs) then
+                    // additionally truncates OLDER surfaces where the erosion cut into them.
+                    let slab_floor_id = self.older_imported_contact_prism(i, min, size, cfg).map(|floor_prim| {
+                        let id = next_id;
+                        next_id += 1;
+                        out.push((0, 0, 0, 255, id, floor_prim));
+                        id
+                    });
                     let clip_refs = self.emit_clip_defs(&mut out, &mut next_id, i, min, size, ext_max, cfg);
-                    // Below-the-contact unit (0) is always rock; the ABOVE unit (1) is the void owned
-                    // by a younger element / Air — dropped when an older element lies beneath, exactly
-                    // as `present_unit_count` drops a bounded series' top void unit.
+                    // Unit 0 is the below-rock SLAB. The ABOVE unit (1, void → Air) is emitted ONLY for
+                    // a LONE imported surface (no younger AND no older): in a stack, the space above a
+                    // surface is owned by the YOUNGER surfaces' slabs, so an above-void there would
+                    // overlap every one of them (it did — bed1's above-void spanned the whole column).
                     let has_older = i + 1 < self.series.len();
-                    let n_units = if has_older { 1 } else { 2 };
+                    let has_younger = i > 0;
+                    let n_units = if !has_older && !has_younger { 2 } else { 1 };
                     for u in 0..n_units {
                         if u == 0 {
                             out.push((i, 0, 0, 0, bid, Mesh::default())); // Base = below(mesh)
+                            // − below(older imported surface) → the slab between the two surfaces.
+                            if let Some(fid) = slab_floor_id {
+                                out.push((i, 0, 0, 2, fid, Mesh::default()));
+                            }
                         } else {
                             out.push((i, 0, 1, 3, 0, Mesh::default())); // BaseBox (top fill unit)
                             out.push((i, 0, 1, 2, bid, Mesh::default())); // − below(mesh)

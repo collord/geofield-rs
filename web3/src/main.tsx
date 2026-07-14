@@ -25,6 +25,7 @@ import {
   validate,
   exportProjectJson,
   importProjectJson,
+  hydrateMeshPaths,
   slimForExport,
   newId,
 } from "./HierarchyPanel/project";
@@ -465,9 +466,17 @@ function App() {
   }
   const onNew = () => confirmIfDirty(() => loadFreshProject(blankProject()));
   const onSeed = (templateId: string) =>
-    confirmIfDirty(() => {
+    confirmIfDirty(async () => {
       const t = templateById(templateId);
-      if (t) loadFreshProject(t.build());
+      if (!t) return;
+      try {
+        // Hydrate any imported-surface `objPath` refs (e.g. the imported-mesh template) by
+        // fetching the .obj from public/meshes/ — the same step importProjectJson runs. A
+        // template with no mesh refs is returned unchanged.
+        loadFreshProject(await hydrateMeshPaths(t.build()));
+      } catch (err) {
+        setStatus("seed failed: " + (err instanceof Error ? err.message : String(err)));
+      }
     });
   const onExport = () => {
     const cam = viewApiRef.current?.getView();
