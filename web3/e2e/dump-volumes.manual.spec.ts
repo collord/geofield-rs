@@ -6,12 +6,16 @@ import { test, expect } from "@playwright/test";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
-const OUT = fileURLToPath(new URL("../../crates/geofield/tests/fixtures/imported_volumes/", import.meta.url));
+// Which template + output dir. Defaults to the all-imported template; override via env for the
+// mixed one: DUMP_TEMPLATE=conformal-stack-mixed DUMP_DIR=imported_volumes_mixed.
+const TEMPLATE = process.env.DUMP_TEMPLATE ?? "erosion-over-stack-imported";
+const DIR = process.env.DUMP_DIR ?? "imported_volumes";
+const OUT = fileURLToPath(new URL(`../../crates/geofield/tests/fixtures/${DIR}/`, import.meta.url));
 
-test("dump imported erosion-over-stack volumes", async ({ page }) => {
+test("dump erosion-over-stack volumes", async ({ page }) => {
   test.setTimeout(300_000);
   await page.goto("/");
-  await page.getByTestId("seed-template").selectOption("erosion-over-stack-imported");
+  await page.getByTestId("seed-template").selectOption(TEMPLATE);
   await expect(page.getByText("status: done")).toBeVisible({ timeout: 150_000 });
   await expect(page.getByTestId("stale-scrim")).toHaveCount(0, { timeout: 150_000 });
 

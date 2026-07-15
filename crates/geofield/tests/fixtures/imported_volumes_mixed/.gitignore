@@ -1,0 +1,4 @@
+# Per-volume Manifold-booleaned solids dumped by web3/e2e/_dump-volumes.spec.ts for the native
+# partition test (imported_volumes_partition.rs). Regenerable + large (~100 MB), so not committed.
+*.obj
+manifest.json

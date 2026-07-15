@@ -469,6 +469,78 @@ export const TEMPLATES: Template[] = [
     },
   },
   {
+    id: "conformal-stack-mixed",
+    name: "Conformal stack (mixed imported + parametric)",
+    description:
+      "A 5-surface CONFORMABLE stack with the element types INTERLEAVED: three surfaces are imported ~100k-vertex meshes (the top bed, bed 3, bed 1) and two are single-interface PARAMETRIC (fitted) series (an upper bed, bed 2). Exercises the imported↔parametric stacking interaction — a parametric bed slabbing between two imported contacts and vice versa — which the volume mesher must tile into a clean layer cake regardless of each surface's type. (Erode interleaving of a parametric DEPOSIT series with imported contacts is a known-open follow-up; see the imported-mesh-volume-partition-residual memory.)",
+    build: () => {
+      const litho = (id: string, name: string, color: string) =>
+        ({ id, name, color, kind: "user" as const });
+      const imported = (name: string, file: string) => ({
+        kind: "importedSurface" as const,
+        id: newId("el"),
+        name,
+        role: "contact" as const,
+        relation: "conformable" as const,
+        objText: "",
+        objPath: `meshes/${file}`,
+        extendToBounds: false,
+      });
+      // A single PARAMETRIC surface as a standalone 1-interface CONFORMABLE series (its own stack
+      // element, interleaved with the imported ones). `dippingInterface` matches the imported meshes'
+      // analytic z/dip so the surfaces line up into a coherent stack.
+      const paramSurface = (name: string, iface: InterfaceData): ProjectElement => ({
+        kind: "series",
+        id: newId("el"),
+        name,
+        relation: "conformable",
+        unboundedAbove: false,
+        interfaces: [iface],
+      });
+
+      // Youngest-first, matching the imported template's order and elevations. The "erosion" surface
+      // slot is here a plain CONFORMABLE upper bed (parametric) — the erode-deposit interleaving is
+      // deferred (see description).
+      const cover = imported("top bed", "erosion-stack-cover.obj");
+      const upper = paramSurface(
+        "upper bed (parametric)",
+        dippingInterface("upper bed", 600, 0.35, 0),
+      );
+      const bed3 = imported("bed 3", "erosion-stack-bed3.obj");
+      const bed2 = paramSurface("bed 2 (parametric)", dippingInterface("bed 2", 320, 0, 0));
+      const bed1 = imported("bed 1", "erosion-stack-bed1.obj");
+
+      const catalog = {
+        lithologies: [
+          { id: "air", name: "Air", color: "#ffffff", kind: "air" as const },
+          { id: "unknown", name: "Unknown", color: "#c8c8cd", kind: "unknown" as const },
+          litho("l-ss", "Sandstone", "#d9b06a"),
+          litho("l-sh", "Shale", "#6f7d55"),
+          litho("l-ls", "Limestone", "#9fb1c4"),
+          litho("l-base", "Basement", "#7a6b5d"),
+          litho("l-cov", "Cover sand", "#e6d18a"),
+          litho("l-cov2", "Cover marl", "#b7c99a"),
+        ],
+        // Imported contacts assign the below-rock at unit index 0; a bounded parametric 1-interface
+        // series' below-rock is also unit 0 (§ feature 003 unit ladder).
+        assignment: {
+          [`${bed1.id}:0`]: "l-base",
+          [`${bed2.id}:0`]: "l-ss",
+          [`${bed3.id}:0`]: "l-sh",
+          [`${upper.id}:0`]: "l-cov",
+          [`${cover.id}:0`]: "l-cov2",
+        } as Record<string, string>,
+      };
+      return {
+        version: 1,
+        name: "conformal-stack-mixed",
+        extent: EXTENT,
+        elements: [cover, upper, bed3, bed2, bed1],
+        catalog,
+      };
+    },
+  },
+  {
     id: "cross-cutting-vein-dipping",
     name: "Cross-cutting vein (dipping) — repro",
     description:
