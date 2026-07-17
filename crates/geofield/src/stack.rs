@@ -709,16 +709,31 @@ impl<M: SeriesModel> Stack<M> {
                 _ => {}
             }
         }
-        // (2) If element `i` is an ONLAP series, every OLDER series it crosses clips it: it
-        // survives only on its depositional side (ABOVE that older series' top contact). The
-        // onlap surface thus pinches out against the older topography instead of passing
-        // through it. (Cross-cutting bodies are not stratigraphic and lap onto nothing.)
+        // (2) If element `i` is an ONLAP series, every OLDER STRATIGRAPHIC surface it crosses clips
+        // it: it survives only on its depositional side (ABOVE that older surface), so it pinches out
+        // against the older slope instead of passing through it. This mirrors the erode direction —
+        // the masker flows DOWN the stack (older → younger). Older surfaces are:
+        //   * a fitted `Series`   → clip against its top-contact field half-space (`field > iso_top`);
+        //   * an imported CONTACT or TOPOGRAPHY → clip against the EXACT mesh (survives ABOVE the
+        //     sheet, `sdf > 0`), NOT the fitted field — same reason the younger-clips-older path above
+        //     uses `MeshHalfspace` for imports: the decimated single-surface krige's level set can
+        //     drift far from the mesh and pinch the onlap in the wrong place.
+        // Cross-cutting bodies (veins/intrusions) and imported vein walls are not stratigraphic slopes
+        // and lap onto nothing, so they are intentionally excluded.
         if matches!(&self.series[i], StackElement::Series(s) if s.relation == Some(Relation::Onlap)) {
             for ej in &self.series[i + 1..] {
-                if let StackElement::Series(older) = ej {
-                    if let Some(iso_top) = older.iso_top() {
-                        out.push(Masker::Halfspace { field: older.model.field(), iso: iso_top, below: false });
+                match ej {
+                    StackElement::Series(older) => {
+                        if let Some(iso_top) = older.iso_top() {
+                            out.push(Masker::Halfspace { field: older.model.field(), iso: iso_top, below: false });
+                        }
                     }
+                    StackElement::ImportedSurface(im)
+                        if matches!(im.role, ImportRole::Contact | ImportRole::Topography) =>
+                    {
+                        out.push(Masker::MeshHalfspace { mesh: &im.mesh, below: false });
+                    }
+                    _ => {} // veins / intrusions / imported vein walls: not a stratigraphic slope
                 }
             }
         }
