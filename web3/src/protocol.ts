@@ -142,4 +142,12 @@ export interface ErrorMessage {
   message: string;
 }
 
-export type WorkerMessage = StatusMessage | DoneMessage | ErrorMessage;
+/** A NON-fatal diagnostic the run can continue past — a fit-quality warning forwarded from the
+ *  kernel diagnostic sink, or the count of rock units Manifold could not compose (review 2.3/4.2).
+ *  The UI shows it without discarding the (partial) result the way `error` does. */
+export interface WarningMessage {
+  type: "warning";
+  message: string;
+}
+
+export type WorkerMessage = StatusMessage | DoneMessage | ErrorMessage | WarningMessage;

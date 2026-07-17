@@ -26,6 +26,57 @@ thread_local! {
 
 const WHOLE_MODEL: u32 = u32::MAX;
 
+// ---------------------------------------------------------------------------
+// Host diagnostic sink — a GENERIC kernel→host message channel.
+//
+// The kernel cdylib otherwise imports nothing, but a kernel-side event (a panic, a
+// singular-fit warning, future telemetry) is invisible to JS: a wasm trap surfaces only
+// as an opaque `RuntimeError: unreachable` with no message (review 4.1). This one import
+// lets the kernel hand the host a UTF-8 message + a level; the host reads the bytes out of
+// KERNEL memory (the same copy-out the buffer-returning exports already do) and routes it
+// (console.info/warn/error, and error-level onward to the app UI). The panic hook is just
+// the first caller — the channel is deliberately not panic-specific.
+//
+// level: 0 = info, 1 = warn, 2 = error. On native (tests/CLI) there is no host, so the
+// import is stubbed to a no-op and the message is written to stderr instead.
+#[cfg(all(feature = "wasm-abi", target_arch = "wasm32"))]
+#[link(wasm_import_module = "kernel_host")]
+extern "C" {
+    /// Host diagnostic sink. `ptr`/`len` point at UTF-8 bytes in KERNEL linear memory.
+    fn kernel_log(level: u32, ptr: *const u8, len: usize);
+}
+
+#[cfg(not(all(feature = "wasm-abi", target_arch = "wasm32")))]
+unsafe fn kernel_log(level: u32, ptr: *const u8, len: usize) {
+    // Native fallback: no host to forward to — write to stderr so tests/CLI still see it.
+    let bytes = std::slice::from_raw_parts(ptr, len);
+    if let Ok(s) = std::str::from_utf8(bytes) {
+        eprintln!("[kernel level={level}] {s}");
+    }
+}
+
+/// Forward a diagnostic message to the host sink (safe wrapper).
+pub(crate) fn host_log(level: u32, msg: &str) {
+    let bytes = msg.as_bytes();
+    // SAFETY: `bytes` is a live UTF-8 slice in this (kernel) memory; the host copies it out
+    // synchronously and does not retain the pointer.
+    unsafe { kernel_log(level, bytes.as_ptr(), bytes.len()) };
+}
+
+/// Install a panic hook ONCE that forwards the panic message to the host sink at error level,
+/// so a kernel panic reaches the browser/app instead of only an opaque `unreachable` trap.
+/// NOTE: this improves the *message*; it does NOT un-poison the trapped instance — the actual
+/// trap paths are prevented upstream (non-finite `.obj` rejection, NaN-safe comparators).
+pub(crate) fn install_panic_hook() {
+    use std::sync::Once;
+    static HOOK: Once = Once::new();
+    HOOK.call_once(|| {
+        std::panic::set_hook(Box::new(|info| {
+            host_log(2, &format!("kernel panic: {info}"));
+        }));
+    });
+}
+
 // Optional boundary-crossing instrumentation (feature = "wasm-abi-stats"). Counts every
 // gf_eval / gf_eval_grad — the per-sample wasm-module-boundary calls the octree makes —
 // so the web2 harness can report how many crossings a mesh costs.
@@ -141,12 +192,43 @@ struct FitInput {
     consumed: usize, // f64s consumed (so the fault plane can follow)
 }
 
+/// A well-defined empty (data-less) fit for a malformed/short input buffer — `Model::fit` of an
+/// empty series yields a "no contact" model (field `+∞`, unit 0) the host handles, rather than an
+/// OOB read (review 4.3). `consumed = 13` so the faulted path's trailing-plane read is also bounded.
+fn empty_fit() -> FitInput {
+    FitInput {
+        series: Series::new(Vec::new(), Vec::new()),
+        opts: KernelOptions::default(),
+        consumed: 13,
+    }
+}
+
 /// # Safety
 /// `ptr` must point to a valid host-staged f64 buffer of at least the encoded length.
 unsafe fn decode_fit(ptr: *const u8, len_f64: usize) -> FitInput {
+    // The 13-scalar header must be present before we can read the point/orientation counts.
+    if len_f64 < 13 {
+        return empty_fit();
+    }
     let v = read_f64s(ptr, len_f64);
+    // `n_sp`/`n_ori` are attacker/host-controlled f64s (NaN→0, huge→usize::MAX). Validate that the
+    // encoded body actually fits in the staged buffer BEFORE indexing `v`, or a length desync reads
+    // OOB kernel memory and aborts (review 4.3). On any mismatch, decode an empty (data-less) fit —
+    // a well-defined "no contact" model the host already handles — instead of trapping.
+    if !v[0].is_finite() || !v[1].is_finite() || v[0] < 0.0 || v[1] < 0.0 {
+        return empty_fit();
+    }
     let n_sp = v[0] as usize;
     let n_ori = v[1] as usize;
+    // 13 header + 4·n_sp (xyz + interface) + 6·n_ori (xyz + pole), guarding overflow.
+    let body = n_sp
+        .checked_mul(4)
+        .and_then(|a| n_ori.checked_mul(6).and_then(|b| a.checked_add(b)))
+        .and_then(|ab| ab.checked_add(13));
+    match body {
+        Some(need) if need <= len_f64 => {}
+        _ => return empty_fit(),
+    }
     let d = KernelOptions::default();
     let or = |x: f64, dflt: f64| if x.is_nan() { dflt } else { x };
     let dd = crate::assemble::DecimateConfig::default();
@@ -165,7 +247,9 @@ unsafe fn decode_fit(ptr: *const u8, len_f64: usize) -> FitInput {
         c_o: or(v[3], d.c_o),
         i_res: or(v[4], d.i_res),
         gi_res: or(v[5], d.gi_res),
-        uni_degree: if v[6] as u32 == 0 { d.uni_degree } else { v[6] as u32 },
+        // Only degree-1 drift is implemented; `assemble` asserts it. Clamp any other value at the
+        // ABI edge so a stray host arg degrades to the default instead of trapping the kernel (4.6).
+        uni_degree: if v[6] as u32 == 1 { 1 } else { d.uni_degree },
         grad_nugget: or(v[7], d.grad_nugget),
         sp_nugget: or(v[8], d.sp_nugget),
         decimate,
@@ -204,6 +288,17 @@ unsafe fn decode_fit(ptr: *const u8, len_f64: usize) -> FitInput {
 // Exports.
 // ---------------------------------------------------------------------------
 
+/// Store a fitted model, warning the host if its solve did not converge. A non-finite residual
+/// means a singular/degenerate system (the field is NaN and meshes to nothing) — the host also
+/// detects this via `gf_diagnostics`/`WasmStack.residual()`, but forwarding it through the generic
+/// sink surfaces a readable error at fit time (review 4.2) rather than a silent empty render.
+fn store_fitted(m: Model) -> u32 {
+    if !m.fit_is_finite() {
+        host_log(2, "fit failed: non-finite field (singular/degenerate surface)");
+    }
+    put_model(m)
+}
+
 /// Fit a non-faulted model from a host-staged f64 buffer (`len_f64` f64 values).
 /// Returns a model handle.
 ///
@@ -211,8 +306,9 @@ unsafe fn decode_fit(ptr: *const u8, len_f64: usize) -> FitInput {
 /// `ptr` must point to `len_f64*8` valid bytes staged by the host.
 #[no_mangle]
 pub unsafe extern "C" fn gf_fit(ptr: *const u8, len_f64: usize) -> u32 {
+    install_panic_hook();
     let fi = decode_fit(ptr, len_f64);
-    put_model(Model::fit(&fi.series, fi.opts))
+    store_fitted(Model::fit(&fi.series, fi.opts))
 }
 
 /// Fit a single-planar-fault model. Same buffer as `gf_fit`, with 6 trailing f64
@@ -223,6 +319,7 @@ pub unsafe extern "C" fn gf_fit(ptr: *const u8, len_f64: usize) -> u32 {
 /// `ptr` must point to `len_f64*8` valid bytes staged by the host.
 #[no_mangle]
 pub unsafe extern "C" fn gf_fit_faulted(ptr: *const u8, len_f64: usize) -> u32 {
+    install_panic_hook();
     let fi = decode_fit(ptr, len_f64);
     let v = read_f64s(ptr, len_f64);
     let off = fi.consumed;
@@ -239,7 +336,7 @@ pub unsafe extern "C" fn gf_fit_faulted(ptr: *const u8, len_f64: usize) -> u32 {
     } else {
         Model::fit(&fi.series, fi.opts)
     };
-    put_model(model)
+    store_fitted(model)
 }
 
 /// THE field oracle (hot path). `block == WHOLE_MODEL` (u32::MAX) queries the whole
@@ -438,4 +535,59 @@ pub extern "C" fn gf_release(handle: u32) {
             *slot = None;
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Stage `vals` as a little-endian f64 buffer and run `decode_fit` over it, returning the
+    /// decoded series' point/orientation counts. `len_override` lets a test claim a length that
+    /// disagrees with the header counts (the OOB desync the bounds check must catch).
+    fn decode_counts(vals: &[f64], len_override: Option<usize>) -> (usize, usize) {
+        let bytes: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let len = len_override.unwrap_or(vals.len());
+        // SAFETY: `bytes` outlives the call; `len` is bounded by the test.
+        let fi = unsafe { decode_fit(bytes.as_ptr(), len) };
+        (fi.series.surface_points.len(), fi.series.orientations.len())
+    }
+
+    #[test]
+    fn decode_fit_rejects_short_and_mismatched_buffers() {
+        // A buffer shorter than the 13-scalar header → empty (data-less) fit, no OOB.
+        assert_eq!(decode_counts(&[0.0; 5], None), (0, 0));
+
+        // Header claims 100 surface points but the body is not there. Without the bounds check
+        // this indexes `v[13 + ...]` far past the end → OOB abort. With it → empty fit.
+        let mut v = vec![0.0; 13];
+        v[0] = 100.0; // n_sp
+        v[1] = 0.0; // n_ori
+        assert_eq!(decode_counts(&v, None), (0, 0), "header-count desync yields empty, not OOB");
+
+        // NaN / negative counts must not become huge usizes.
+        let mut nanv = vec![0.0; 13];
+        nanv[0] = f64::NAN;
+        assert_eq!(decode_counts(&nanv, None), (0, 0), "NaN count → empty");
+        let mut negv = vec![0.0; 13];
+        negv[1] = -1.0;
+        assert_eq!(decode_counts(&negv, None), (0, 0), "negative count → empty");
+    }
+
+    #[test]
+    fn decode_fit_accepts_a_well_formed_buffer() {
+        // 13 header + 1 surface point (3 xyz + 1 interface = 4) + 1 orientation (3 xyz + 3 pole = 6).
+        let mut v = vec![0.0; 13 + 4 + 6];
+        v[0] = 1.0; // n_sp
+        v[1] = 1.0; // n_ori
+        v[6] = 1.0; // uni_degree
+                    // sp xyz at 13..16, sp interface at 16, ori xyz at 17..20, ori pole at 20..23
+        v[13] = 1.0;
+        v[14] = 2.0;
+        v[15] = 3.0;
+        v[16] = 0.0; // interface id
+        v[20] = 0.0; // pole x
+        v[21] = 0.0; // pole y
+        v[22] = 1.0; // pole z
+        assert_eq!(decode_counts(&v, None), (1, 1));
+    }
 }

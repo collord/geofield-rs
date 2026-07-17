@@ -263,6 +263,29 @@ impl Model {
     pub fn lithology(&self) -> &Lithology {
         &self.representative_lithology
     }
+
+    /// Whether this fit is trustworthy enough to mesh, or should be flagged to the host.
+    ///
+    /// The ONLY sound fit-time signal is finiteness. Empirically (see the abi fit-failure notes),
+    /// the nugget-regularized cokriging solve keeps `residual` and `isovalue_spread` finite and
+    /// near-zero even for wildly under-constrained or contradictory input — it interpolates
+    /// *through* the data, so the recovered isovalues always self-agree. A 2-point vein whose level
+    /// set FOLDS is geologically wrong but produces a perfectly finite, self-consistent field; that
+    /// pathology lives in the field GEOMETRY, not in any solve diagnostic, so no cheap scalar here
+    /// detects it (detecting it needs field evaluation — out of scope for a fit-time gate).
+    ///
+    /// So this reports exactly what is detectable: a non-finite residual or interface spread, which
+    /// only arises from a genuinely broken system (e.g. non-finite input that slipped past ingress).
+    /// The host warns on `false` (review 4.2, narrowed to the reproducible case).
+    pub fn fit_is_finite(&self) -> bool {
+        self.residual.is_finite()
+            && self.isovalue_spread.is_finite()
+            && self
+                .representative_lithology
+                .interfaces
+                .iter()
+                .all(|i| i.isovalue.is_finite())
+    }
 }
 
 /// `Model` as a [`ScalarField`] for the contourer — per-block dispatch (the field is
@@ -615,6 +638,41 @@ mod tests {
     use super::*;
     use crate::data::{Orientation, SurfacePoint};
     use crate::fault::{OneFault, PlanarFault};
+
+    #[test]
+    fn well_posed_and_underconstrained_fits_are_finite() {
+        // The nugget-regularized solve keeps a fit finite even for degenerate/contradictory input
+        // (it interpolates THROUGH the data). `fit_is_finite` therefore reports true here — the
+        // geologic wrongness of an under-constrained fit lives in field geometry, not a diagnostic
+        // scalar (see abi::store_fitted). This test pins that contract so a future regression that
+        // makes a normal fit report non-finite is caught.
+        let good = Model::fit(
+            &Series::new(
+                vec![
+                    SurfacePoint::new([0.0, 0.0, 100.0], 0),
+                    SurfacePoint::new([100.0, 0.0, 100.0], 0),
+                    SurfacePoint::new([0.0, 100.0, 100.0], 0),
+                ],
+                vec![Orientation::new([50.0, 50.0, 100.0], [0.0, 0.0, 1.0])],
+            ),
+            KernelOptions::default(),
+        );
+        assert!(good.fit_is_finite(), "a well-posed fit is finite");
+
+        let two_point = Model::fit(
+            &Series::new(
+                vec![
+                    SurfacePoint::new([0.0, 0.0, 0.0], 0),
+                    SurfacePoint::new([100.0, 0.0, 0.0], 0),
+                ],
+                vec![Orientation::new([50.0, 0.0, 0.0], [0.0, 0.0, 1.0])],
+            ),
+            KernelOptions::default(),
+        );
+        // Documents the empirical finding: this DOES fit finitely (no false alarm), even though the
+        // resulting vein wall is under-constrained.
+        assert!(two_point.fit_is_finite(), "regularization keeps a 2-point fit finite");
+    }
 
     /// A flat contact OFFSET by a fault: z=600 on the negative side of the fault
     /// plane x=500, z=700 on the positive side (a 100-unit throw). The surface points

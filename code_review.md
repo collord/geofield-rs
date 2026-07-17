@@ -39,12 +39,22 @@ reason and one cross-cutting reason:
 
 2. **Failure across the whole pipeline is silent.** A composed model that goes wrong tends to
    render as *missing geometry with a "done" status*, which is precisely the outcome `SPEC.md §2.2`
-   and `US-STATUS-1` promise to avoid. There is **no fit-failure channel** (a singular/degenerate
-   fit returns a valid handle to a NaN field — `abi.rs:213`, `solve.rs:44`); Manifold **silently
-   drops** any rock unit whose primitive fails to ingest (`manifoldVolumes.ts:87`); the corefiner
-   **declines to a legacy staircase** on any watertightness failure (`stack.rs:2124`,
-   `mesh_clip.rs:3462`); and a malformed imported `.obj` can **panic and poison the kernel wasm
-   instance**, losing every element already fitted in that Apply (`obj.rs:133` → `litho.rs:63`).
+   and `US-STATUS-1` promise to avoid. Manifold **silently drops** any rock unit whose primitive
+   fails to ingest (`manifoldVolumes.ts:87`); the corefiner **declines to a legacy staircase** on
+   any watertightness failure (`stack.rs:2124`, `mesh_clip.rs:3462`); and a malformed imported
+   `.obj` can **panic and poison the kernel wasm instance**, losing every element already fitted in
+   that Apply (`obj.rs` → `litho.rs`).
+
+   > **UPDATE (make-failure-loud pass — done):** the reachable silent/trapping paths are now closed:
+   > non-finite `.obj` vertices/normals are rejected at ingress (`ObjError::NonFinite`); the two named
+   > kernel `partial_cmp().unwrap()` panic sites + the `uni_degree` assert are made NaN/arg-safe; the
+   > ABI validates buffer header counts before indexing (no OOB); the kernel gained a panic hook + a
+   > generic `kernel_host.kernel_log` host diagnostic sink; Manifold-dropped units and compose
+   > exceptions now surface a warning/error status instead of finishing empty-as-"done"; and
+   > `worker.onerror` is handled. **Caveat:** the "no fit-failure channel" clause was based on a
+   > mechanism (singular fit → NaN field) that **does not reproduce** — see 4.2. The genuinely silent
+   > failure that remains is the *geologically-wrong-but-finite* under-constrained fit (§1.3), which
+   > no fit-time scalar detects.
 
 3. **Reliability is gated by fit conditioning, which the harness deliberately hides.** Because
    §8 forbids exposing kernel/fit parameters, an under-constrained surface (e.g. a 2-point vein)
@@ -187,16 +197,28 @@ promise. One malformed imported surface takes down the whole composition.
 *Direction:* reject non-finite vertices/normals in `parse_obj` with a typed `ObjError`; replace the
 kernel `unwrap()`s with NaN-safe comparators (`total_cmp`); install a kernel panic hook.
 
-### 4.2 [CRITICAL] The fit ABI has no failure channel — a singular fit returns a handle to garbage
-`abi.rs:213` (`gf_fit` always returns a handle), `solve.rs:44-47` (Bunch–Kaufman, no rank/finite
-check), `remote.rs:66-69` (`fit` cannot fail)
+### 4.2 [CRITICAL → PARTLY RESOLVED / PREMISE CORRECTED] The fit ABI has no failure channel
+`abi.rs` (`gf_fit`/`gf_fit_faulted`), `solve.rs` (Bunch–Kaufman), `remote.rs` (`fit` cannot fail)
 
-`Model::fit` never returns `Result`; a singular/degenerate/NaN system yields NaN weights, a NaN
-field, and an empty/nonsense mesh, with **no way for the engine or UI to know the fit failed**. The
-user gets a blank view with no message — contradicting `§2.2/§2.3` ("clear message when a fit fails,
-e.g. an unmeshable surface").
-*Direction:* return a sentinel handle (or set a diagnostic flag) when residual/weights are
-non-finite; check it in `remote::fit` and raise a `JsError`.
+> **UPDATE (make-failure-loud pass).** The stated mechanism — "a singular/degenerate system yields
+> NaN weights, a NaN field" — **did not reproduce under test.** The nugget-regularized cokriging
+> solve keeps `residual` **and** `isovalue_spread` finite and near-zero even for coincident points,
+> 1e160 coordinates, zero-length orientation poles, and mutually-contradictory interface points: it
+> interpolates *through* the data, so the recovered isovalues always self-agree. The real failure of
+> an under-constrained fit (a 2-point vein) is a **finite, self-consistent field whose level set is
+> geologically wrong** (folds/drifts) — a *worse* failure than NaN because it is plausible, and one
+> that lives in the field GEOMETRY, not in any fit-time solve scalar. No cheap diagnostic here
+> detects it (detecting it needs field evaluation), so the residual/spread "fit-failure channel"
+> this finding asked for would be **near-dead code**.
+>
+> **What was done instead:** the kernel now installs a panic hook + a generic `kernel_host.kernel_log`
+> host diagnostic sink (see 4.1), forwards a fit-failure warning to the app UI when a fit IS non-finite
+> (`Model::fit_is_finite` — the only sound signal, covering input that slipped ingress), and the host
+> reads it via the already-plumbed `WasmStack.residual()`. The geometric-fold detector and any
+> user-facing fit-conditioning lever (see §1.3) remain **open and are the real fix** — scoped
+> separately, not by an ABI sentinel.
+
+*Original direction (superseded):* return a sentinel handle when residual/weights are non-finite.
 
 ### 4.3 [HIGH] `decode_fit` / `read_f64s` trust buffer-header counts and index unchecked
 `abi.rs:147-200`, `read_f64s` `abi.rs:116`

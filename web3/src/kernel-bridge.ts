@@ -57,15 +57,46 @@ export function setEngineMemory(mem: WebAssembly.Memory): void {
   engineMemory = mem;
 }
 
-/** Instantiate geofield_kernel.wasm (it imports nothing). Idempotent. */
+/** Optional sink for ERROR-level kernel diagnostics, so the worker can forward them to the app UI
+ *  (a fit-failure warning, a kernel panic message). Set by the worker before `initKernel`. */
+let onKernelError: ((message: string) => void) | null = null;
+export function setKernelErrorSink(sink: (message: string) => void): void {
+  onKernelError = sink;
+}
+
+/** The generic kernel→host diagnostic sink (kernel ABI import `kernel_host.kernel_log`). The kernel
+ *  writes a UTF-8 message into ITS OWN memory and hands us (ptr, len) + a level; we read the bytes
+ *  out of kernel memory and route by level. level: 0 = info, 1 = warn, 2 = error. Error-level is
+ *  also forwarded to the app UI via `onKernelError` (review 4.1/4.2 — a kernel event is no longer an
+ *  opaque `unreachable` trap or a silent empty render). Reading kernel memory here mirrors the
+ *  byte-copy every buffer-returning bridge shim already does. */
+function kernel_log(level: number, ptr: number, len: number): void {
+  let message = "(kernel message unavailable)";
+  if (kernel && ptr !== 0 && len > 0) {
+    const bytes = new Uint8Array(kernel.memory.buffer, ptr, len);
+    message = new TextDecoder().decode(bytes);
+  }
+  if (level >= 2) {
+    console.error("[kernel]", message);
+    onKernelError?.(message);
+  } else if (level === 1) {
+    console.warn("[kernel]", message);
+  } else {
+    console.info("[kernel]", message);
+  }
+}
+
+/** Instantiate geofield_kernel.wasm. It imports one thing: the `kernel_host` diagnostic sink
+ *  (above). Idempotent. */
 export async function initKernel(wasmUrl: string | URL): Promise<void> {
   if (kernel) return;
+  const imports = { kernel_host: { kernel_log } };
   let instance: WebAssembly.Instance;
   if (typeof WebAssembly.instantiateStreaming === "function") {
-    ({ instance } = await WebAssembly.instantiateStreaming(fetch(wasmUrl), {}));
+    ({ instance } = await WebAssembly.instantiateStreaming(fetch(wasmUrl), imports));
   } else {
     const bytes = await (await fetch(wasmUrl)).arrayBuffer();
-    ({ instance } = await WebAssembly.instantiate(bytes, {}));
+    ({ instance } = await WebAssembly.instantiate(bytes, imports));
   }
   kernel = instance.exports as unknown as KernelExports;
 }

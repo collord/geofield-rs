@@ -11,7 +11,7 @@
 // Build status: type-checked design; not yet `tsc`-verified here (web3 deps uninstalled).
 
 import init, { WasmStack } from "./wasm/geofield.js";
-import { initKernel, setEngineMemory } from "./kernel-bridge";
+import { initKernel, setEngineMemory, setKernelErrorSink } from "./kernel-bridge";
 import kernelWasmUrl from "./wasm-kernel/geofield_kernel.wasm?url";
 import type {
   Command,
@@ -43,6 +43,10 @@ let ready: Promise<void> | null = null;
 function initWasm(): Promise<void> {
   if (!ready) {
     ready = (async () => {
+      // Forward ERROR-level kernel diagnostics (fit failure, kernel panic) to the app as a
+      // non-fatal warning, so a kernel-side event surfaces in the UI instead of only the console
+      // (review 4.1/4.2). Registered before initKernel so the import is live on first fit.
+      setKernelErrorSink((message) => emit({ type: "warning", message: `kernel: ${message}` }));
       await initKernel(kernelWasmUrl);
       const wasm = await init();
       setEngineMemory(wasm.memory as WebAssembly.Memory);

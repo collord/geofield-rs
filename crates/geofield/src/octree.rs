@@ -468,7 +468,9 @@ impl<'a> Scene<'a> {
             .contributors
             .iter()
             .filter_map(|c| c.surface_distance(p).map(|d| (d, c)))
-            .min_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+            // NaN-safe: an ill-conditioned fit can hand us a non-finite distance; ordering it as
+            // Equal keeps the seam-normal query from trapping the (hook-less) instance (review 4.6).
+            .min_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
         if let Some((_, c)) = nearest {
             if let Some(n) = c.surface_normal(p) {
                 return Some(n);
@@ -2097,7 +2099,9 @@ fn project_to_contact(
         // direction along which the contact is locally single-valued, and the only
         // axis allowed to leave the cell.
         let ax = (0..3)
-            .max_by(|&a, &b| g[a].abs().partial_cmp(&g[b].abs()).unwrap())
+            // NaN-safe: a non-finite gradient component (degenerate fit) must not trap here — order
+            // it as Equal so projection falls back to a well-defined axis instead of panicking (4.6).
+            .max_by(|&a, &b| g[a].abs().partial_cmp(&g[b].abs()).unwrap_or(std::cmp::Ordering::Equal))
             .unwrap();
         let s = f / g2;
         let np = [p[0] - s * g[0], p[1] - s * g[1], p[2] - s * g[2]];

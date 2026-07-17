@@ -38,13 +38,22 @@ export function initManifold(): Promise<ManifoldToplevel> {
  *  2 = Subtract, 3 = BaseBox (the domain cube). Every unit is clipped to the exact domain (the
  *  primitives overhang, so the cut is flap-free); shared contacts coincide by construction (the SAME
  *  pooled primitive bounds both adjacent units) → no gaps. One tagged SurfacePayload per non-empty
- *  unit. A primitive that fails `ofMesh` is null in the pool; any unit referencing it is dropped. */
+ *  unit. A primitive that fails `ofMesh` is null in the pool; any unit referencing it is dropped.
+ *
+ *  Returns the surfaces AND a count of rock units dropped because a primitive failed to ingest, so
+ *  the caller can warn instead of rendering the missing volumes silently as "done" (review 2.3). */
+export interface RecipeResult {
+  surfaces: SurfacePayload[];
+  /** Rock units skipped because a referenced primitive failed Manifold `ofMesh` (NotManifold). */
+  droppedUnits: number;
+}
+
 export function executeRecipe(
   wasm: ManifoldToplevel,
   ops: RecipeOp[],
   extent: [number, number, number, number, number, number],
   assignment: Record<string, string>,
-): SurfacePayload[] {
+): RecipeResult {
   const { Manifold, Mesh } = wasm;
   const [x0, x1, y0, y1, z0, z1] = extent;
   const domainBox = Manifold.cube([x1 - x0, y1 - y0, z1 - z0]).translate([x0, y0, z0]);
@@ -77,6 +86,7 @@ export function executeRecipe(
   // Pass 2: compose each unit from the pooled primitives (booleans produce NEW solids; pooled inputs
   // are reused, deleted only at the end).
   const out: SurfacePayload[] = [];
+  let droppedUnits = 0;
   for (const [key, list] of groups) {
     let result: Solid | null = null;
     let ownsResult = false; // whether `result` is ours to delete (NOT a pooled prim / domainBox)
@@ -97,6 +107,9 @@ export function executeRecipe(
     }
     if (failed || !result) {
       if (ownsResult && result) result.delete();
+      // A primitive failed to ingest (NotManifold) → this rock unit is missing from the scene.
+      // Count it so the caller can surface a warning rather than finishing silently (review 2.3).
+      if (failed) droppedUnits++;
       continue;
     }
     const clipped = result.intersect(domainBox);
@@ -119,5 +132,5 @@ export function executeRecipe(
   }
   for (const m of pool.values()) m?.delete();
   domainBox.delete();
-  return out;
+  return { surfaces: out, droppedUnits };
 }

@@ -60,7 +60,10 @@ impl Lithology {
             })
             .collect();
 
-        interfaces.sort_by(|a, b| a.isovalue.partial_cmp(&b.isovalue).unwrap());
+        // NaN-safe total order: a degenerate/singular fit yields NaN isovalues (the failure surfaces
+        // via a non-finite residual, not a trap). `partial_cmp().unwrap()` would panic on NaN and
+        // poison the once-per-worker kernel instance (review 4.1/4.6).
+        interfaces.sort_by(|a, b| a.isovalue.total_cmp(&b.isovalue));
         (Self { interfaces }, max_spread)
     }
 

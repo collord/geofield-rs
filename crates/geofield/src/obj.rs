@@ -41,6 +41,10 @@ pub enum ObjError {
     BadFaceIndex(String),
     /// Parsing succeeded but left no non-degenerate triangle to mesh.
     NoTriangles,
+    /// A vertex or normal carried a non-finite (`nan`/`inf`) coordinate. `f64::from_str` accepts
+    /// these, and downstream area/pole tests do not reject them, so a NaN would flow into the kernel
+    /// and trap the once-per-worker instance (review 4.1) — reject the import instead.
+    NonFinite,
 }
 
 impl std::fmt::Display for ObjError {
@@ -50,6 +54,7 @@ impl std::fmt::Display for ObjError {
             ObjError::NoVertices => write!(f, "imported mesh has no vertices"),
             ObjError::BadFaceIndex(s) => write!(f, "imported mesh face references an invalid vertex index: {s}"),
             ObjError::NoTriangles => write!(f, "imported mesh has no non-degenerate triangles to mesh"),
+            ObjError::NonFinite => write!(f, "imported mesh has a non-finite (NaN/Inf) vertex or normal coordinate"),
         }
     }
 }
@@ -75,7 +80,9 @@ fn is_degenerate(a: [f64; 3], b: [f64; 3], c: [f64; 3]) -> bool {
     let area2 = cx[0] * cx[0] + cx[1] * cx[1] + cx[2] * cx[2];
     let s = (ab[0] * ab[0] + ab[1] * ab[1] + ab[2] * ab[2])
         * (ac[0] * ac[0] + ac[1] * ac[1] + ac[2] * ac[2]);
-    area2 <= s * 1e-20 || area2 == 0.0
+    // A NaN area (non-finite input that slipped past ingress) compares false everywhere, so guard it
+    // explicitly and treat as degenerate — belt-and-suspenders behind the `parse_obj` finite check.
+    !area2.is_finite() || area2 <= s * 1e-20 || area2 == 0.0
 }
 
 /// Resolve an obj index token (1-based, or negative-relative) against the current count. Returns a
@@ -132,12 +139,20 @@ pub fn parse_obj(bytes: &[u8]) -> Result<ObjMesh, ObjError> {
             Some("v") => {
                 let c: Vec<f64> = it.filter_map(|t| t.parse().ok()).collect();
                 if c.len() >= 3 {
+                    // `f64::from_str` accepts "nan"/"inf"; a non-finite vertex would flow unguarded
+                    // into the kernel and trap the instance (review 4.1). Reject the import.
+                    if !(c[0].is_finite() && c[1].is_finite() && c[2].is_finite()) {
+                        return Err(ObjError::NonFinite);
+                    }
                     raw_v.push([c[0], c[1], c[2]]);
                 }
             }
             Some("vn") => {
                 let c: Vec<f64> = it.filter_map(|t| t.parse().ok()).collect();
                 if c.len() >= 3 {
+                    if !(c[0].is_finite() && c[1].is_finite() && c[2].is_finite()) {
+                        return Err(ObjError::NonFinite);
+                    }
                     raw_vn.push([c[0], c[1], c[2]]);
                 }
             }
@@ -350,6 +365,24 @@ mod tests {
     fn rejects_empty_and_non_utf8() {
         assert_eq!(parse_obj(b""), Err(ObjError::NoVertices));
         assert_eq!(parse_obj(&[0xff, 0xfe, 0x00]), Err(ObjError::NotUtf8));
+    }
+
+    #[test]
+    fn rejects_non_finite_vertices_and_normals() {
+        // `f64::from_str` parses "nan"/"inf"; the import must be rejected, not silently kept — a
+        // non-finite coord traps the kernel downstream (review 4.1). Both `v` and `vn` are guarded.
+        assert_eq!(
+            parse_obj(b"v nan 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n"),
+            Err(ObjError::NonFinite),
+        );
+        assert_eq!(
+            parse_obj(b"v 0 0 inf\nv 1 0 0\nv 0 1 0\nf 1 2 3\n"),
+            Err(ObjError::NonFinite),
+        );
+        assert_eq!(
+            parse_obj(b"v 0 0 0\nv 1 0 0\nv 0 1 0\nvn inf 0 0\nf 1//1 2//1 3//1\n"),
+            Err(ObjError::NonFinite),
+        );
     }
 
     #[test]

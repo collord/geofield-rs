@@ -201,28 +201,55 @@ function App() {
         setStatus(msg.phase);
       }
       else if (msg.type === "error") setStatus("error: " + msg.message);
+      // A non-fatal kernel/compose diagnostic — surface it without discarding the run. The most
+      // recent warning wins the status line; it is replaced by the next status/done (review 4.2).
+      else if (msg.type === "warning") setStatus("⚠ " + msg.message);
       else if (msg.type === "done") {
-        const finish = (surfaces: SurfacePayload[]) => {
+        const finish = (surfaces: SurfacePayload[], statusText = "done") => {
           setSurfaces(surfaces);
           setState(applyCoreUpdate(msg.update)); // derived = read-only cache (FR-018)
-          setStatus("done");
+          setStatus(statusText);
           onDone?.();
         };
         // Unified solid mesher: the worker shipped a boolean RECIPE over single-level-set primitives;
         // compose the rock units on the PERSISTENT main-thread Manifold instance (it hangs if
         // re-instantiated per worker — docs/14). The geology is already baked into the recipe (Rust's
-        // clip_maskers); the main thread just runs the booleans. On any failure, fall back to whatever
-        // `surfaces` the worker sent (the legacy field path when the toggle is off, else empty).
+        // clip_maskers); the main thread just runs the booleans.
         if (msg.recipeOps && msg.recipeMeta) {
           const { extent, assignment } = msg.recipeMeta;
           const ops = msg.recipeOps;
           initManifold()
-            .then((wasm) => finish(executeRecipe(wasm, ops, extent, assignment)))
-            .catch(() => finish(msg.surfaces));
+            .then((wasm) => {
+              const { surfaces, droppedUnits } = executeRecipe(wasm, ops, extent, assignment);
+              // A unit dropped because its primitive failed to ingest is MISSING geometry — warn
+              // rather than render it silently as a clean "done" (review 2.3).
+              finish(
+                surfaces,
+                droppedUnits > 0
+                  ? `⚠ done — ${droppedUnits} rock unit${droppedUnits > 1 ? "s" : ""} could not be composed`
+                  : "done",
+              );
+            })
+            // A compose EXCEPTION on the recipe path means `msg.surfaces` is empty (the worker ships
+            // no legacy surfaces in solid mode). Finishing it would render an empty scene as "done"
+            // — the silent-blank outcome the spec forbids. Set an error status instead (review 2.3).
+            // Clear `applying` directly (NOT via `onDone`, which also clears `dirty` — a FAILED Apply
+            // must stay dirty so the user knows it isn't applied) so the Apply spinner releases.
+            .catch((err) => {
+              setStatus("error: solid composition failed — " + (err instanceof Error ? err.message : String(err)));
+              setApplying(false);
+            });
         } else {
           finish(msg.surfaces);
         }
       }
+    };
+    // A worker-level failure (module load, wasm instantiation, uncaught async rejection) fires
+    // `onerror`, not `onmessage` — without this the view stays blank/stale with no status and
+    // `applying` never clears (review 4.7).
+    worker.onerror = (e: ErrorEvent) => {
+      setStatus("error: worker failed — " + (e.message || "unknown error"));
+      setApplying(false);
     };
     const cmd: RunCommand = {
       type: "run",
