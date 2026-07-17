@@ -362,3 +362,15 @@ self.onmessage = (e: MessageEvent<Command>) => {
     });
   }
 };
+
+// Safety net for failures that escape the per-run `catch` above: a promise rejection thrown OUTSIDE
+// `run` fires `unhandledrejection` (not the main thread's `worker.onerror`), and a top-level sync
+// throw fires the worker's own `error` event — either would otherwise leave the UI blank/stale with
+// no status (review 4.7). Forward both to the same readable `error` message the host already handles.
+self.addEventListener("unhandledrejection", (e: PromiseRejectionEvent) => {
+  const r = e.reason;
+  emit({ type: "error", message: "worker: " + (r instanceof Error ? r.message : String(r)) });
+});
+self.addEventListener("error", (e: ErrorEvent) => {
+  emit({ type: "error", message: "worker: " + (e.message || "unknown error") });
+});
