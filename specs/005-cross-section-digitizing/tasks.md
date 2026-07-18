@@ -240,12 +240,15 @@ Commit per task or coherent group (`feat(web3): …` / `test(web3): …`), on `m
   on the stale `project` closure silently dropped the prior edit (last-write-wins). All digitizing
   paths now commit through functional `setProject(prev => …)` updaters (`commitFn` in main.tsx),
   with the section-set lookup resolved inside the updater. The five gates pass 3× consecutively.
-- **Pre-existing failures, NOT feature 005** (each verified against the stashed pre-005 baseline
-  on this machine): `e2e/view-roundtrip.spec.ts` (two identical solid-mode fits return meshes with
-  different bounding boxes, min-z 29.09 vs 0, so the data-box-keyed auto-frame overrides the
-  restored camera), `e2e/smoke.spec.ts` (all-templates fit loop is marginal against its 30s test
-  budget — the imported-mesh template alone fits in ~20s here), and
-  `e2e/imported-mesh-erosion-stack.spec.ts` (solid-mode "meshing solids (Manifold)…" exceeds the
-  120s budget). Final gate of record: full serial suite = 62 passed + these 3 baseline failures;
-  the five 005 section specs pass 15/15 across 3 consecutive runs and in every full-suite run.
-  Engine/solid-path investigation is out of this feature's scope — left as named, reproducible gaps.
+- **Pre-existing failures, NOT feature 005 — since DIAGNOSED and FIXED (follow-up commit)**:
+  all three reproduce on the stashed pre-005 baseline. The suspected "solid-path nondeterminism"
+  behind `view-roundtrip` was DISPROVED (4 consecutive identical solid fits → byte-identical
+  summaries: 5 units, 119,280 tris, box 0–1000): the real cause was the spec's own stale-done
+  race — its "wait for the solid fit" was satisfied by the previous fit's text, the load
+  superseded the in-flight solid fit, and when the solid result finally landed the data box
+  changed shape (contact box ≠ solid box) so the box-keyed auto-frame overrode the restored
+  camera. Fixed with the settled-wait pattern (status-log growth + solid-payload presence).
+  `smoke` and `imported-mesh-erosion-stack` were slow-but-correct on this machine (~20 s
+  imported-template contact fit; ~85 s erosion-stack solids) against tight budgets — budgets
+  raised. Final gate of record: five 005 section specs 15/15 across 3 consecutive runs; the
+  three repaired specs pass serially 3×/1× each.

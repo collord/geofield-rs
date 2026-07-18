@@ -14,6 +14,9 @@ test("page loads with the authoring shell and a viewer canvas", async ({ page })
 });
 
 test("each seed template loads container(s) into the panel and fits", async ({ page }) => {
+  // One test iterates EVERY template; the imported-mesh template alone fits in ~20 s on a
+  // slower machine, so the loop needs far more than the 30 s default test budget.
+  test.setTimeout(240_000);
   await page.goto("/");
   const select = page.getByTestId("seed-template");
   // Skip the disabled placeholder; the real templates include blank + the three scenarios.
@@ -25,7 +28,7 @@ test("each seed template loads container(s) into the panel and fits", async ({ p
   for (const value of values) {
     if (value === "blank") continue; // blank has nothing to fit
     await select.selectOption(value);
-    await expect(page.locator(".hierarchy .container-node").first()).toBeVisible({ timeout: 30_000 });
-    await expect(page.getByText("status: done")).toBeVisible({ timeout: 30_000 });
+    await expect(page.locator(".hierarchy .container-node").first()).toBeVisible({ timeout: 60_000 });
+    await expect(page.getByText("status: done")).toBeVisible({ timeout: 60_000 });
   }
 });

@@ -48,7 +48,7 @@ test("the imported-mesh erosion-over-stack template hydrates, fits, and renders 
   );
 
   // Five ~100k-vert meshes fit + contour; give the whole pipeline generous time.
-  test.setTimeout(300_000); // Surfaces fit + Solids re-mesh of five 100k-vert meshes is heavy.
+  test.setTimeout(480_000); // Surfaces fit + Solids re-mesh of five 100k-vert meshes is heavy (~85 s solids alone on a loaded machine).
 
   await page.goto("/");
   await page.getByTestId("seed-template").selectOption("erosion-over-stack-imported");
@@ -78,8 +78,8 @@ test("the imported-mesh erosion-over-stack template hydrates, fits, and renders 
   await page
     .waitForFunction(() => (window as { __statusLog?: string[] }).__statusLog?.slice(-1)[0] !== "done", { timeout: 10_000 })
     .catch(() => {});
-  await expect(page.getByText("status: done")).toBeVisible({ timeout: 120_000 });
-  await expect(page.getByTestId("stale-scrim")).toHaveCount(0, { timeout: 120_000 });
+  await expect(page.getByText("status: done")).toBeVisible({ timeout: 240_000 });
+  await expect(page.getByTestId("stale-scrim")).toHaveCount(0, { timeout: 240_000 });
   // Now the payloads are solids (each carries a `unit`).
   await expect
     .poll(
@@ -88,7 +88,7 @@ test("the imported-mesh erosion-over-stack template hydrates, fits, and renders 
           const s = (window as { __surfaces?: { unit?: number }[] }).__surfaces ?? [];
           return s.length > 0 && s.every((x) => x.unit !== undefined && x.unit !== null);
         }),
-      { timeout: 120_000 },
+      { timeout: 240_000 },
     )
     .toBe(true);
 
