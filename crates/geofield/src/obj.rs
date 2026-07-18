@@ -45,6 +45,10 @@ pub enum ObjError {
     /// these, and downstream area/pole tests do not reject them, so a NaN would flow into the kernel
     /// and trap the once-per-worker instance (review 4.1) — reject the import instead.
     NonFinite,
+    /// The buffer exceeds the parse budget (bytes / vertices / faces). A `.obj` is untrusted user
+    /// upload; without a cap a multi-GB file OOM-aborts the wasm instance before the fit cap ever
+    /// applies (review 4.5) — reject it with a readable error instead.
+    TooLarge,
 }
 
 impl std::fmt::Display for ObjError {
@@ -55,8 +59,27 @@ impl std::fmt::Display for ObjError {
             ObjError::BadFaceIndex(s) => write!(f, "imported mesh face references an invalid vertex index: {s}"),
             ObjError::NoTriangles => write!(f, "imported mesh has no non-degenerate triangles to mesh"),
             ObjError::NonFinite => write!(f, "imported mesh has a non-finite (NaN/Inf) vertex or normal coordinate"),
+            ObjError::TooLarge => write!(f, "imported mesh exceeds the parse size budget (too many bytes/vertices/faces)"),
         }
     }
+}
+
+/// Hostile/accidental-oversize guards for [`parse_obj`] (review §4.5). Generous enough for real lidar
+/// TINs (millions of triangles), bounded enough to reject an absurd upload before it OOM-aborts the
+/// wasm instance. The byte cap alone bounds everything downstream; the count caps are defense in depth.
+#[derive(Clone, Copy)]
+struct ObjLimits {
+    max_bytes: usize,
+    max_vertices: usize,
+    max_faces: usize,
+}
+
+impl ObjLimits {
+    const DEFAULT: ObjLimits = ObjLimits {
+        max_bytes: 256 << 20, // 256 MiB
+        max_vertices: 8_000_000,
+        max_faces: 16_000_000,
+    };
 }
 
 /// Quantize a coordinate to a bit-tight integer key for duplicate-vertex welding. `1e7` matches the
@@ -122,6 +145,14 @@ fn normal_index(tok: &str, count: usize) -> Option<usize> {
 /// Welds duplicate vertices, fan-triangulates polygons, drops degenerate triangles, and carries
 /// per-vertex normals only if the file provided them for every kept vertex. See module docs.
 pub fn parse_obj(bytes: &[u8]) -> Result<ObjMesh, ObjError> {
+    parse_obj_capped(bytes, ObjLimits::DEFAULT)
+}
+
+fn parse_obj_capped(bytes: &[u8], limits: ObjLimits) -> Result<ObjMesh, ObjError> {
+    // Reject an oversize buffer up front (O(1)) — before allocating any parse state.
+    if bytes.len() > limits.max_bytes {
+        return Err(ObjError::TooLarge);
+    }
     let text = std::str::from_utf8(bytes).map_err(|_| ObjError::NotUtf8)?;
 
     let mut raw_v: Vec<[f64; 3]> = Vec::new();
@@ -144,6 +175,9 @@ pub fn parse_obj(bytes: &[u8]) -> Result<ObjMesh, ObjError> {
                     if !(c[0].is_finite() && c[1].is_finite() && c[2].is_finite()) {
                         return Err(ObjError::NonFinite);
                     }
+                    if raw_v.len() >= limits.max_vertices {
+                        return Err(ObjError::TooLarge);
+                    }
                     raw_v.push([c[0], c[1], c[2]]);
                 }
             }
@@ -152,6 +186,9 @@ pub fn parse_obj(bytes: &[u8]) -> Result<ObjMesh, ObjError> {
                 if c.len() >= 3 {
                     if !(c[0].is_finite() && c[1].is_finite() && c[2].is_finite()) {
                         return Err(ObjError::NonFinite);
+                    }
+                    if raw_vn.len() >= limits.max_vertices {
+                        return Err(ObjError::TooLarge);
                     }
                     raw_vn.push([c[0], c[1], c[2]]);
                 }
@@ -166,6 +203,9 @@ pub fn parse_obj(bytes: &[u8]) -> Result<ObjMesh, ObjError> {
                     corners.push((vi, ni));
                 }
                 if corners.len() >= 3 {
+                    if faces.len() >= limits.max_faces {
+                        return Err(ObjError::TooLarge);
+                    }
                     faces.push(corners);
                 }
             }
@@ -383,6 +423,35 @@ mod tests {
             parse_obj(b"v 0 0 0\nv 1 0 0\nv 0 1 0\nvn inf 0 0\nf 1//1 2//1 3//1\n"),
             Err(ObjError::NonFinite),
         );
+    }
+
+    #[test]
+    fn rejects_oversize_input() {
+        // Untrusted upload budget (review §4.5): each cap is exercised with tiny limits so the test
+        // stays cheap. A valid mesh UNDER the limits still parses.
+        let byte_cap = ObjLimits { max_bytes: 4, max_vertices: 10, max_faces: 10 };
+        assert_eq!(parse_obj_capped(b"v 0 0 0\n", byte_cap), Err(ObjError::TooLarge), "byte cap");
+
+        let vert_cap = ObjLimits { max_bytes: 1 << 20, max_vertices: 2, max_faces: 10 };
+        assert_eq!(
+            parse_obj_capped(b"v 0 0 0\nv 1 0 0\nv 0 1 0\n", vert_cap),
+            Err(ObjError::TooLarge),
+            "3rd vertex exceeds max_vertices=2",
+        );
+
+        let face_cap = ObjLimits { max_bytes: 1 << 20, max_vertices: 10, max_faces: 1 };
+        assert_eq!(
+            parse_obj_capped(b"v 0 0 0\nv 1 0 0\nv 0 1 0\nv 1 1 0\nf 1 2 3\nf 1 3 4\n", face_cap),
+            Err(ObjError::TooLarge),
+            "2nd face exceeds max_faces=1",
+        );
+
+        // A single triangle is comfortably under DEFAULT limits → still parses.
+        let ok = parse_obj_capped(
+            b"v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n",
+            ObjLimits::DEFAULT,
+        );
+        assert!(ok.is_ok(), "a small valid mesh parses under default limits");
     }
 
     #[test]

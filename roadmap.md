@@ -21,6 +21,66 @@ verified before adoption. These are flagged again inline where they matter.
 
 ---
 
+## Progress & verification status (updated 2026-07-18)
+
+A round of fixes landed on `main` (merged PR #1 + follow-ups) and was **independently verified** for
+this update — code read directly, and `cargo build -p geofield-kernel -p geofield` compiles clean
+with the kernel (44), obj (10), and `onlap_against_imported` test suites green. (The web3 TS
+type-check and Playwright e2e could not be *run* here — `node_modules` absent — so TS/feature
+verdicts are by code reading + spec cross-check.) The picture is now considerably better than the
+review's baseline; the remaining work is the *foundation and geology* items, which were never in the
+scope of these commits.
+
+**Done & verified (this round):**
+
+| Item | Review ref | Verdict |
+|------|-----------|---------|
+| Manifold N-body compose moved to a dedicated **persistent worker** (off the main thread) | §2.1 | ✅ Fixed |
+| Monotonic **run-token guard** — superseded fit/compose results discarded | §2.2 | ✅ Fixed (beyond the commit's stated scope) |
+| Manifold-**dropped units surfaced** as a warning; compose failure → error status, not empty-as-"done" | §2.3 | ✅ Fixed |
+| `worker.onerror` wired on both workers, clears `applying` | §4.7 | ✅ Fixed |
+| Non-finite `.obj` vertices/normals **rejected at ingress** (`ObjError::NonFinite`, tested) | §4.1 | ✅ Fixed |
+| ABI `decode_fit`/`read_f64s` **bounds-validate** header counts (overflow-guarded, tested) | §4.3 | ✅ Fixed |
+| Octree `partial_cmp().unwrap()` → `unwrap_or(Equal)`; `litho` `total_cmp`; `uni_degree` clamped at ABI edge | §4.6 | ✅ Fixed |
+| Kernel **panic hook + `kernel_log` host sink**; `Model::fit_is_finite` fit-failure warning forwarded to UI | §4.1/§4.2 | ✅ Fixed |
+| Onlap **pinches out against older imported** contacts/topography (exact mesh; tested) | §3.4 | ✅ Fixed |
+| **Cross-section views + polyline digitizing** (feature 005) — §10/§11 acceptance satisfied; younging math correct (uses the corrected `m = normalize(ŝ × t̂)`, "youngs to your left" holds; feeds the existing `sp_xyz`/`ori_pole` fit path with **no kernel change**) | roadmap **B7 + B8** | ✅ Shipped |
+
+*One honest correction the maintainers made (and I concur):* review §4.2's premise — "a singular fit
+yields a NaN field" — **did not reproduce**; the nugget-regularized solve interpolates through even
+pathological data. So a "fit-failure sentinel" would be near-dead code. The genuine silent failure is
+the **finite-but-geologically-wrong under-constrained fit** (§1.3), which no fit-time scalar detects —
+that reframes the open item toward **A2.3 (structural anisotropy/trend, which better-conditions the
+fit)** and a geometric-fold detector, not an ABI channel.
+
+**Closed in a follow-up cleanup (verified: `cargo test` green — kernel 48, geofield 135, onlap 1 — and
+both crates build clean for `wasm32-unknown-unknown`):**
+
+| Item | Review ref | Fix |
+|------|-----------|-----|
+| Three.js geometry/material **leak in the *primary* mesh-rebuild path** | §7 | ✅ `Viewer.tsx` now `disposeMeshGroupChildren(st.group)` (geometry + material, incl. wireframe) before `clear()` — mirrors `disposeOverlay`. *(TS not type-checked here — `node_modules` absent — verified by review.)* |
+| **NEW residual (I surfaced):** `sym3_eig` raw `.unwrap()` reachable from a host-staged NaN coordinate | §4.6 | ✅ Two layers: `sym3_eig` sort now uses `f64::total_cmp` (never panics on NaN), and `decode_fit` **rejects any non-finite coordinate/pole at the ABI edge** with a `host_log` warning + empty fit (loud + attributable, like the `.obj` guard). Tested (`decode_fit_rejects_non_finite_coordinates`). |
+| `gf_alloc`/`gf_free` capacity-mismatch UB | §4.4 | ✅ Both now use a shared fixed `Layout` (`buffer_layout`) so alloc and free agree exactly; `len == 0` handled. Tested (`gf_alloc_free_roundtrips_various_sizes`). |
+| Uncapped `.obj` parse (hostile-large-file OOM before the fit cap) | §4.5 | ✅ `parse_obj` now enforces a byte/vertex/face budget (`ObjError::TooLarge`); byte cap is O(1) up front. Tested (`rejects_oversize_input`). |
+| **A1.2 fast winding number** — O(n) `winding()`/point-in-mesh scan | §7-perf | 🟡 Prototyped: first-order Barill dipole on the existing `TriBvh` → O(log n); membership proven exact vs. the flat scan, far-field converges to exact. Tested (`fast_winding_matches_exact_scan`). |
+| **A1.2 robust SDF sign** — `local_signed_distance` raw nearest-face normal mis-signs at creases | §7 | ✅ Now signs via the Bærentzen–Aanæs angle-weighted pseudonormal (edge → both incident faces; vertex → angle-weighted). Tested (`pseudonormal_at_edge_uses_both_incident_faces`, `local_signed_distance_sign_agrees_with_winding_on_closed_mesh`). |
+
+**Still open (verified NOT addressed):**
+
+| Item | Review ref | Status / note |
+|------|-----------|---------------|
+| `global_unit` doesn't hoist Topography ("rock in the sky") | §3.1 | ❌ Open — a public-API correctness landmine; **UI item B2** would also surface it. |
+| Inert imported `VeinWall` role | §3.3 | ❌ Open — pairs with **UI item B5** (vein pinch-out/termination). |
+| Single-body seam-quality paths; fitted-erosion drift; coplanar drop-C | §3.2/§3.5/§3.6 | ❌ Open — the composition-quality cluster; **A1.1/A1.5** are the structural fix. |
+| The exact-predicate / determinism / thin-feature / winding-number **foundation** | §5.x/§6.x/§7-perf | ❌ Open — **all of Part A1.1–A1.5 remain**, and are now the top of the queue (below). *(Note: the `robust` crate — georust's Shewchuk predicates — is already a transitive dep, so A1.3 has a head start.)* |
+
+**Net:** the *reliability-surfacing* layer (make-failure-loud, off-thread compose, stale-guard), the
+*cross-section authoring feature*, and now the *robustness residuals* (§4.4/§4.5/§4.6-residual/§7) are
+**done and verified**. The **geometry/robustness foundation (A1.1–A1.5)** and the **geological-method
+completeness (A2)** remain the real roadmap. Phasing in Part C is updated accordingly.
+
+---
+
 ## The single most important through-line
 
 The review's two deepest defects — a **corefiner that guarantees watertightness by *checking then
@@ -67,7 +127,26 @@ Root-causes `code_review.md §2, §3.2, §5.1–5.6`. Two routes, not mutually e
   Attene 2020 (CAD); Shewchuk 1997.
 
 **A1.2 [HIGH] Replace the O(n) winding/point-in-mesh test with a BVH-accelerated *fast winding
-number*.**
+number*. — 🟡 PROTOTYPED (first-order, 2026-07-18).**
+Landed a first-order (dipole) Barill fast winding number on the existing `TriBvh`
+(`octree.rs`): each node caches an aggregate dipole moment + area-weighted centre + cluster radius
+(computed in one reverse pass since children follow parents in the node array), and `TriMesh::winding`
+now tree-walks — far nodes contribute their whole subtree in O(1), near leaves stay exact — for
+O(log n) queries instead of the O(n) flat scan. The exact scan is kept as `winding_exact` and the test
+`fast_winding_matches_exact_scan` proves (a) membership (`>0.5`) never flips vs. the exact scan — the
+property every consumer (`inside`, `MeshSdf` sign) actually depends on, safe because the 0.5 crossing
+is always near-field/exact — and (b) the far-field **converges** to exact as β grows (1.8e-2 at β=2 →
+<1e-3 at β=8), confirming the dipole is the correct asymptotic. Builds clean for `wasm32`; all
+imported-mesh suites green.
+**The paired robust SDF is also done:** `TriMesh::local_signed_distance` (the open-terrain
+`MeshLocalField` path, where a global winding number is undefined) now signs via the
+**Bærentzen–Aanæs angle-weighted pseudonormal** — face normal for an interior nearest point, the
+two-face edge pseudonormal on an edge, the angle-weighted vertex pseudonormal on a vertex — so the
+sign is correct at creases where the raw nearest-face normal can flip. Tested: the edge branch
+provably uses both incident faces, and the SDF sign matches the winding ground truth everywhere on a
+closed mesh. (`MeshSdf`, the closed-mesh path, already used the winding sign, so it was robust once
+`winding` went O(log n).) **Remaining to fully close:** add the 2nd-order winding term (or raise β)
+only if a use emerges that needs the winding *magnitude* (none does today).
 Fixes `code_review.md §7` (unaccelerated `winding()`), and — crucially — the generalized winding
 number is **defect-tolerant**, so it keeps working on the not-guaranteed-watertight meshes the
 engine currently emits (unlike a ray-parity test). Pair the BVH nearest-triangle (unsigned distance)
@@ -107,11 +186,17 @@ Fixes `code_review.md §6.1` (thin veins missed) and `§5.2` (watertight-by-decl
   *No mature Rust crate for Manifold DC was found — this is an in-house port from the TVCG paper.*
 *Sources:* Schaefer et al. 2007 (Manifold DC); Schaefer & Warren 2004 (Dual MC); Ju et al. 2002.
 
-**A1.6 [HIGH] Make failure loud (the review's top cross-cutting theme).**
-Not a literature item but the prerequisite for trusting any of the above: add a fit-failure channel
-(`code_review.md §4.2`), reject non-finite `.obj` + kernel panic hook (`§4.1`), surface Manifold-
-dropped units instead of rendering empty-as-"done" (`§2.3`), and handle `worker.onerror` (`§4.7`).
-This pairs naturally with UI item **B3** (validation/QC) and **B7** (sealed-contact report).
+**A1.6 [HIGH] Make failure loud (the review's top cross-cutting theme). — ✅ LARGELY DONE (2026-07-18).**
+Landed and verified: non-finite `.obj` rejected at ingress; kernel panic hook + `kernel_log` sink +
+`fit_is_finite` warning; ABI header-count bounds validation; the named octree/litho unwraps and the
+`uni_degree` assert made safe; Manifold-dropped units surfaced; `worker.onerror` handled (see the
+status table above). **The residuals are now also closed** in a follow-up: the `sym3_eig` NaN-`unwrap`
++ ABI-edge non-finite-coordinate rejection, the `gf_alloc/gf_free` capacity UB (§4.4), and the
+uncapped `.obj` parse (§4.5) — all with tests, all building for `wasm32`. Note the "fit-failure
+channel" premise was corrected — the one genuinely-open failure here is detecting the
+*finite-but-wrong* under-constrained fit, which routes to **A2.3** (anisotropy/trend better-conditions
+the fit) and a geometric-fold detector, not an ABI sentinel. Still pairs with UI item **B3**
+(validation/QC).
 
 ### A2. Geological-method completeness
 
@@ -211,14 +296,19 @@ global ellipsoid or an existing mesh as a trend, with Strength + Range. The bigg
 expressiveness lever, and the prototype already meshes surfaces so a trend mesh is in hand.
 *(Leapfrog Structural/Global Trend.)*
 
-**B7 [MED] On-demand cross-section / slice view** at an arbitrary plane (+ serial offset sections). A
-section is how geologists actually verify a stack; a read-only slice is very achievable in a
-browser. *(Leapfrog sections; RockWorks cross-sections/fence.)*
+**B7 [MED] On-demand cross-section / slice view** — ✅ **SHIPPED (feature 005, 2026-07-18).** Vertical
+sections from a two-click plan baseline + serial parallel sets, opened face-on with the current
+model's surface traces as a backdrop, are view-only (never dirty the project). Verified against
+`SPEC.md §10`. Follow-ons if wanted: arbitrary tilted/fence sections (currently vertical-only), and a
+printable section layout. *(Leapfrog sections; RockWorks cross-sections/fence.)*
 
-**B8 [MED] Polyline-on-section surface editing.** The category's signature "draw geology in 3D"
-gesture: draw a line on a section plane and re-solve the surface to honor it — makes surfaces
-controllable without more data. Higher build cost (needs the section view B7 first). *(Leapfrog edit-
-with-polyline.)*
+**B8 [MED] Polyline-on-section surface editing.** — ✅ **SHIPPED (feature 005, 2026-07-18).** Ordered
+polylines digitized across parallel sections loft into one fitted surface; the **draw direction sets
+the younging/normal** (verified: shipped code uses the corrected `m = normalize(ŝ × t̂)`, the affordance
+reads the same sign the fit does, and it feeds the existing points+orientations path with no kernel
+change). Verified against `SPEC.md §11` (acceptance §11.6 satisfied). Gap to close: no unit tests for
+the `frame`/`slice`/`digitizeDerive` geometry helpers — coverage is Playwright-e2e only. *(Leapfrog
+edit-with-polyline.)*
 
 **B9 [MED] Sealed-contact / non-overlap report.** Turn the engine's seam/stitch work into a user-
 visible guarantee: flag where surfaces fail to seal or bodies overlap (ties to A1.5 manifold output
@@ -238,24 +328,37 @@ System & drillhole import; RockWorks/Micromine.)*
 
 ## Part C — Suggested phasing
 
+> **Phase 1 status (2026-07-18): the *surfacing* half is done; the *foundation* half is the live
+> queue.** A1.6 make-failure-loud (✅, minus the residuals noted above), off-thread compose + run-token
+> guard (§2.1/§2.2 ✅), and — jumping ahead — the cross-section authoring feature (B7/B8 ✅) all landed.
+> **Not yet started:** A1.1 exact-predicate booleans, A1.2 fast winding number, A1.3 determinism test,
+> A1.4/A1.5 meshing, and B3 validation/QC. Those are the front of the queue now.
+
 **Phase 1 — Trustworthy foundation (do first; unblocks everything).**
-A1.6 make-failure-loud + B3 validation/QC; A1.1 consolidate on exact-predicate N-body booleans;
-A1.2 fast winding number; A1.3 determinism + native/wasm golden test; A1.4 QEF spike clamp.
+~~A1.6 make-failure-loud~~ ✅ (incl. the §4.4/§4.5/§4.6-residual/§7 cleanup); ~~A1.2 fast winding
+number~~ 🟡 prototyped (first-order; 2nd-order/robust-SDF still open); **remaining:** B3 validation/QC;
+A1.1 consolidate on exact-predicate N-body booleans; A1.3 determinism + native/wasm golden test; A1.4
+QEF spike clamp.
 *Outcome:* the "reliably compose arbitrary CSG" goal is actually met for the geology the engine
 already models, and failures are visible instead of silent.
 
 **Phase 2 — Cheap expressiveness & correctness wins.**
-B1 younging toggle; B2 stack cut-rule table (exposes the topography-order landmine); B4 unconformity
-types; B5 vein pinch-out; A2.2 kriging-variance uncertainty band (near-free); A2.3 global anisotropy
-(also improves fit conditioning); A1.5 sub-cell feature detection + Manifold DC.
+B1 younging toggle *(note: feature 005 already derives per-line younging from draw direction — B1
+generalizes that to a per-surface toggle)*; B2 stack cut-rule table (exposes the §3.1 topography-order
+landmine); B4 unconformity types; B5 vein pinch-out (pairs with the still-open §3.3 imported VeinWall);
+A2.2 kriging-variance uncertainty band (near-free); A2.3 global anisotropy (also better-conditions the
+fit — the real fix for the §1.3/§4.2 finite-but-wrong-fit failure); A1.5 sub-cell feature detection +
+Manifold DC.
 
 **Phase 3 — Structural completeness.**
 A2.1 fault networks via structural frames (the biggest capability gap) + B11 fault UI; B6 structural-
-trend control; B7 cross-sections; A2.6 tangent constraints + topology output.
+trend control; ~~B7 cross-sections~~ ✅ (shipped — extend to tilted/fence sections); A2.6 tangent
+constraints + topology output.
 
 **Phase 4 — Frontier.**
-A2.4 Monte-Carlo ensembles; A2.5 fold frames; B8 polyline-on-section editing; B11 drillhole model;
-full Bayesian inversion / LVA / neural meshing as research bets.
+A2.4 Monte-Carlo ensembles; A2.5 fold frames; ~~B8 polyline-on-section editing~~ ✅ (shipped — add
+unit tests for the geometry helpers); B11 drillhole model; full Bayesian inversion / LVA / neural
+meshing as research bets.
 
 ---
 

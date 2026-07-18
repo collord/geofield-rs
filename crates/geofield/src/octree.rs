@@ -713,6 +713,11 @@ struct TriBvh {
     nodes: Vec<BvhNode>,
     /// Triangle indices, reordered by the build so each leaf is a contiguous slice.
     order: Vec<u32>,
+    /// Per-node winding-number expansion, parallel to `nodes` (Barill et al. 2018, *Fast Winding
+    /// Numbers for Soups and Clouds*): the aggregate first-order (dipole) moment of the subtree, so a
+    /// query point FAR from a node evaluates the whole subtree's winding contribution in O(1) instead
+    /// of visiting its triangles → O(log n) queries instead of O(n) (code_review §7 / roadmap A1.2).
+    wind: Vec<NodeWind>,
 }
 
 #[derive(Clone)]
@@ -723,6 +728,21 @@ struct BvhNode {
     /// the left child index; the right child is `start + 1`.
     start: u32,
     count: u32,
+}
+
+/// One node's aggregated winding-number expansion (Barill et al. 2018, first-order / dipole term).
+#[derive(Clone, Copy, Default)]
+struct NodeWind {
+    /// Σ over the subtree's triangles of the area-weighted normal `0.5·(b−a)×(c−a)` — the dipole
+    /// moment. The far-field solid angle at `p` is `n_sum·(center−p)/|center−p|³`.
+    n_sum: [f64; 3],
+    /// Area-weighted centroid of the subtree's triangles — the Taylor expansion point.
+    center: [f64; 3],
+    /// Σ triangle area over the subtree (weight for combining child centers).
+    area: f64,
+    /// Max distance from `center` to any subtree vertex — the cluster radius the far-field test uses
+    /// (`p` is "far" when `|center−p| > β·radius`).
+    radius: f64,
 }
 
 impl TriBvh {
@@ -751,7 +771,7 @@ impl TriBvh {
         let mut nodes: Vec<BvhNode> = Vec::new();
         if n == 0 {
             nodes.push(BvhNode { min: [0.0; 3], max: [0.0; 3], start: 0, count: 0 });
-            return Self { nodes, order };
+            return Self { nodes, order, wind: vec![NodeWind::default()] };
         }
         // Iterative build over `order` ranges to avoid deep recursion on huge meshes.
         struct Task {
@@ -792,7 +812,60 @@ impl TriBvh {
             stack.push(Task { lo, hi: mid, node: left });
             stack.push(Task { lo: mid, hi, node: left + 1 });
         }
-        Self { nodes, order }
+
+        // Winding-number expansion (Barill et al. 2018). The builder appends children AFTER their
+        // parent, so every internal node's child indices exceed its own — a single reverse pass
+        // computes each subtree's dipole from already-computed children (leaves) with no recursion.
+        let mut wind = vec![NodeWind::default(); nodes.len()];
+        for i in (0..nodes.len()).rev() {
+            let nd = nodes[i].clone();
+            if nd.count > 0 {
+                // Leaf: aggregate its triangles directly.
+                let (mut n_sum, mut wc, mut area) = ([0.0; 3], [0.0; 3], 0.0);
+                for &ti in &order[nd.start as usize..(nd.start + nd.count) as usize] {
+                    let t = tris[ti as usize];
+                    let (a, b, c) = (verts[t[0]], verts[t[1]], verts[t[2]]);
+                    let cr = cross(sub(b, a), sub(c, a));
+                    let at = 0.5 * norm(cr); // triangle area
+                    let cen = [(a[0] + b[0] + c[0]) / 3.0, (a[1] + b[1] + c[1]) / 3.0, (a[2] + b[2] + c[2]) / 3.0];
+                    for k in 0..3 {
+                        n_sum[k] += 0.5 * cr[k]; // area-weighted normal (dipole moment)
+                        wc[k] += at * cen[k];
+                    }
+                    area += at;
+                }
+                let center = if area > 0.0 {
+                    [wc[0] / area, wc[1] / area, wc[2] / area]
+                } else {
+                    [(nd.min[0] + nd.max[0]) / 2.0, (nd.min[1] + nd.max[1]) / 2.0, (nd.min[2] + nd.max[2]) / 2.0]
+                };
+                let mut radius: f64 = 0.0;
+                for &ti in &order[nd.start as usize..(nd.start + nd.count) as usize] {
+                    let t = tris[ti as usize];
+                    for &vi in &t {
+                        radius = radius.max(norm(sub(verts[vi], center)));
+                    }
+                }
+                wind[i] = NodeWind { n_sum, center, area, radius };
+            } else {
+                // Internal: combine the two children (already computed — higher indices).
+                let (wl, wr) = (wind[nd.start as usize], wind[nd.start as usize + 1]);
+                let area = wl.area + wr.area;
+                let n_sum = [wl.n_sum[0] + wr.n_sum[0], wl.n_sum[1] + wr.n_sum[1], wl.n_sum[2] + wr.n_sum[2]];
+                let center = if area > 0.0 {
+                    [
+                        (wl.area * wl.center[0] + wr.area * wr.center[0]) / area,
+                        (wl.area * wl.center[1] + wr.area * wr.center[1]) / area,
+                        (wl.area * wl.center[2] + wr.area * wr.center[2]) / area,
+                    ]
+                } else {
+                    [(nd.min[0] + nd.max[0]) / 2.0, (nd.min[1] + nd.max[1]) / 2.0, (nd.min[2] + nd.max[2]) / 2.0]
+                };
+                let radius = (norm(sub(wl.center, center)) + wl.radius).max(norm(sub(wr.center, center)) + wr.radius);
+                wind[i] = NodeWind { n_sum, center, area, radius };
+            }
+        }
+        Self { nodes, order, wind }
     }
 
     /// Squared distance from `p` to an AABB (0 if inside).
@@ -888,18 +961,126 @@ impl TriBvh {
             }
         }
     }
+
+    /// Generalized winding number at `p`, in turns, via the Barill et al. 2018 tree walk: a node whose
+    /// cluster is FAR from `p` (`|center−p| > β·radius`) contributes its whole subtree through the
+    /// first-order dipole `n_sum·(center−p)/|center−p|³` in O(1); only NEAR nodes recurse, and near
+    /// leaves sum the EXACT per-triangle solid angle. So the approximation is used only where the
+    /// winding is small and smooth (far field); points near the surface — where the membership
+    /// decision lives — are always exact. O(log n) amortized vs. the O(n) flat scan. `beta2 = β²`.
+    fn fast_winding(&self, p: [f64; 3], beta2: f64, verts: &[[f64; 3]], tris: &[[usize; 3]]) -> f64 {
+        if self.order.is_empty() {
+            return 0.0;
+        }
+        let mut omega = 0.0;
+        let mut stack = vec![0usize];
+        while let Some(i) = stack.pop() {
+            let w = &self.wind[i];
+            let d = sub(w.center, p);
+            let d2 = dot(d, d);
+            // Far field: the query is well outside the cluster → one dipole term for the whole subtree.
+            if d2 > 0.0 && d2 > beta2 * w.radius * w.radius {
+                omega += dot(w.n_sum, d) / (d2 * d2.sqrt());
+                continue;
+            }
+            let n = &self.nodes[i];
+            if n.count > 0 {
+                for &ti in &self.order[n.start as usize..(n.start + n.count) as usize] {
+                    let t = tris[ti as usize];
+                    omega += tri_solid_angle(p, verts[t[0]], verts[t[1]], verts[t[2]]);
+                }
+            } else {
+                stack.push(n.start as usize);
+                stack.push(n.start as usize + 1);
+            }
+        }
+        omega / (4.0 * std::f64::consts::PI)
+    }
+}
+
+/// Barycentric coordinates `[u, v, w]` of `p` w.r.t. triangle `(a, b, c)` (weights of a, b, c). For a
+/// point ON the triangle, a coordinate ≈ 0 means `p` lies on the opposite edge; two ≈ 0 means `p` is
+/// the remaining vertex. Degenerate triangle → `[1, 0, 0]` (treat as vertex a).
+fn barycentric(p: [f64; 3], a: [f64; 3], b: [f64; 3], c: [f64; 3]) -> [f64; 3] {
+    let (v0, v1, v2) = (sub(b, a), sub(c, a), sub(p, a));
+    let (d00, d01, d11) = (dot(v0, v0), dot(v0, v1), dot(v1, v1));
+    let (d20, d21) = (dot(v2, v0), dot(v2, v1));
+    let denom = d00 * d11 - d01 * d01;
+    if denom.abs() < 1e-30 {
+        return [1.0, 0.0, 0.0];
+    }
+    let v = (d11 * d20 - d01 * d21) / denom;
+    let w = (d00 * d21 - d01 * d20) / denom;
+    [1.0 - v - w, v, w]
+}
+
+/// The signed solid angle (steradians) that oriented triangle `(va,vb,vc)` subtends at `p`
+/// (Van Oosterom–Strackee). `0` if `p` coincides with a vertex. Summed over a mesh and divided by 4π
+/// this is the generalized winding number; it is also the exact near-field term of `fast_winding`.
+fn tri_solid_angle(p: [f64; 3], va: [f64; 3], vb: [f64; 3], vc: [f64; 3]) -> f64 {
+    let (a, b, c) = (sub(va, p), sub(vb, p), sub(vc, p));
+    let (la, lb, lc) = (norm(a), norm(b), norm(c));
+    if la == 0.0 || lb == 0.0 || lc == 0.0 {
+        return 0.0;
+    }
+    let numer = det3(a, b, c);
+    let denom = la * lb * lc + dot(a, b) * lc + dot(b, c) * la + dot(c, a) * lb;
+    2.0 * numer.atan2(denom)
 }
 
 pub struct TriMesh {
     vertices: Vec<[f64; 3]>,
     triangles: Vec<[usize; 3]>,
     bvh: TriBvh,
+    /// Angle-weighted vertex pseudonormals (Bærentzen & Aanæs 2005), parallel to `vertices`: the
+    /// sign-correct surface normal when the nearest point lands on a vertex.
+    vertex_pn: Vec<[f64; 3]>,
+    /// Summed incident-face normals per undirected edge — the edge pseudonormal, used when the nearest
+    /// point lands on a shared edge (where one face's normal can mis-sign near a crease). Together these
+    /// make `local_signed_distance`'s sign robust, not just the raw nearest-face normal (roadmap A1.2).
+    edge_pn: std::collections::HashMap<(u32, u32), [f64; 3]>,
 }
 
 impl TriMesh {
     pub fn new(vertices: Vec<[f64; 3]>, triangles: Vec<[usize; 3]>) -> Self {
         let bvh = TriBvh::build(&vertices, &triangles);
-        Self { vertices, triangles, bvh }
+        let (vertex_pn, edge_pn) = Self::build_pseudonormals(&vertices, &triangles);
+        Self { vertices, triangles, bvh, vertex_pn, edge_pn }
+    }
+
+    /// Precompute the angle-weighted vertex pseudonormals and per-edge summed face normals
+    /// (Bærentzen & Aanæs 2005) so `local_signed_distance` can sign correctly at edges/vertices.
+    fn build_pseudonormals(
+        verts: &[[f64; 3]],
+        tris: &[[usize; 3]],
+    ) -> (Vec<[f64; 3]>, std::collections::HashMap<(u32, u32), [f64; 3]>) {
+        let mut vpn = vec![[0.0; 3]; verts.len()];
+        let mut epn: std::collections::HashMap<(u32, u32), [f64; 3]> = std::collections::HashMap::new();
+        // Interior angle at `p` between edges p→q and p→r (the vertex weight, Bærentzen & Aanæs).
+        let angle = |p: [f64; 3], q: [f64; 3], r: [f64; 3]| -> f64 {
+            dot(normalize(sub(q, p)), normalize(sub(r, p))).clamp(-1.0, 1.0).acos()
+        };
+        for t in tris {
+            let (ia, ib, ic) = (t[0], t[1], t[2]);
+            let (a, b, c) = (verts[ia], verts[ib], verts[ic]);
+            let fnl = normalize(cross(sub(b, a), sub(c, a)));
+            if fnl == [0.0; 3] {
+                continue; // degenerate face contributes no normal
+            }
+            for &(vi, w) in &[(ia, angle(a, b, c)), (ib, angle(b, a, c)), (ic, angle(c, a, b))] {
+                for k in 0..3 {
+                    vpn[vi][k] += w * fnl[k];
+                }
+            }
+            for &(x, y) in &[(ia, ib), (ib, ic), (ic, ia)] {
+                let key = if x < y { (x as u32, y as u32) } else { (y as u32, x as u32) };
+                let e = epn.entry(key).or_insert([0.0; 3]);
+                for k in 0..3 {
+                    e[k] += fnl[k];
+                }
+            }
+        }
+        (vpn, epn)
     }
 
     /// The three world-space corners of triangle `t`.
@@ -979,28 +1160,24 @@ impl TriMesh {
         normalize(cross(ab, ac))
     }
 
-    /// Generalized winding number of the mesh at `p`, in turns (≈ +1 strictly
-    /// inside a closed outward-wound mesh, ≈ 0 outside). Sum of per-triangle
-    /// signed solid angles (Van Oosterom–Strackee) over 4π.
+    /// Generalized winding number of the mesh at `p`, in turns (≈ +1 strictly inside a closed
+    /// outward-wound mesh, ≈ 0 outside). BVH-accelerated (Barill et al. 2018): O(log n) via the
+    /// per-node dipole expansion, exact near the surface. Defect-tolerant — well-defined on the
+    /// not-guaranteed-watertight meshes the engine emits, unlike a ray-parity test.
     fn winding(&self, p: [f64; 3]) -> f64 {
+        // β = 2 (β² = 4): a node is "far" past twice its cluster radius. Near the surface every
+        // relevant node is near → exact, so membership (`> 0.5`) never flips vs. the flat scan.
+        self.bvh.fast_winding(p, 4.0, &self.vertices, &self.triangles)
+    }
+
+    /// The exact O(n) flat-scan winding number — the oracle `winding` (the BVH fast path) is tested
+    /// against. Kept for that test and as the reference definition.
+    #[cfg(test)]
+    fn winding_exact(&self, p: [f64; 3]) -> f64 {
         let mut omega = 0.0;
         for t in 0..self.triangles.len() {
             let (va, vb, vc) = self.tri(t);
-            let a = sub(va, p);
-            let b = sub(vb, p);
-            let c = sub(vc, p);
-            let la = norm(a);
-            let lb = norm(b);
-            let lc = norm(c);
-            if la == 0.0 || lb == 0.0 || lc == 0.0 {
-                continue; // p coincides with a vertex; treat as no contribution
-            }
-            let numer = det3(a, b, c);
-            let denom = la * lb * lc
-                + dot(a, b) * lc
-                + dot(b, c) * la
-                + dot(c, a) * lb;
-            omega += 2.0 * numer.atan2(denom);
+            omega += tri_solid_angle(p, va, vb, vc);
         }
         omega / (4.0 * std::f64::consts::PI)
     }
@@ -1051,17 +1228,52 @@ impl TriMesh {
     }
 
     /// LOCAL signed distance to the mesh (feature 004): magnitude = clamped nearest-triangle
-    /// distance; sign from the side of the NEAREST triangle `p` is on (`dot(p − closest, normal)`),
-    /// NOT from a global winding number (undefined for an open sheet) or a fitted field. This is the
-    /// no-co-kriging exact-patch field for an imported terrain: negative below the surface, positive
-    /// above, zero on it. `None` for an empty mesh.
+    /// distance; sign from the side of the surface `p` is on, via the Bærentzen–Aanæs PSEUDONORMAL at
+    /// the closest point — NOT a global winding number (undefined for an open sheet) or a fitted
+    /// field. Using the pseudonormal (not the raw nearest-face normal) makes the sign correct even
+    /// when the closest point lands on a shared edge or vertex, where one face's normal can mis-sign
+    /// near a crease (roadmap A1.2). This is the no-co-kriging exact-patch field for an imported
+    /// terrain: negative below the surface, positive above, zero on it. `None` for an empty mesh.
     pub fn local_signed_distance(&self, p: [f64; 3]) -> Option<f64> {
         let (t, d, cl) = self.nearest_triangle_clamped(p)?;
         if d <= 1e-12 {
             return Some(0.0);
         }
-        let s = if dot(sub(p, cl), self.tri_normal(t)) < 0.0 { -1.0 } else { 1.0 };
+        let n = self.pseudonormal_at(t, cl);
+        let s = if dot(sub(p, cl), n) < 0.0 { -1.0 } else { 1.0 };
         Some(s * d)
+    }
+
+    /// The Bærentzen–Aanæs pseudonormal at the closest point `cl` on triangle `t`: the FACE normal
+    /// if `cl` is interior, the EDGE pseudonormal (both incident faces summed) if `cl` is on an edge,
+    /// or the ANGLE-WEIGHTED VERTEX pseudonormal if `cl` is on a vertex — so `sign(dot(p−cl, n))`
+    /// classifies inside/outside correctly even at a crease. Falls back to the face normal if the
+    /// looked-up pseudonormal is degenerate (e.g. a boundary edge of an open sheet has one face).
+    fn pseudonormal_at(&self, t: usize, cl: [f64; 3]) -> [f64; 3] {
+        let [ia, ib, ic] = self.triangles[t];
+        let (a, b, c) = (self.vertices[ia], self.vertices[ib], self.vertices[ic]);
+        let face_n = self.tri_normal(t);
+        let bc = barycentric(cl, a, b, c);
+        const E: f64 = 1e-7; // barycentric coords are dimensionless
+        let n = match (bc[0] < E, bc[1] < E, bc[2] < E) {
+            (false, true, true) => self.vertex_pn[ia], // on vertex a
+            (true, false, true) => self.vertex_pn[ib], // on vertex b
+            (true, true, false) => self.vertex_pn[ic], // on vertex c
+            (true, false, false) => self.edge_pseudonormal(ib, ic), // on edge opposite a
+            (false, true, false) => self.edge_pseudonormal(ia, ic), // on edge opposite b
+            (false, false, true) => self.edge_pseudonormal(ia, ib), // on edge opposite c
+            _ => face_n,                                // interior (or fully degenerate)
+        };
+        if norm(n) <= 1e-12 {
+            face_n
+        } else {
+            n
+        }
+    }
+
+    fn edge_pseudonormal(&self, x: usize, y: usize) -> [f64; 3] {
+        let key = if x < y { (x as u32, y as u32) } else { (y as u32, x as u32) };
+        self.edge_pn.get(&key).copied().unwrap_or([0.0; 3])
     }
 }
 
@@ -2698,6 +2910,115 @@ mod tests {
     use crate::assemble::KernelOptions;
     use crate::data::{Orientation, Series, SurfacePoint};
     use crate::Model;
+
+    /// A closed, outward-wound UV sphere — a dense mesh (so the BVH has real internal nodes and the
+    /// far-field dipole path is exercised) with a known winding field (≈±1 inside, ≈0 outside).
+    fn uv_sphere(stacks: usize, slices: usize, r: f64) -> (Vec<[f64; 3]>, Vec<[usize; 3]>) {
+        use std::f64::consts::PI;
+        let mut verts = Vec::new();
+        for i in 0..=stacks {
+            let phi = PI * i as f64 / stacks as f64;
+            for j in 0..=slices {
+                let th = 2.0 * PI * j as f64 / slices as f64;
+                verts.push([r * phi.sin() * th.cos(), r * phi.sin() * th.sin(), r * phi.cos()]);
+            }
+        }
+        let idx = |i: usize, j: usize| i * (slices + 1) + j;
+        let mut tris = Vec::new();
+        for i in 0..stacks {
+            for j in 0..slices {
+                let (a, b, c, d) = (idx(i, j), idx(i + 1, j), idx(i + 1, j + 1), idx(i, j + 1));
+                tris.push([a, b, c]);
+                tris.push([a, c, d]);
+            }
+        }
+        (verts, tris)
+    }
+
+    #[test]
+    fn fast_winding_matches_exact_scan() {
+        // ~2k triangles → a multi-level BVH; interior/mid-range queries genuinely hit the far-field
+        // dipole path (not just trivially-zero distant points).
+        let (v, t) = uv_sphere(24, 24, 1.0);
+        let mesh = TriMesh::new(v, t);
+        let (mut max_diff_prod, mut max_diff_hi) = (0.0f64, 0.0f64);
+        // Deterministic grid over a box a few× the sphere: inside, near-surface, and far.
+        const N: usize = 11;
+        let g = |k: usize| -3.0 + 6.0 * k as f64 / (N as f64 - 1.0);
+        for a in 0..N {
+            for b in 0..N {
+                for c in 0..N {
+                    let p = [g(a), g(b), g(c)];
+                    let exact = mesh.winding_exact(p);
+                    // Production path (β = 2, first-order dipole).
+                    let fast = mesh.winding(p);
+                    max_diff_prod = max_diff_prod.max((fast - exact).abs());
+                    // The property that actually matters, and the reason β = 2 is safe: the
+                    // inside/outside decision never flips vs. the exact scan — the 0.5 crossing lives
+                    // near the surface, which is always near-field (exact). Every consumer
+                    // (`inside`, `MeshSdf` sign) uses only this decision, not the winding magnitude.
+                    assert_eq!(fast > 0.5, exact > 0.5, "membership flip at {p:?}: fast={fast} exact={exact}");
+                    // Convergence: as β grows, the far-field must converge to the exact scan — this is
+                    // what proves the dipole is the CORRECT asymptotic (a sign/formula bug would not
+                    // converge, only stay "roughly right"). β = 8 (β² = 64) → < 1e-3.
+                    let hi = mesh.bvh.fast_winding(p, 64.0, &mesh.vertices, &mesh.triangles);
+                    max_diff_hi = max_diff_hi.max((hi - exact).abs());
+                }
+            }
+        }
+        // First-order (dipole) accuracy at β = 2 is ~1e-2; the value is never used for a decision, so
+        // this bound only guards against gross regressions (wrong moment / expansion centre).
+        assert!(max_diff_prod < 2.5e-2, "β=2 winding max diff {max_diff_prod} exceeds first-order bound");
+        assert!(max_diff_hi < 1e-3, "β=6 winding max diff {max_diff_hi} — far-field does not converge to exact");
+        // End-to-end sanity: the field reads ≈±1 inside and ≈0 far outside (orientation-agnostic).
+        assert!(mesh.winding([0.0, 0.0, 0.0]).abs() > 0.9, "sphere centre should read as inside");
+        assert!(mesh.winding([2.7, 2.7, 2.7]).abs() < 0.1, "far corner should read as outside");
+    }
+
+    #[test]
+    fn pseudonormal_at_edge_uses_both_incident_faces() {
+        // Just outside the +x/+y edge of the octahedron (shared by the +z and −z octant faces); the
+        // nearest point is that edge. A single incident face's normal is z-tilted (|nz| ≈ 0.577); the
+        // EDGE pseudonormal sums BOTH faces, cancelling z — so the sign comes from the true bisector,
+        // not whichever tilted face `nearest` happened to return (the crease fragility A1.2 fixes).
+        let mesh = octahedron([0.0, 0.0, 0.0], 1.0);
+        let p = [0.571, 0.571, 0.0];
+        let (t, _d, cl) = mesh.nearest_triangle_clamped(p).unwrap();
+        let pn = normalize(mesh.pseudonormal_at(t, cl));
+        let face_n = mesh.tri_normal(t);
+        assert!(face_n[2].abs() > 0.4, "the returned single face is z-tilted (nz={})", face_n[2]);
+        assert!(pn[2].abs() < 1e-6, "edge pseudonormal cancels z (both faces used), nz={}", pn[2]);
+        assert!(pn[0] > 0.5 && pn[1] > 0.5, "edge pseudonormal points outward in +x+y: {pn:?}");
+    }
+
+    #[test]
+    fn local_signed_distance_sign_agrees_with_winding_on_closed_mesh() {
+        // On a CLOSED mesh the pseudonormal-signed distance must agree with the winding-number
+        // inside/outside test everywhere off the surface — including points whose nearest point lands
+        // on a sharp edge or vertex, the case the raw nearest-face normal can get wrong.
+        let mesh = octahedron([0.0, 0.0, 0.0], 1.0);
+        const N: usize = 15;
+        let g = |k: usize| -1.5 + 3.0 * k as f64 / (N as f64 - 1.0);
+        let mut checked = 0;
+        for a in 0..N {
+            for b in 0..N {
+                for c in 0..N {
+                    let p = [g(a), g(b), g(c)];
+                    let lsd = match mesh.local_signed_distance(p) {
+                        Some(x) => x,
+                        None => continue,
+                    };
+                    if lsd.abs() < 1e-6 {
+                        continue; // on/near the surface: sign ambiguous
+                    }
+                    let inside = mesh.winding(p) > 0.5;
+                    assert_eq!(lsd < 0.0, inside, "sign disagreement at {p:?}: lsd={lsd} inside={inside}");
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 100, "expected many off-surface samples, got {checked}");
+    }
 
     fn flat_model() -> Model {
         let sps = vec![

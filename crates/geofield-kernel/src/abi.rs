@@ -140,13 +140,30 @@ fn with_model<T>(handle: u32, default: T, f: impl FnOnce(&Model) -> T) -> T {
 // Byte-buffer helpers so the host can stage inputs / read outputs.
 // ---------------------------------------------------------------------------
 
+/// The allocation layout `gf_alloc`/`gf_free` agree on for a `len`-byte host buffer. Align 8 covers
+/// the f64 payload the host stages. Returns `None` for `len == 0` (no allocation) or a `len` that
+/// overflows when aligned.
+fn buffer_layout(len: usize) -> Option<std::alloc::Layout> {
+    if len == 0 {
+        return None;
+    }
+    std::alloc::Layout::from_size_align(len, 8).ok()
+}
+
 /// Allocate `len` bytes in kernel memory; returns the pointer (host writes inputs here).
+///
+/// Uses a fixed [`std::alloc::Layout`] so `gf_free` deallocates with the *identical* layout. The
+/// former `Vec::with_capacity(len)` + `from_raw_parts(ptr, 0, len)` freed with the requested length
+/// as the capacity, which is UB whenever the allocator over-allocates (code_review §4.4).
 #[no_mangle]
 pub extern "C" fn gf_alloc(len: usize) -> *mut u8 {
-    let mut buf = Vec::<u8>::with_capacity(len);
-    let ptr = buf.as_mut_ptr();
-    std::mem::forget(buf);
-    ptr
+    match buffer_layout(len) {
+        // A zero-length buffer needs no allocation; hand back a well-aligned dangling non-null ptr
+        // (the host must not read/write it), which `gf_free` treats as a no-op.
+        None => std::ptr::NonNull::<u64>::dangling().as_ptr() as *mut u8,
+        // SAFETY: `layout` has non-zero size.
+        Some(layout) => unsafe { std::alloc::alloc(layout) },
+    }
 }
 
 /// Free a buffer previously returned by `gf_alloc`.
@@ -155,9 +172,12 @@ pub extern "C" fn gf_alloc(len: usize) -> *mut u8 {
 /// `ptr`/`len` must be exactly a prior `gf_alloc(len)` result, freed once.
 #[no_mangle]
 pub unsafe extern "C" fn gf_free(ptr: *mut u8, len: usize) {
-    if !ptr.is_null() {
-        drop(Vec::from_raw_parts(ptr, 0, len));
+    if let Some(layout) = buffer_layout(len) {
+        if !ptr.is_null() {
+            std::alloc::dealloc(ptr, layout);
+        }
     }
+    // len == 0 → the dangling ptr from `gf_alloc`; nothing to free.
 }
 
 /// Read a little-endian f64 slice from a host-staged buffer.
@@ -225,9 +245,19 @@ unsafe fn decode_fit(ptr: *const u8, len_f64: usize) -> FitInput {
         .checked_mul(4)
         .and_then(|a| n_ori.checked_mul(6).and_then(|b| a.checked_add(b)))
         .and_then(|ab| ab.checked_add(13));
-    match body {
-        Some(need) if need <= len_f64 => {}
+    let need = match body {
+        Some(need) if need <= len_f64 => need,
         _ => return empty_fit(),
+    };
+    // Reject a non-finite coordinate / interface id / orientation at the ABI edge — the same
+    // guard the `.obj` ingress applies (`ObjError::NonFinite`). A NaN/inf datum otherwise flows
+    // into the covariance eigensolve and the kriging system and fits a garbage field; decoding to
+    // an empty (data-less) fit and warning is loud and attributable at input time, rather than
+    // relying on the downstream field going non-finite (code_review §4.6 residual). `need` bounds
+    // the body; the 13 header scalars were validated above.
+    if v[13..need].iter().any(|x| !x.is_finite()) {
+        host_log(2, "fit input rejected: non-finite coordinate or orientation");
+        return empty_fit();
     }
     let d = KernelOptions::default();
     let or = |x: f64, dflt: f64| if x.is_nan() { dflt } else { x };
@@ -571,6 +601,49 @@ mod tests {
         let mut negv = vec![0.0; 13];
         negv[1] = -1.0;
         assert_eq!(decode_counts(&negv, None), (0, 0), "negative count → empty");
+    }
+
+    #[test]
+    fn gf_alloc_free_roundtrips_various_sizes() {
+        // Exercises the exact alloc/free layout contract natively (the wasm host path isn't in this
+        // suite). Writing the whole buffer proves at least `len` usable bytes; freeing with the same
+        // `len` must match the allocation layout (no capacity-mismatch UB).
+        for &len in &[0usize, 1, 7, 8, 64, 4096] {
+            let p = gf_alloc(len);
+            if len != 0 {
+                assert!(!p.is_null(), "gf_alloc({len}) returned null");
+                // SAFETY: `p` points to `len` writable bytes just allocated.
+                unsafe { std::ptr::write_bytes(p, 0xAB, len) };
+            }
+            // SAFETY: `p`/`len` are exactly this `gf_alloc(len)` result, freed once.
+            unsafe { gf_free(p, len) };
+        }
+    }
+
+    #[test]
+    fn decode_fit_rejects_non_finite_coordinates() {
+        // A well-formed-LENGTH buffer (1 sp + 1 ori) but with a NaN surface-point coordinate must
+        // decode to an empty fit — the NaN must never reach the eigensolve / kriging system.
+        let mut v = vec![0.0; 13 + 4 + 6];
+        v[0] = 1.0; // n_sp
+        v[1] = 1.0; // n_ori
+        v[6] = 1.0; // uni_degree
+        v[13] = f64::NAN; // sp x
+        v[14] = 2.0;
+        v[15] = 3.0;
+        v[22] = 1.0; // pole z
+        assert_eq!(decode_counts(&v, None), (0, 0), "NaN coordinate → empty fit, no panic");
+
+        // An inf orientation pole is likewise rejected.
+        let mut w = vec![0.0; 13 + 4 + 6];
+        w[0] = 1.0;
+        w[1] = 1.0;
+        w[6] = 1.0;
+        w[13] = 1.0;
+        w[14] = 2.0;
+        w[15] = 3.0;
+        w[20] = f64::INFINITY; // pole x
+        assert_eq!(decode_counts(&w, None), (0, 0), "inf pole → empty fit");
     }
 
     #[test]

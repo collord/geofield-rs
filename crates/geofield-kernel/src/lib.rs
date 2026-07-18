@@ -621,7 +621,11 @@ fn sym3_eig(mut a: [[f64; 3]; 3]) -> ([f64; 3], [[f64; 3]; 3]) {
     let mut evals = [a[0][0], a[1][1], a[2][2]];
     // Sort ascending, permuting eigenvector columns with the eigenvalues.
     let mut order = [0usize, 1, 2];
-    order.sort_by(|&i, &j| evals[i].partial_cmp(&evals[j]).unwrap());
+    // `total_cmp` is a total order over all f64 (NaN sorts last) so this never panics on a
+    // non-finite eigenvalue — which a NaN input coordinate would produce. A NaN then flows on to
+    // the (non-finite) fitted field, which `Model::fit_is_finite` reports loudly, instead of
+    // trapping the wasm kernel here (code_review §4.6 residual).
+    order.sort_by(|&i, &j| evals[i].total_cmp(&evals[j]));
     let sorted_evals = [evals[order[0]], evals[order[1]], evals[order[2]]];
     let mut sorted_vecs = [[0.0; 3]; 3];
     for (col, &src) in order.iter().enumerate() {

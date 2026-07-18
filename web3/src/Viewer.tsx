@@ -267,6 +267,24 @@ function disposeOverlay(g: THREE.Group): void {
   });
 }
 
+/** Dispose the GPU resources of every child of the main mesh group before it is cleared and rebuilt.
+ *  Each rebuilt child owns a unique `BufferGeometry` + `MeshStandardMaterial` (and, with wireframe on,
+ *  a `WireframeGeometry` + `LineBasicMaterial`); `Group.clear()` only DETACHES them, so without this
+ *  their GPU buffers accumulate for the whole session on every Apply / render-mode / colour / wireframe
+ *  / visibility change (code_review §7). The group holds only these rebuildable meshes (nothing
+ *  persistent — it is cleared wholesale each rebuild), so disposing all children is safe. */
+function disposeMeshGroupChildren(g: THREE.Group): void {
+  g.traverse((o) => {
+    const r = o as unknown as {
+      geometry?: THREE.BufferGeometry;
+      material?: THREE.Material | THREE.Material[];
+    };
+    r.geometry?.dispose();
+    if (Array.isArray(r.material)) r.material.forEach((m) => m.dispose());
+    else r.material?.dispose();
+  });
+}
+
 /** Convert a "#rrggbb" hex string to a three.js numeric colour. */
 function hexToNum(hex: string): number {
   return parseInt(hex.replace("#", ""), 16) || 0x888888;
@@ -1112,6 +1130,7 @@ export function Viewer(props: {
   useEffect(() => {
     const st = stateRef.current;
     if (!st) return;
+    disposeMeshGroupChildren(st.group); // free prior GPU buffers before detaching (code_review §7)
     st.group.clear();
     const byLithology = props.colorBy === "lithology";
     const hidden = props.hiddenKeys;
