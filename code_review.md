@@ -237,12 +237,22 @@ over-allocate, so freeing with `len` is UB. It works with wasm dlmalloc today bu
 every fit and scratch grow.
 *Direction:* track and free with the real capacity, or use a fixed `Layout`.
 
+> **UPDATE (robustness cleanup — done):** `gf_alloc`/`gf_free` now share a fixed `buffer_layout(len)`
+> (align 8, `len == 0` → dangling no-op) and allocate/free via `std::alloc` with the *identical*
+> layout, eliminating the capacity mismatch. Native round-trip test `gf_alloc_free_roundtrips_various_sizes`;
+> builds clean for `wasm32-unknown-unknown`.
+
 ### 4.5 [MEDIUM] Imported-mesh parse/store is uncapped for huge/hostile files
 `wasm.rs:733` caps the *fit* to 400 pts / 120 oris, but `parse_obj` (`obj.rs:117`), the weld
 HashMap (`obj.rs:170`), and the retained `TriMesh` (cloned by `imported_surface_contact`,
 `wasm.rs:910`) are all O(n) with no byte/vertex/triangle budget. A multi-GB `.obj` OOM-aborts the
 instance before the fit cap applies. Untrusted user upload.
 *Direction:* enforce a size budget in `parse_obj`; reject with a readable `ObjError`.
+
+> **UPDATE (robustness cleanup — done):** `parse_obj` now enforces an `ObjLimits` budget (256 MiB /
+> 8M vertices / 16M faces) and returns `ObjError::TooLarge`; the byte cap is checked O(1) up front
+> before any allocation. Test `rejects_oversize_input` exercises all three caps via an injectable-limits
+> internal.
 
 ### 4.6 [MEDIUM] `assert_eq!(uni_degree, 1)` and other kernel asserts reachable from the ABI
 `assemble.rs:121`, plus `partial_cmp(...).unwrap()` at `octree.rs:471`, `octree.rs:2100`
@@ -253,6 +263,13 @@ octree `unwrap()`s panic on NaN/inf field distances (an ill-conditioned fit reac
 (`octree.rs:1789`) so it fails late rather than fast.
 *Direction:* clamp/validate `uni_degree` at the ABI edge; use `unwrap_or(Equal)` and a NaN guard in
 `sample_corners`.
+
+> **UPDATE (make-failure-loud pass + follow-up — done):** `uni_degree` is clamped at the ABI edge and
+> the octree `partial_cmp().unwrap()`s are now `unwrap_or(Equal)` (earlier pass). The **residual** the
+> verification surfaced — `sym3_eig`'s raw `partial_cmp().unwrap()` (`lib.rs:624`) reachable from a
+> host-staged NaN coordinate — is now closed two ways: the sort uses `f64::total_cmp` (never panics),
+> and `decode_fit` **rejects any non-finite coordinate/pole at the ABI edge** (`host_log` warning +
+> empty fit — loud, like the `.obj` guard). Test `decode_fit_rejects_non_finite_coordinates`.
 
 ### 4.7 [MEDIUM] No `worker.onerror` handler — some worker/wasm failures leave a blank view
 `main.tsx:196-226`
@@ -401,6 +418,10 @@ diagnostic when cells remain double-crossed at `max_depth`.
   on every Apply, toggle, and color edit; GPU buffers accumulate for the whole session. The overlay
   path *does* dispose (`disposeOverlay`), so this is an inconsistent oversight. *Direction:*
   traverse and dispose before `clear()`.
+  > **UPDATE (robustness cleanup — done):** the main mesh-rebuild effect now calls
+  > `disposeMeshGroupChildren(st.group)` (traverse → dispose geometry + material, incl. the wireframe
+  > `WireframeGeometry`/`LineBasicMaterial`) before `st.group.clear()`, mirroring `disposeOverlay`.
+  > (TS not type-checked in this environment — `node_modules` absent — verified by review.)
 - **[LOW]** Redundant field re-evaluation: no corner-sample caching across cells or parent/child
   (`octree.rs:1776-1793`, ≈ 8 × node_count kernel sums); `read_f64s` copies the whole fit buffer
   twice in the faulted path (`abi.rs:225-227`); every `WasmMesh` getter clones its `Vec` per JS

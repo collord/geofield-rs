@@ -53,23 +53,29 @@ the **finite-but-geologically-wrong under-constrained fit** (§1.3), which no fi
 that reframes the open item toward **A2.3 (structural anisotropy/trend, which better-conditions the
 fit)** and a geometric-fold detector, not an ABI channel.
 
-**Still open (verified NOT addressed this round):**
+**Closed in a follow-up cleanup (verified: `cargo test` green — kernel 48, geofield 135, onlap 1 — and
+both crates build clean for `wasm32-unknown-unknown`):**
+
+| Item | Review ref | Fix |
+|------|-----------|-----|
+| Three.js geometry/material **leak in the *primary* mesh-rebuild path** | §7 | ✅ `Viewer.tsx` now `disposeMeshGroupChildren(st.group)` (geometry + material, incl. wireframe) before `clear()` — mirrors `disposeOverlay`. *(TS not type-checked here — `node_modules` absent — verified by review.)* |
+| **NEW residual (I surfaced):** `sym3_eig` raw `.unwrap()` reachable from a host-staged NaN coordinate | §4.6 | ✅ Two layers: `sym3_eig` sort now uses `f64::total_cmp` (never panics on NaN), and `decode_fit` **rejects any non-finite coordinate/pole at the ABI edge** with a `host_log` warning + empty fit (loud + attributable, like the `.obj` guard). Tested (`decode_fit_rejects_non_finite_coordinates`). |
+| `gf_alloc`/`gf_free` capacity-mismatch UB | §4.4 | ✅ Both now use a shared fixed `Layout` (`buffer_layout`) so alloc and free agree exactly; `len == 0` handled. Tested (`gf_alloc_free_roundtrips_various_sizes`). |
+| Uncapped `.obj` parse (hostile-large-file OOM before the fit cap) | §4.5 | ✅ `parse_obj` now enforces a byte/vertex/face budget (`ObjError::TooLarge`); byte cap is O(1) up front. Tested (`rejects_oversize_input`). |
+
+**Still open (verified NOT addressed):**
 
 | Item | Review ref | Status / note |
 |------|-----------|---------------|
-| Three.js geometry/material **leak in the *primary* mesh-rebuild path** | §7 | ❌ Open. Feature-005 section-render paths dispose correctly, but `Viewer.tsx` `st.group.clear()` in the main mesh effect still allocates `BufferGeometry`/materials/`WireframeGeometry` per run with **no disposal** — GPU buffers still accumulate on every Apply/toggle/color edit. Cheap fix (mirror `disposeOverlay`). |
-| **NEW residual:** `sym3_eig` raw `partial_cmp().unwrap()` (`lib.rs:624`) | §4.6 | ⚠️ Partial. The fail-loud pass fixed the *named* unwraps, but this one survives and is **reachable from a host-staged fit buffer with a NaN coordinate** — `decode_fit` finite-checks only the header words `v[0]/v[1]`, not the coordinate payload `v[13..]`. The `.obj` path is protected (§4.1); the raw ABI fit path is not. Add an `is_finite` sweep of the decoded coords, and switch to `total_cmp`. |
-| `gf_alloc`/`gf_free` capacity-mismatch UB | §4.4 | ❌ Open, untouched. |
-| Uncapped `.obj` parse/weld (hostile-large-file OOM before the fit cap) | §4.5 | ❌ Open, untouched — see also **A1.5**. |
 | `global_unit` doesn't hoist Topography ("rock in the sky") | §3.1 | ❌ Open — a public-API correctness landmine; **UI item B2** would also surface it. |
 | Inert imported `VeinWall` role | §3.3 | ❌ Open — pairs with **UI item B5** (vein pinch-out/termination). |
 | Single-body seam-quality paths; fitted-erosion drift; coplanar drop-C | §3.2/§3.5/§3.6 | ❌ Open — the composition-quality cluster; **A1.1/A1.5** are the structural fix. |
-| The exact-predicate / determinism / thin-feature / winding-number **foundation** | §5.x/§6.x/§7-perf | ❌ Open — **all of Part A1.1–A1.5 remain**, and are now the top of the queue (below). |
+| The exact-predicate / determinism / thin-feature / winding-number **foundation** | §5.x/§6.x/§7-perf | ❌ Open — **all of Part A1.1–A1.5 remain**, and are now the top of the queue (below). *(Note: the `robust` crate — georust's Shewchuk predicates — is already a transitive dep, so A1.3 has a head start.)* |
 
-**Net:** the *reliability-surfacing* layer (make-failure-loud, off-thread compose, stale-guard) and
-the *cross-section authoring feature* are **done and verified**. The **geometry/robustness foundation
-(A1)** and the **geological-method completeness (A2)** are essentially untouched and are the real
-remaining roadmap. Phasing in Part C is updated accordingly.
+**Net:** the *reliability-surfacing* layer (make-failure-loud, off-thread compose, stale-guard), the
+*cross-section authoring feature*, and now the *robustness residuals* (§4.4/§4.5/§4.6-residual/§7) are
+**done and verified**. The **geometry/robustness foundation (A1.1–A1.5)** and the **geological-method
+completeness (A2)** remain the real roadmap. Phasing in Part C is updated accordingly.
 
 ---
 
@@ -163,12 +169,13 @@ Fixes `code_review.md §6.1` (thin veins missed) and `§5.2` (watertight-by-decl
 Landed and verified: non-finite `.obj` rejected at ingress; kernel panic hook + `kernel_log` sink +
 `fit_is_finite` warning; ABI header-count bounds validation; the named octree/litho unwraps and the
 `uni_degree` assert made safe; Manifold-dropped units surfaced; `worker.onerror` handled (see the
-status table above). **Residuals still open:** the `sym3_eig` raw `.unwrap()` reachable from a
-host-staged NaN coordinate (`lib.rs:624` — decode only finite-checks the header, not the coord
-payload); `gf_alloc/gf_free` capacity UB (§4.4); uncapped `.obj` parse (§4.5, see A1.5). Note the
-"fit-failure channel" premise was corrected — the real open item is detecting the *finite-but-wrong*
-under-constrained fit, which routes to **A2.3** (anisotropy/trend better-conditions the fit) and a
-geometric-fold detector, not an ABI sentinel. Still pairs with UI item **B3** (validation/QC).
+status table above). **The residuals are now also closed** in a follow-up: the `sym3_eig` NaN-`unwrap`
++ ABI-edge non-finite-coordinate rejection, the `gf_alloc/gf_free` capacity UB (§4.4), and the
+uncapped `.obj` parse (§4.5) — all with tests, all building for `wasm32`. Note the "fit-failure
+channel" premise was corrected — the one genuinely-open failure here is detecting the
+*finite-but-wrong* under-constrained fit, which routes to **A2.3** (anisotropy/trend better-conditions
+the fit) and a geometric-fold detector, not an ABI sentinel. Still pairs with UI item **B3**
+(validation/QC).
 
 ### A2. Geological-method completeness
 
@@ -307,10 +314,9 @@ System & drillhole import; RockWorks/Micromine.)*
 > A1.4/A1.5 meshing, and B3 validation/QC. Those are the front of the queue now.
 
 **Phase 1 — Trustworthy foundation (do first; unblocks everything).**
-~~A1.6 make-failure-loud~~ ✅; **remaining:** B3 validation/QC; A1.1 consolidate on exact-predicate
-N-body booleans; A1.2 fast winding number; A1.3 determinism + native/wasm golden test; A1.4 QEF spike
-clamp; **+ finish the A1.6 residuals** (`sym3_eig` unwrap / coord finite-check, §4.4 alloc UB, §4.5
-parse cap) and **the §7 Three.js leak in the main mesh path** (cheap, still open).
+~~A1.6 make-failure-loud~~ ✅ (incl. the §4.4/§4.5/§4.6-residual/§7 cleanup); **remaining:** B3
+validation/QC; A1.1 consolidate on exact-predicate N-body booleans; A1.2 fast winding number; A1.3
+determinism + native/wasm golden test; A1.4 QEF spike clamp.
 *Outcome:* the "reliably compose arbitrary CSG" goal is actually met for the geology the engine
 already models, and failures are visible instead of silent.
 
