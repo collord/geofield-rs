@@ -998,6 +998,22 @@ impl TriBvh {
     }
 }
 
+/// Barycentric coordinates `[u, v, w]` of `p` w.r.t. triangle `(a, b, c)` (weights of a, b, c). For a
+/// point ON the triangle, a coordinate ≈ 0 means `p` lies on the opposite edge; two ≈ 0 means `p` is
+/// the remaining vertex. Degenerate triangle → `[1, 0, 0]` (treat as vertex a).
+fn barycentric(p: [f64; 3], a: [f64; 3], b: [f64; 3], c: [f64; 3]) -> [f64; 3] {
+    let (v0, v1, v2) = (sub(b, a), sub(c, a), sub(p, a));
+    let (d00, d01, d11) = (dot(v0, v0), dot(v0, v1), dot(v1, v1));
+    let (d20, d21) = (dot(v2, v0), dot(v2, v1));
+    let denom = d00 * d11 - d01 * d01;
+    if denom.abs() < 1e-30 {
+        return [1.0, 0.0, 0.0];
+    }
+    let v = (d11 * d20 - d01 * d21) / denom;
+    let w = (d00 * d21 - d01 * d20) / denom;
+    [1.0 - v - w, v, w]
+}
+
 /// The signed solid angle (steradians) that oriented triangle `(va,vb,vc)` subtends at `p`
 /// (Van Oosterom–Strackee). `0` if `p` coincides with a vertex. Summed over a mesh and divided by 4π
 /// this is the generalized winding number; it is also the exact near-field term of `fast_winding`.
@@ -1016,12 +1032,55 @@ pub struct TriMesh {
     vertices: Vec<[f64; 3]>,
     triangles: Vec<[usize; 3]>,
     bvh: TriBvh,
+    /// Angle-weighted vertex pseudonormals (Bærentzen & Aanæs 2005), parallel to `vertices`: the
+    /// sign-correct surface normal when the nearest point lands on a vertex.
+    vertex_pn: Vec<[f64; 3]>,
+    /// Summed incident-face normals per undirected edge — the edge pseudonormal, used when the nearest
+    /// point lands on a shared edge (where one face's normal can mis-sign near a crease). Together these
+    /// make `local_signed_distance`'s sign robust, not just the raw nearest-face normal (roadmap A1.2).
+    edge_pn: std::collections::HashMap<(u32, u32), [f64; 3]>,
 }
 
 impl TriMesh {
     pub fn new(vertices: Vec<[f64; 3]>, triangles: Vec<[usize; 3]>) -> Self {
         let bvh = TriBvh::build(&vertices, &triangles);
-        Self { vertices, triangles, bvh }
+        let (vertex_pn, edge_pn) = Self::build_pseudonormals(&vertices, &triangles);
+        Self { vertices, triangles, bvh, vertex_pn, edge_pn }
+    }
+
+    /// Precompute the angle-weighted vertex pseudonormals and per-edge summed face normals
+    /// (Bærentzen & Aanæs 2005) so `local_signed_distance` can sign correctly at edges/vertices.
+    fn build_pseudonormals(
+        verts: &[[f64; 3]],
+        tris: &[[usize; 3]],
+    ) -> (Vec<[f64; 3]>, std::collections::HashMap<(u32, u32), [f64; 3]>) {
+        let mut vpn = vec![[0.0; 3]; verts.len()];
+        let mut epn: std::collections::HashMap<(u32, u32), [f64; 3]> = std::collections::HashMap::new();
+        // Interior angle at `p` between edges p→q and p→r (the vertex weight, Bærentzen & Aanæs).
+        let angle = |p: [f64; 3], q: [f64; 3], r: [f64; 3]| -> f64 {
+            dot(normalize(sub(q, p)), normalize(sub(r, p))).clamp(-1.0, 1.0).acos()
+        };
+        for t in tris {
+            let (ia, ib, ic) = (t[0], t[1], t[2]);
+            let (a, b, c) = (verts[ia], verts[ib], verts[ic]);
+            let fnl = normalize(cross(sub(b, a), sub(c, a)));
+            if fnl == [0.0; 3] {
+                continue; // degenerate face contributes no normal
+            }
+            for &(vi, w) in &[(ia, angle(a, b, c)), (ib, angle(b, a, c)), (ic, angle(c, a, b))] {
+                for k in 0..3 {
+                    vpn[vi][k] += w * fnl[k];
+                }
+            }
+            for &(x, y) in &[(ia, ib), (ib, ic), (ic, ia)] {
+                let key = if x < y { (x as u32, y as u32) } else { (y as u32, x as u32) };
+                let e = epn.entry(key).or_insert([0.0; 3]);
+                for k in 0..3 {
+                    e[k] += fnl[k];
+                }
+            }
+        }
+        (vpn, epn)
     }
 
     /// The three world-space corners of triangle `t`.
@@ -1169,17 +1228,52 @@ impl TriMesh {
     }
 
     /// LOCAL signed distance to the mesh (feature 004): magnitude = clamped nearest-triangle
-    /// distance; sign from the side of the NEAREST triangle `p` is on (`dot(p − closest, normal)`),
-    /// NOT from a global winding number (undefined for an open sheet) or a fitted field. This is the
-    /// no-co-kriging exact-patch field for an imported terrain: negative below the surface, positive
-    /// above, zero on it. `None` for an empty mesh.
+    /// distance; sign from the side of the surface `p` is on, via the Bærentzen–Aanæs PSEUDONORMAL at
+    /// the closest point — NOT a global winding number (undefined for an open sheet) or a fitted
+    /// field. Using the pseudonormal (not the raw nearest-face normal) makes the sign correct even
+    /// when the closest point lands on a shared edge or vertex, where one face's normal can mis-sign
+    /// near a crease (roadmap A1.2). This is the no-co-kriging exact-patch field for an imported
+    /// terrain: negative below the surface, positive above, zero on it. `None` for an empty mesh.
     pub fn local_signed_distance(&self, p: [f64; 3]) -> Option<f64> {
         let (t, d, cl) = self.nearest_triangle_clamped(p)?;
         if d <= 1e-12 {
             return Some(0.0);
         }
-        let s = if dot(sub(p, cl), self.tri_normal(t)) < 0.0 { -1.0 } else { 1.0 };
+        let n = self.pseudonormal_at(t, cl);
+        let s = if dot(sub(p, cl), n) < 0.0 { -1.0 } else { 1.0 };
         Some(s * d)
+    }
+
+    /// The Bærentzen–Aanæs pseudonormal at the closest point `cl` on triangle `t`: the FACE normal
+    /// if `cl` is interior, the EDGE pseudonormal (both incident faces summed) if `cl` is on an edge,
+    /// or the ANGLE-WEIGHTED VERTEX pseudonormal if `cl` is on a vertex — so `sign(dot(p−cl, n))`
+    /// classifies inside/outside correctly even at a crease. Falls back to the face normal if the
+    /// looked-up pseudonormal is degenerate (e.g. a boundary edge of an open sheet has one face).
+    fn pseudonormal_at(&self, t: usize, cl: [f64; 3]) -> [f64; 3] {
+        let [ia, ib, ic] = self.triangles[t];
+        let (a, b, c) = (self.vertices[ia], self.vertices[ib], self.vertices[ic]);
+        let face_n = self.tri_normal(t);
+        let bc = barycentric(cl, a, b, c);
+        const E: f64 = 1e-7; // barycentric coords are dimensionless
+        let n = match (bc[0] < E, bc[1] < E, bc[2] < E) {
+            (false, true, true) => self.vertex_pn[ia], // on vertex a
+            (true, false, true) => self.vertex_pn[ib], // on vertex b
+            (true, true, false) => self.vertex_pn[ic], // on vertex c
+            (true, false, false) => self.edge_pseudonormal(ib, ic), // on edge opposite a
+            (false, true, false) => self.edge_pseudonormal(ia, ic), // on edge opposite b
+            (false, false, true) => self.edge_pseudonormal(ia, ib), // on edge opposite c
+            _ => face_n,                                // interior (or fully degenerate)
+        };
+        if norm(n) <= 1e-12 {
+            face_n
+        } else {
+            n
+        }
+    }
+
+    fn edge_pseudonormal(&self, x: usize, y: usize) -> [f64; 3] {
+        let key = if x < y { (x as u32, y as u32) } else { (y as u32, x as u32) };
+        self.edge_pn.get(&key).copied().unwrap_or([0.0; 3])
     }
 }
 
@@ -2879,6 +2973,51 @@ mod tests {
         // End-to-end sanity: the field reads ≈±1 inside and ≈0 far outside (orientation-agnostic).
         assert!(mesh.winding([0.0, 0.0, 0.0]).abs() > 0.9, "sphere centre should read as inside");
         assert!(mesh.winding([2.7, 2.7, 2.7]).abs() < 0.1, "far corner should read as outside");
+    }
+
+    #[test]
+    fn pseudonormal_at_edge_uses_both_incident_faces() {
+        // Just outside the +x/+y edge of the octahedron (shared by the +z and −z octant faces); the
+        // nearest point is that edge. A single incident face's normal is z-tilted (|nz| ≈ 0.577); the
+        // EDGE pseudonormal sums BOTH faces, cancelling z — so the sign comes from the true bisector,
+        // not whichever tilted face `nearest` happened to return (the crease fragility A1.2 fixes).
+        let mesh = octahedron([0.0, 0.0, 0.0], 1.0);
+        let p = [0.571, 0.571, 0.0];
+        let (t, _d, cl) = mesh.nearest_triangle_clamped(p).unwrap();
+        let pn = normalize(mesh.pseudonormal_at(t, cl));
+        let face_n = mesh.tri_normal(t);
+        assert!(face_n[2].abs() > 0.4, "the returned single face is z-tilted (nz={})", face_n[2]);
+        assert!(pn[2].abs() < 1e-6, "edge pseudonormal cancels z (both faces used), nz={}", pn[2]);
+        assert!(pn[0] > 0.5 && pn[1] > 0.5, "edge pseudonormal points outward in +x+y: {pn:?}");
+    }
+
+    #[test]
+    fn local_signed_distance_sign_agrees_with_winding_on_closed_mesh() {
+        // On a CLOSED mesh the pseudonormal-signed distance must agree with the winding-number
+        // inside/outside test everywhere off the surface — including points whose nearest point lands
+        // on a sharp edge or vertex, the case the raw nearest-face normal can get wrong.
+        let mesh = octahedron([0.0, 0.0, 0.0], 1.0);
+        const N: usize = 15;
+        let g = |k: usize| -1.5 + 3.0 * k as f64 / (N as f64 - 1.0);
+        let mut checked = 0;
+        for a in 0..N {
+            for b in 0..N {
+                for c in 0..N {
+                    let p = [g(a), g(b), g(c)];
+                    let lsd = match mesh.local_signed_distance(p) {
+                        Some(x) => x,
+                        None => continue,
+                    };
+                    if lsd.abs() < 1e-6 {
+                        continue; // on/near the surface: sign ambiguous
+                    }
+                    let inside = mesh.winding(p) > 0.5;
+                    assert_eq!(lsd < 0.0, inside, "sign disagreement at {p:?}: lsd={lsd} inside={inside}");
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 100, "expected many off-surface samples, got {checked}");
     }
 
     fn flat_model() -> Model {

@@ -62,7 +62,8 @@ both crates build clean for `wasm32-unknown-unknown`):**
 | **NEW residual (I surfaced):** `sym3_eig` raw `.unwrap()` reachable from a host-staged NaN coordinate | §4.6 | ✅ Two layers: `sym3_eig` sort now uses `f64::total_cmp` (never panics on NaN), and `decode_fit` **rejects any non-finite coordinate/pole at the ABI edge** with a `host_log` warning + empty fit (loud + attributable, like the `.obj` guard). Tested (`decode_fit_rejects_non_finite_coordinates`). |
 | `gf_alloc`/`gf_free` capacity-mismatch UB | §4.4 | ✅ Both now use a shared fixed `Layout` (`buffer_layout`) so alloc and free agree exactly; `len == 0` handled. Tested (`gf_alloc_free_roundtrips_various_sizes`). |
 | Uncapped `.obj` parse (hostile-large-file OOM before the fit cap) | §4.5 | ✅ `parse_obj` now enforces a byte/vertex/face budget (`ObjError::TooLarge`); byte cap is O(1) up front. Tested (`rejects_oversize_input`). |
-| **A1.2 fast winding number** — O(n) `winding()`/point-in-mesh scan | §7-perf | 🟡 Prototyped: first-order Barill dipole on the existing `TriBvh` → O(log n); membership proven exact vs. the flat scan, far-field converges to exact. Tested (`fast_winding_matches_exact_scan`). See A1.2 for the remaining 2nd-order/robust-SDF work. |
+| **A1.2 fast winding number** — O(n) `winding()`/point-in-mesh scan | §7-perf | 🟡 Prototyped: first-order Barill dipole on the existing `TriBvh` → O(log n); membership proven exact vs. the flat scan, far-field converges to exact. Tested (`fast_winding_matches_exact_scan`). |
+| **A1.2 robust SDF sign** — `local_signed_distance` raw nearest-face normal mis-signs at creases | §7 | ✅ Now signs via the Bærentzen–Aanæs angle-weighted pseudonormal (edge → both incident faces; vertex → angle-weighted). Tested (`pseudonormal_at_edge_uses_both_incident_faces`, `local_signed_distance_sign_agrees_with_winding_on_closed_mesh`). |
 
 **Still open (verified NOT addressed):**
 
@@ -136,8 +137,16 @@ O(log n) queries instead of the O(n) flat scan. The exact scan is kept as `windi
 property every consumer (`inside`, `MeshSdf` sign) actually depends on, safe because the 0.5 crossing
 is always near-field/exact — and (b) the far-field **converges** to exact as β grows (1.8e-2 at β=2 →
 <1e-3 at β=8), confirming the dipole is the correct asymptotic. Builds clean for `wasm32`; all
-imported-mesh suites green. **Remaining to fully close:** add the 2nd-order term (or raise β) if a
-use emerges that needs the winding *magnitude* (none does today); and the paired robust SDF below.
+imported-mesh suites green.
+**The paired robust SDF is also done:** `TriMesh::local_signed_distance` (the open-terrain
+`MeshLocalField` path, where a global winding number is undefined) now signs via the
+**Bærentzen–Aanæs angle-weighted pseudonormal** — face normal for an interior nearest point, the
+two-face edge pseudonormal on an edge, the angle-weighted vertex pseudonormal on a vertex — so the
+sign is correct at creases where the raw nearest-face normal can flip. Tested: the edge branch
+provably uses both incident faces, and the SDF sign matches the winding ground truth everywhere on a
+closed mesh. (`MeshSdf`, the closed-mesh path, already used the winding sign, so it was robust once
+`winding` went O(log n).) **Remaining to fully close:** add the 2nd-order winding term (or raise β)
+only if a use emerges that needs the winding *magnitude* (none does today).
 Fixes `code_review.md §7` (unaccelerated `winding()`), and — crucially — the generalized winding
 number is **defect-tolerant**, so it keeps working on the not-guaranteed-watertight meshes the
 engine currently emits (unlike a ray-parity test). Pair the BVH nearest-triangle (unsigned distance)
