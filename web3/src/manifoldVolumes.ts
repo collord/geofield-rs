@@ -1,12 +1,17 @@
-// MAIN-THREAD Manifold pass for the unified volume mesher (docs/14, path b).
+// Manifold composition for the unified volume mesher (docs/14, path b).
 //
-// WHY HERE (not in the worker): the solver worker is terminate-per-fit (its hard-cancel design), so
-// every re-render spawns a fresh worker. manifold-3d is a SINGLE-THREADED wasm whose boolean op
-// deadlocks on the 2nd instantiation in a page (measured: `subtract` never returns) — it wants ONE
-// persistent instance, the exact opposite of the engine wasm. So Manifold lives on the main thread,
-// inited once and reused for the page's lifetime; the worker only emits a boolean RECIPE over
-// single-level-set primitives (Rust `mesh_volume_recipe`) and ships it here. `executeRecipe` composes
-// the rock units at the tail of a render the user is already waiting on, so it is not a perceptible block.
+// WHERE THIS RUNS: in a DEDICATED, PERSISTENT worker (manifoldWorker.ts) — NOT the main thread and
+// NOT the solver worker. manifold-3d is a SINGLE-THREADED wasm whose boolean op deadlocks on the 2nd
+// instantiation in one JS REALM (measured: `subtract` never returns) — it wants ONE persistent
+// instance. The solver worker is terminate-per-fit (hard-cancel), so it re-instantiates Manifold
+// every run and can't host it; a Web Worker is a SEPARATE realm, so a persistent worker that inits
+// Manifold exactly ONCE (and never terminates) sidesteps the deadlock and keeps the heavy
+// #bodies×#triangles compose off the UI thread. The solver worker only emits a boolean RECIPE over
+// single-level-set primitives (Rust `mesh_volume_recipe`); the main thread relays it here.
+// `executeRecipe` composes the rock units and streams per-unit progress via the `onUnit` callback.
+//
+// (This module holds the Manifold LOGIC — `initManifold` + `executeRecipe`; the worker wrapper that
+// owns the message loop and the run-token guarding lives in manifoldWorker.ts / main.tsx.)
 
 import ManifoldModule from "manifold-3d";
 import manifoldWasmUrl from "manifold-3d/manifold.wasm?url";
@@ -53,6 +58,7 @@ export function executeRecipe(
   ops: RecipeOp[],
   extent: [number, number, number, number, number, number],
   assignment: Record<string, string>,
+  onUnit?: (k: number, n: number) => void,
 ): RecipeResult {
   const { Manifold, Mesh } = wasm;
   const [x0, x1, y0, y1, z0, z1] = extent;
@@ -84,9 +90,12 @@ export function executeRecipe(
   }
 
   // Pass 2: compose each unit from the pooled primitives (booleans produce NEW solids; pooled inputs
-  // are reused, deleted only at the end).
+  // are reused, deleted only at the end). `onUnit(k, n)` fires after each unit group so the host
+  // worker can stream per-unit progress to the UI (n = total unit groups, known now).
   const out: SurfacePayload[] = [];
   let droppedUnits = 0;
+  const n = groups.size;
+  let k = 0;
   for (const [key, list] of groups) {
     let result: Solid | null = null;
     let ownsResult = false; // whether `result` is ours to delete (NOT a pooled prim / domainBox)
@@ -110,6 +119,7 @@ export function executeRecipe(
       // A primitive failed to ingest (NotManifold) → this rock unit is missing from the scene.
       // Count it so the caller can surface a warning rather than finishing silently (review 2.3).
       if (failed) droppedUnits++;
+      onUnit?.(++k, n);
       continue;
     }
     const clipped = result.intersect(domainBox);
@@ -129,6 +139,7 @@ export function executeRecipe(
       });
     }
     clipped.delete();
+    onUnit?.(++k, n);
   }
   for (const m of pool.values()) m?.delete();
   domainBox.delete();

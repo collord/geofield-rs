@@ -151,3 +151,46 @@ export interface WarningMessage {
 }
 
 export type WorkerMessage = StatusMessage | DoneMessage | ErrorMessage | WarningMessage;
+
+// ---------------------------------------------------------------------------
+// The DEDICATED Manifold worker's contract (manifoldWorker.ts). Kept SEPARATE from
+// `WorkerMessage` (the terminate-per-fit solver worker's contract): the two workers have
+// unrelated lifecycles and message shapes, and a shared union would force needless
+// type-widening in each `onmessage`. The main thread relays a compose RECIPE to the
+// persistent Manifold worker and correlates its streamed responses by `token` (a monotonic
+// run id) — a superseded run's result is dropped, so a stale compose can't overwrite a
+// newer model (review 2.1/2.2).
+// ---------------------------------------------------------------------------
+
+/** Main → Manifold worker: compose one recipe. `ops` buffers are transferred in. */
+export interface ComposeRequest {
+  type: "compose";
+  token: number;
+  ops: RecipeOp[];
+  extent: [number, number, number, number, number, number];
+  assignment: Record<string, string>;
+}
+export type ManifoldCommand = ComposeRequest;
+
+/** Manifold worker → main: per-unit progress (`k` of `n` unit groups composed so far). */
+export interface ComposeProgress {
+  type: "progress";
+  token: number;
+  k: number;
+  n: number;
+}
+/** Manifold worker → main: the compose finished. `surfaces` buffers are transferred back. */
+export interface ComposeDone {
+  type: "done";
+  token: number;
+  surfaces: SurfacePayload[];
+  /** Rock units Manifold could not compose (a primitive failed `ofMesh`) — a warning, not a fault. */
+  droppedUnits: number;
+}
+/** Manifold worker → main: the compose threw (an actual failure, distinct from droppedUnits). */
+export interface ComposeError {
+  type: "error";
+  token: number;
+  message: string;
+}
+export type ManifoldMessage = ComposeProgress | ComposeDone | ComposeError;

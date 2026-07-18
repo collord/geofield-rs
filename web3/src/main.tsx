@@ -59,8 +59,7 @@ import {
 } from "./HierarchyPanel/projectOps";
 import { AddSurfaceMenu } from "./HierarchyPanel/AddSurfaceMenu";
 import { SurfaceDataModal } from "./HierarchyPanel/SurfaceDataModal";
-import type { RenderMode, RunCommand, SurfacePayload, WorkerMessage } from "./protocol";
-import { initManifold, executeRecipe } from "./manifoldVolumes";
+import type { ManifoldMessage, RenderMode, RunCommand, SurfacePayload, WorkerMessage } from "./protocol";
 
 /** The minZ/maxZ form shown after the 2-point XY bounds digitization, to complete the rectangular
  *  prism (feature: draw model bounds). Prefilled from the current extent's Z range. */
@@ -179,6 +178,64 @@ function App() {
   const lastApplied = useRef<Project>(project);
   const workerRef = useRef<Worker | null>(null);
 
+  // The DEDICATED, PERSISTENT Manifold-boolean worker (manifoldWorker.ts). Unlike the solver
+  // worker (terminate-per-fit), this one is created lazily ONCE and never terminated — that is
+  // exactly why it can host manifold-3d (which deadlocks on re-instantiation). `runTokenRef` is a
+  // monotonic run id bumped on every `runStack`; `pendingRef` holds the CURRENT run's continuation
+  // so the once-wired worker `onmessage` can route the composed result to the right `finish` and
+  // DROP a superseded run's late result (review 2.1/2.2).
+  const manifoldWorkerRef = useRef<Worker | null>(null);
+  const runTokenRef = useRef(0);
+  const pendingRef = useRef<{
+    token: number;
+    finish: (surfaces: SurfacePayload[], statusText?: string) => void;
+    onDone?: () => void;
+  } | null>(null);
+
+  // Lazily create the persistent Manifold worker and wire its handlers ONCE. Reused across every
+  // fit and every project load; the `if` guard makes React StrictMode's dev double-mount idempotent.
+  function getManifoldWorker(): Worker {
+    if (!manifoldWorkerRef.current) {
+      const w = new Worker(new URL("./manifoldWorker.ts", import.meta.url), { type: "module" });
+      w.onmessage = (e: MessageEvent<ManifoldMessage>) => {
+        const msg = e.data;
+        const pending = pendingRef.current;
+        // STALE: a superseded run's result (or one arriving after we cleared pending) — drop it so
+        // it can't overwrite the current model's surfaces/status (review 2.2).
+        if (!pending || msg.token !== pending.token) return;
+        if (msg.type === "progress") {
+          // Stream per-unit progress to the same `status:` line + __statusLog. Keep "(Manifold)" so
+          // the /Manifold/ e2e assertion still matches.
+          const phase = `composing unit ${msg.k}/${msg.n} (Manifold)…`;
+          const wnd = window as unknown as { __statusLog?: string[] };
+          (wnd.__statusLog ??= []).push(phase);
+          setStatus(phase);
+        } else if (msg.type === "done") {
+          pendingRef.current = null;
+          pending.finish(
+            msg.surfaces,
+            msg.droppedUnits > 0
+              ? `⚠ done — ${msg.droppedUnits} rock unit${msg.droppedUnits > 1 ? "s" : ""} could not be composed`
+              : "done",
+          );
+        } else {
+          // A compose failure. Set an error status but do NOT run `onDone` — a failed Apply must
+          // stay dirty so the user knows it isn't applied — and release the Apply spinner directly.
+          pendingRef.current = null;
+          setStatus("error: solid composition failed — " + msg.message);
+          setApplying(false);
+        }
+      };
+      w.onerror = (ev: ErrorEvent) => {
+        pendingRef.current = null;
+        setStatus("error: Manifold worker failed — " + (ev.message || "unknown error"));
+        setApplying(false);
+      };
+      manifoldWorkerRef.current = w;
+    }
+    return manifoldWorkerRef.current;
+  }
+
   const validation = validate(project);
 
   // (Re)spawn the worker and post a run for a given compiled stack. Hard-terminate
@@ -190,6 +247,9 @@ function App() {
     seamClipOverride?: boolean,
     manifoldOverride?: boolean,
   ) {
+    // Bump the run token FIRST: this supersedes any Manifold compose still in flight from a prior
+    // run (its late result will be dropped by the token check), and tags this run's compose.
+    const token = ++runTokenRef.current;
     workerRef.current?.terminate();
     const worker = new Worker(new URL("./worker.ts", import.meta.url), { type: "module" });
     workerRef.current = worker;
@@ -211,34 +271,22 @@ function App() {
           setStatus(statusText);
           onDone?.();
         };
-        // Unified solid mesher: the worker shipped a boolean RECIPE over single-level-set primitives;
-        // compose the rock units on the PERSISTENT main-thread Manifold instance (it hangs if
-        // re-instantiated per worker — docs/14). The geology is already baked into the recipe (Rust's
-        // clip_maskers); the main thread just runs the booleans.
+        // Unified solid mesher: the worker shipped a boolean RECIPE over single-level-set primitives.
+        // Relay it to the DEDICATED, PERSISTENT Manifold worker (it deadlocks if re-instantiated, so
+        // it lives in its own never-terminated worker — docs/14, review 2.1). The geology is already
+        // baked into the recipe (Rust's clip_maskers); the Manifold worker just runs the booleans and
+        // streams per-unit progress. Its result returns via the once-wired handler in
+        // `getManifoldWorker`, correlated to this run by `token` (stale results are dropped).
         if (msg.recipeOps && msg.recipeMeta) {
           const { extent, assignment } = msg.recipeMeta;
           const ops = msg.recipeOps;
-          initManifold()
-            .then((wasm) => {
-              const { surfaces, droppedUnits } = executeRecipe(wasm, ops, extent, assignment);
-              // A unit dropped because its primitive failed to ingest is MISSING geometry — warn
-              // rather than render it silently as a clean "done" (review 2.3).
-              finish(
-                surfaces,
-                droppedUnits > 0
-                  ? `⚠ done — ${droppedUnits} rock unit${droppedUnits > 1 ? "s" : ""} could not be composed`
-                  : "done",
-              );
-            })
-            // A compose EXCEPTION on the recipe path means `msg.surfaces` is empty (the worker ships
-            // no legacy surfaces in solid mode). Finishing it would render an empty scene as "done"
-            // — the silent-blank outcome the spec forbids. Set an error status instead (review 2.3).
-            // Clear `applying` directly (NOT via `onDone`, which also clears `dirty` — a FAILED Apply
-            // must stay dirty so the user knows it isn't applied) so the Apply spinner releases.
-            .catch((err) => {
-              setStatus("error: solid composition failed — " + (err instanceof Error ? err.message : String(err)));
-              setApplying(false);
-            });
+          pendingRef.current = { token, finish, onDone };
+          const mw = getManifoldWorker();
+          // Transfer the recipe buffers into the worker (zero-copy). After this `msg.recipeOps` is
+          // detached on the main thread — we do not read it again.
+          const transfer: Transferable[] = [];
+          for (const o of ops) transfer.push(o.positions.buffer, o.indices.buffer);
+          mw.postMessage({ type: "compose", token, ops, extent, assignment }, transfer);
         } else {
           finish(msg.surfaces);
         }
@@ -291,7 +339,13 @@ function App() {
         lastApplied.current = project;
       });
     }
-    return () => workerRef.current?.terminate();
+    return () => {
+      workerRef.current?.terminate();
+      // Release the persistent Manifold worker on true unmount (page teardown). A remount lazily
+      // recreates it via `getManifoldWorker`; nulling the ref keeps that idempotent.
+      manifoldWorkerRef.current?.terminate();
+      manifoldWorkerRef.current = null;
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
