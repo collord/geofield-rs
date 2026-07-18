@@ -6,9 +6,23 @@ test("Export carries camera + render mode; load restores them", async ({ page })
   await page.goto("/");
   await page.getByTestId("seed-template").selectOption("cross-cutting-vein-dipping");
   await expect(page.getByText("status: done")).toBeVisible({ timeout: 30_000 });
-  // Go to Solids.
+  // Go to Solids. "status: done" alone races with the PREVIOUS fit's text (the stale-preview
+  // gotcha): if the solid fit hasn't landed before Export/load below, its result arrives
+  // AFTER the imported camera is applied, the data box changes shape (contact box ≠ solid
+  // box), and the box-keyed auto-frame overrides the restored camera. Wait for THIS fit via
+  // status-log growth, then for its result to land (payloads carry `unit` in solid mode).
+  const len0 = await page.evaluate(() => ((window as unknown as { __statusLog?: string[] }).__statusLog ?? []).length);
   await page.getByTestId("render-toggle").click();
-  await expect(page.getByText("status: done")).toBeVisible({ timeout: 30_000 });
+  await expect
+    .poll(async () => page.evaluate(() => ((window as unknown as { __statusLog?: string[] }).__statusLog ?? []).length), { timeout: 60_000 })
+    .toBeGreaterThanOrEqual(len0 + 2);
+  await expect(page.getByText("status: done")).toBeVisible({ timeout: 60_000 });
+  await expect
+    .poll(async () =>
+      page.evaluate(() =>
+        ((window as unknown as { __surfaces?: { unit?: number }[] }).__surfaces ?? []).some((s) => s.unit !== undefined),
+      ), { timeout: 60_000 })
+    .toBe(true);
   // Orbit a bit so the camera is off its default.
   const canvas = page.locator("main canvas");
   const box = (await canvas.boundingBox())!;
