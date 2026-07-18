@@ -11,6 +11,8 @@
 // specs/002-enhanced-authoring/. No Rust/worker/ABI/schema changes accompany this file.
 
 import type { SeriesJson } from "../protocol";
+import { derivePoles, meanPole, selfCrosses } from "../section/digitizeDerive";
+import { PLANE_EPS_FRACTION, extentDiagonal } from "../section/frame";
 
 // ============================================================================
 // T003 — data model types (data-model.md)
@@ -67,6 +69,38 @@ export interface OrientationRow {
   dipDir: number;
 }
 
+// ============================================================================
+// Cross-sections & digitized lines (feature 005) — data-model.md / contracts/project-json.md.
+// A SECTION SET is a VIEW construct (never geology: creating/moving/deleting one never sets
+// dirty, never re-fits — spec FR-009). A DIGITIZED LINE is GEOMETRY (a deferred commit edit).
+// ============================================================================
+
+/** A family of parallel vertical section planes from one plan-view baseline A→B. count = 1
+ *  ⇒ a single section. Per-plane geometry (frames, planes) is DERIVED in section/frame.ts,
+ *  never stored (Constitution III). */
+export interface SectionSet {
+  id: string;
+  name: string;
+  a: [number, number]; // baseline start, world XY
+  b: [number, number]; // baseline end; |b − a| > 0 guaranteed by the creation gesture
+  spacing: number; // > 0 when count > 1; plane k sits at offset + k·spacing along ŝ
+  count: number; // integer ≥ 1
+  offset?: number; // default 0: start offset of plane 0 from the baseline along ŝ
+  showInScene?: boolean; // the 3D translucent-quad toggle (US-SECT-5); default false
+}
+
+/** An ordered polyline digitized on one section plane for one surface. SELF-SUFFICIENT: it
+ *  snapshots its plane (`frame`), so deleting the section (a view construct) never orphans
+ *  the geometry; `sectionRef` is a soft UI-grouping ref that may dangle. VERTEX ORDER IS
+ *  LOAD-BEARING — the drawn direction encodes younging (contracts/younging-derivation.md §2:
+ *  pole m = ŝ × t̂, "youngs to the LEFT" face-on). */
+export interface DigitizedLine {
+  id: string;
+  frame: { origin: [number, number, number]; s: [number, number, number] }; // ŝ unit, horizontal
+  vertices: [number, number, number][]; // world-space, all on the plane (guarded on import)
+  sectionRef?: { setId: string; index: number };
+}
+
 /** One interface's interpolation data — the unit a user adds and edits. */
 export interface InterfaceData {
   id: string; // stable client id
@@ -75,8 +109,13 @@ export interface InterfaceData {
   orientations: OrientationRow[]; // optional; empty is valid
   /** Negate the orientation poles at compile time (the field's "which side is up" sense).
    *  A SEPARATE declared bit so the raw dip/dipDir the user typed still round-trip exactly;
-   *  flipping is reversible and never rewrites the entered values. Absent ⇒ not flipped. */
+   *  flipping is reversible and never rewrites the entered values. Absent ⇒ not flipped.
+   *  Applies to TYPED and DIGITIZED poles through the same XOR (flattenInterfaces). */
   flipped?: boolean;
+  /** Digitized section polylines (feature 005). Their vertices ARE this surface's contact
+   *  points and their drawn directions its orientations — derived at compile/render time,
+   *  never copied into `points`/`orientations` (one dataset, two views — spec FR-012). */
+  digitized?: DigitizedLine[];
 }
 
 /** An authoring container. A `series` with exactly one interface is PRESENTED FLAT (as a
@@ -148,6 +187,9 @@ export interface Project {
   /** The lithology catalog + per-unit assignment (feature 003 §4). Optional so older saved
    *  projects load; a fresh/loaded project without one gets the default catalog (US3). */
   catalog?: LithologyCatalog;
+  /** Cross-section sets (feature 005). VIEW/AUTHORING constructs, not geology: mutations
+   *  save immediately without dirty/re-fit (the setRelation pattern). Absent ⇒ none. */
+  sections?: SectionSet[];
   /** Optional saved VIEW state — captured on Export and re-applied on Import so a viewpoint
    *  round-trips and an exact view can be shared for repro. UI-only (never sent to the
    *  worker as geology). Covers the camera AND the render toggles, so "what I'm looking at"
@@ -170,6 +212,9 @@ export interface Project {
     overlayPointScale?: number;
     overlayArrowScale?: number;
     overlayLabelScale?: number;
+    /** The open section (feature 005), restored on import so a project reopens on the same
+     *  slice (spec FR-010/SC-005). Index clamped to [0, count) on load. Absent ⇒ 3D view. */
+    section?: { setId: string; index: number };
   };
 }
 
@@ -177,7 +222,9 @@ export interface Project {
  *  validation`, which judges the FITTED result — see validate()'s note and research.md R10. */
 export interface ProjectValidation {
   hardErrors: { elementId: string; interfaceId?: string; reason: string }[];
-  softWarnings: { elementId: string; interfaceId?: string; reason: string }[];
+  /** `lineId` + `fix` tag a warning that carries a one-action remedy (feature 005:
+   *  "flip this line to match" reverses that digitized line's vertex order). */
+  softWarnings: { elementId: string; interfaceId?: string; lineId?: string; fix?: "flipLine"; reason: string }[];
   canApply: boolean;
 }
 
@@ -255,6 +302,20 @@ function flattenInterfaces(
       ori_xyz.push(o.x, o.y, o.z);
       const [nx, ny, nz] = dipDirToPole(o.dip, o.dipDir);
       ori_pole.push(s * nx, s * ny, s * nz);
+    }
+    // Digitized section lines (feature 005): each vertex is a contact point; each segment
+    // yields one orientation at its midpoint with pole m = ŝ × t̂ (the drawn direction sets
+    // the younger side — contracts/younging-derivation.md §2). The SAME flip XOR `s` applies
+    // (contract §3): per-surface flip negates typed AND digitized poles at this one site.
+    for (const line of iface.digitized ?? []) {
+      for (const v of line.vertices) {
+        sp_xyz.push(v[0], v[1], v[2]);
+        sp_if.push(ifId);
+      }
+      for (const d of derivePoles(line.vertices, line.frame.s)) {
+        ori_xyz.push(d.pos[0], d.pos[1], d.pos[2]);
+        ori_pole.push(s * d.pole[0], s * d.pole[1], s * d.pole[2]);
+      }
     }
   });
   return { sp_xyz, sp_if, ori_xyz, ori_pole };
@@ -334,6 +395,22 @@ export function buildAuthoredOverlay(project: Project): AuthoredOverlay {
         // so the arrow reads as perpendicular to the surface it annotates. See dipDirToNormal.
         normals.push({ pos: [o.x, o.y, o.z], dir: dipDirToNormal(o.dip, o.dipDir), row: i + 1, colorIndex });
       });
+      // Digitized lines (feature 005, FR-012): their vertices ARE contact points and their
+      // per-segment poles orientations — the overlay is the second view of the one dataset.
+      // Row numbering continues after the typed rows (matching the modal's union table).
+      // Poles are pre-flip, like the typed normals ("the datum as drawn").
+      let row = iface.points.length;
+      let orow = iface.orientations.length;
+      for (const line of iface.digitized ?? []) {
+        for (const v of line.vertices) {
+          row += 1;
+          points.push({ pos: [v[0], v[1], v[2]], row, colorIndex });
+        }
+        for (const d of derivePoles(line.vertices, line.frame.s)) {
+          orow += 1;
+          normals.push({ pos: [d.pos[0], d.pos[1], d.pos[2]], dir: [d.pole[0], d.pole[1], d.pole[2]], row: orow, colorIndex });
+        }
+      }
     }
   });
   return { points, normals };
@@ -438,12 +515,138 @@ export function toSeriesJson(project: Project): SeriesJson[] {
 export function validate(project: Project): ProjectValidation {
   const hardErrors: ProjectValidation["hardErrors"] = [];
   const softWarnings: ProjectValidation["softWarnings"] = [];
+  // On-plane tolerance for digitized vertices (data-model.md; scale-relative).
+  const epsPlane = Math.max(PLANE_EPS_FRACTION * extentDiagonal(project.extent), 1e-9);
 
   const checkInterface = (elementId: string, iface: InterfaceData) => {
-    if (iface.points.length === 0) {
+    const digitizedVerts = (iface.digitized ?? []).reduce((n, l) => n + l.vertices.length, 0);
+    const totalPoints = iface.points.length + digitizedVerts;
+    if (totalPoints === 0) {
       hardErrors.push({ elementId, interfaceId: iface.id, reason: `"${iface.name}" has no points — add at least one` });
-    } else if (iface.points.length < 3) {
+    } else if (totalPoints < 3) {
       softWarnings.push({ elementId, interfaceId: iface.id, reason: `"${iface.name}" needs ≥3 points to fit well` });
+    }
+    checkDigitized(elementId, iface);
+  };
+
+  // Feature 005 digitizing rules (data-model.md "Validation rules" 1–6). STRUCTURAL only,
+  // like everything else here: can the fit even run / is the input self-consistent.
+  const checkDigitized = (elementId: string, iface: InterfaceData) => {
+    const lines = iface.digitized ?? [];
+    if (lines.length === 0) return;
+
+    // Rule 1 (hard): a line needs ≥2 vertices to be a line.
+    for (const line of lines) {
+      if (line.vertices.length < 2) {
+        hardErrors.push({
+          elementId,
+          interfaceId: iface.id,
+          reason: `"${iface.name}": a digitized line has ${line.vertices.length} vertex${line.vertices.length === 1 ? "" : "es"} — a line needs at least 2`,
+        });
+      }
+    }
+
+    // Rule 3 (hard, import guard): every vertex on its line's plane. The plane-locked tool
+    // makes this unreachable interactively; hand-edited/foreign files are caught here.
+    for (const line of lines) {
+      const [ox, oy, oz] = line.frame.origin;
+      const [sx, sy, sz] = line.frame.s;
+      const off = line.vertices.some(
+        (v) => Math.abs((v[0] - ox) * sx + (v[1] - oy) * sy + (v[2] - oz) * sz) > epsPlane,
+      );
+      if (off) {
+        hardErrors.push({
+          elementId,
+          interfaceId: iface.id,
+          reason: `"${iface.name}": a digitized vertex is off its section plane (corrupt import?)`,
+        });
+      }
+    }
+
+    // Co-planarity of the whole digitized set (vs line 0's plane).
+    const [ox, oy, oz] = lines[0].frame.origin;
+    const [sx, sy, sz] = lines[0].frame.s;
+    const allOnOnePlane = lines.every((l) =>
+      l.vertices.every((v) => Math.abs((v[0] - ox) * sx + (v[1] - oy) * sy + (v[2] - oz) * sz) <= epsPlane),
+    );
+    const hasOtherData = iface.points.length > 0 || iface.orientations.length > 0;
+    if (allOnOnePlane && !hasOtherData) {
+      // Rule 2 (hard): a single coplanar trace cannot define a bounded 3D surface (§11.5).
+      hardErrors.push({
+        elementId,
+        interfaceId: iface.id,
+        reason: `"${iface.name}": all digitized data lies on ONE section plane — digitize on ≥2 parallel sections (a single trace can't define a 3D surface)`,
+      });
+    } else if (allOnOnePlane) {
+      // Rule 4a (soft): under-constrained — the off-section shape rides on the other data.
+      softWarnings.push({
+        elementId,
+        interfaceId: iface.id,
+        reason: `"${iface.name}": digitized lines are all on one section — ≥2 (ideally 3) sections determine the surface`,
+      });
+    } else {
+      // Rule 4b (soft): parallel sections but NO across-section variation — the fit is a
+      // pure extrusion. Cheap proxy: every line has line 0's vertex count and the same
+      // in-plane profile within tolerance (in each line's own frame; u = [−sy, sx, 0]).
+      const profile = (l: DigitizedLine): [number, number][] => {
+        const u: [number, number, number] = [-l.frame.s[1], l.frame.s[0], 0];
+        return l.vertices.map((v) => [
+          (v[0] - l.frame.origin[0]) * u[0] + (v[1] - l.frame.origin[1]) * u[1],
+          v[2],
+        ]);
+      };
+      const p0 = profile(lines[0]);
+      const identical =
+        lines.length >= 2 &&
+        lines.every((l) => l.vertices.length === p0.length) &&
+        lines.slice(1).every((l) =>
+          profile(l).every((p, i) => Math.abs(p[0] - p0[i][0]) <= epsPlane && Math.abs(p[1] - p0[i][1]) <= epsPlane),
+        );
+      if (identical) {
+        softWarnings.push({
+          elementId,
+          interfaceId: iface.id,
+          reason: `"${iface.name}": digitized lines have no across-section variation — the surface is a pure extrusion`,
+        });
+      }
+    }
+
+    // Rule 5 (soft + fix): inconsistent younging — a sibling line drawn the "wrong way"
+    // describes a self-contradictory field. Reference = line 0's mean pole; an opposed
+    // line gets the one-action "flip this line to match" (reverses its vertex order).
+    const m0 = meanPole(lines[0].vertices, lines[0].frame.s);
+    if (m0) {
+      for (const line of lines.slice(1)) {
+        const m = meanPole(line.vertices, line.frame.s);
+        if (m && m0[0] * m[0] + m0[1] * m[1] + m0[2] * m[2] < 0) {
+          softWarnings.push({
+            elementId,
+            interfaceId: iface.id,
+            lineId: line.id,
+            fix: "flipLine",
+            reason: `"${iface.name}": a digitized line's drawn direction youngs the OPPOSITE way from its siblings`,
+          });
+        }
+      }
+    }
+
+    // Rule 6 (soft): a self-crossing/back-tracking chain has an ambiguous tangent.
+    for (const line of lines) {
+      const u: [number, number, number] = [-line.frame.s[1], line.frame.s[0], 0];
+      const pts2d = line.vertices.map(
+        (v): [number, number] => [
+          (v[0] - line.frame.origin[0]) * u[0] + (v[1] - line.frame.origin[1]) * u[1],
+          v[2],
+        ],
+      );
+      if (selfCrosses(pts2d)) {
+        softWarnings.push({
+          elementId,
+          interfaceId: iface.id,
+          lineId: line.id,
+          reason: `"${iface.name}": a digitized line self-crosses — its direction (younging) is ambiguous`,
+        });
+      }
     }
   };
 
@@ -550,7 +753,70 @@ export async function importProjectJson(file: File): Promise<Project> {
   if (p.version !== 1 || !Array.isArray(p.elements)) {
     throw new Error("not a valid .geoproj.json (version 1) file");
   }
-  return hydrateMeshPaths(p);
+  return hydrateMeshPaths(sanitizeSections(p));
+}
+
+/** Import-time guards for the feature-005 additive fields (contracts/project-json.md):
+ *  malformed SectionSets are a readable error naming the set; digitized-line normals are
+ *  renormalized (degenerate ⇒ error); a stale `view.section` is clamped/dropped (view-state
+ *  is best-effort). An OFF-PLANE digitized vertex is deliberately NOT rejected here — it
+ *  loads and surfaces as a hard validation error (blocks Apply, not load). Pre-005 files
+ *  have none of these fields and pass through untouched. */
+export function sanitizeSections(p: Project): Project {
+  let sections = p.sections;
+  if (sections !== undefined) {
+    if (!Array.isArray(sections)) throw new Error("invalid project: `sections` is not an array");
+    for (const set of sections) {
+      const finite2 = (v: unknown): v is [number, number] =>
+        Array.isArray(v) && v.length === 2 && v.every((n) => Number.isFinite(n));
+      if (!finite2(set.a) || !finite2(set.b)) {
+        throw new Error(`invalid section set "${set.name ?? set.id}": baseline a/b must be [x, y]`);
+      }
+      if (!Number.isInteger(set.count) || set.count < 1) {
+        throw new Error(`invalid section set "${set.name ?? set.id}": count must be an integer ≥ 1`);
+      }
+      if (set.count > 1 && !(set.spacing > 0)) {
+        throw new Error(`invalid section set "${set.name ?? set.id}": spacing must be > 0 for a serial set`);
+      }
+    }
+  }
+  // Renormalize digitized-line plane normals (horizontal + unit by contract).
+  const elements = p.elements.map((el) => {
+    const fixIface = (iface: InterfaceData): InterfaceData => {
+      if (!iface.digitized) return iface;
+      const digitized = iface.digitized.map((line) => {
+        const [sx, sy] = line.frame.s;
+        const n = Math.hypot(sx, sy);
+        if (!(n > 0)) {
+          throw new Error(`invalid digitized line on "${iface.name}": degenerate section normal`);
+        }
+        return { ...line, frame: { ...line.frame, s: [sx / n, sy / n, 0] as [number, number, number] } };
+      });
+      return { ...iface, digitized };
+    };
+    switch (el.kind) {
+      case "series":
+        return { ...el, interfaces: el.interfaces.map(fixIface) };
+      case "vein":
+        return { ...el, footWall: fixIface(el.footWall), hangingWall: fixIface(el.hangingWall) };
+      case "intrusion":
+        return { ...el, envelopeInner: fixIface(el.envelopeInner), envelopeOuter: fixIface(el.envelopeOuter) };
+      case "topography":
+        return { ...el, ground: fixIface(el.ground) };
+      case "importedSurface":
+        return el;
+    }
+  });
+  // Clamp/drop a stale active section (best-effort view-state).
+  let view = p.view;
+  if (view?.section) {
+    const set = sections?.find((s) => s.id === view!.section!.setId);
+    if (!set) view = { ...view, section: undefined };
+    else if (view.section.index < 0 || view.section.index >= set.count) {
+      view = { ...view, section: { setId: set.id, index: Math.min(Math.max(view.section.index, 0), set.count - 1) } };
+    }
+  }
+  return { ...p, sections, elements, view };
 }
 
 /** Fetch `objText` for any imported surface that carries an `objPath` but no inline text (a slimmed

@@ -8,8 +8,58 @@ import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import type { SurfacePayload } from "./protocol";
 import type { AuthoredOverlay } from "./HierarchyPanel/project";
+import { type SectionFrame, fromInPlane } from "./section/frame";
+import { derivePoles } from "./section/digitizeDerive";
 
-const SERIES_COLORS = [0x4f83cc, 0xcc7a4f, 0x6aa84f, 0x9b59b6, 0xc0392b];
+/** Element palette — exported so main.tsx colours section traces identically (feature 005). */
+export const SERIES_COLORS = [0x4f83cc, 0xcc7a4f, 0x6aa84f, 0x9b59b6, 0xc0392b];
+
+// ---------------------------------------------------------------------------------------
+// Feature 005 (cross-sections): the section-view content contract between main.tsx (which
+// SLICES — section/slice.ts over the already-returned payloads) and the Viewer (which only
+// DRAWS). All 2D coordinates are in-plane (du, dw); the Viewer lifts them onto the plane.
+// ---------------------------------------------------------------------------------------
+
+/** One digitized line as drawn in the section view. `sign` is the EFFECTIVE flip sign
+ *  (per-surface flip XOR relation default — contracts/younging-derivation.md §3), so the
+ *  younging affordance always shows the side the FIT will see. */
+export interface DigLineView {
+  lineId: string;
+  color: number;
+  isTarget: boolean;
+  sign: 1 | -1;
+  /** The LINE's own stored plane normal (may be anti-parallel to the viewing frame's s if
+   *  digitized from a twin baseline drawn the other way) — poles derive from THIS. */
+  s: [number, number, number];
+  vertices: [number, number, number][]; // world (on the plane)
+}
+
+export interface SectionContent {
+  /** Contact-mode traces (or solid-mode unfilled fallback chains), per source surface. */
+  traces: { color: number; polys: [number, number][][] }[];
+  /** Solid-mode filled unit intervals (closed loops, holes classified). */
+  fills: { color: number; shapes: { outer: [number, number][]; holes: [number, number][][] }[] }[];
+  /** Authored contact points within the slab tolerance (backdrop). */
+  backdrop: { p: [number, number]; color: number }[];
+  /** Digitized lines lying on this plane. */
+  lines: DigLineView[];
+}
+
+export interface SectionViewState {
+  /** `${setId}:${index}` — camera/content effect key. */
+  key: string;
+  label: string;
+  frame: SectionFrame;
+  zRange: [number, number];
+  content: SectionContent;
+}
+
+/** One 3D translucent plane quad (US-SECT-5), computed by main.tsx per shown set-member. */
+export interface SectionQuad {
+  frame: SectionFrame;
+  zRange: [number, number];
+  active: boolean;
+}
 
 /** Data bounding box `[x0, x1, y0, y1, z0, z1]`. */
 export type Extent = [number, number, number, number, number, number];
@@ -261,6 +311,23 @@ export function Viewer(props: {
   onBoundsXY?: (x0: number, x1: number, y0: number, y1: number) => void;
   /** Bump to reframe the camera on the current data (above-SE, fit) — a "Fit view" button. */
   fitNonce?: number;
+  // --- feature 005: cross-sections ---
+  /** When set (a NEW object), enter 2-point top-down SECTION-BASELINE digitization (clone of
+   *  the bounds gesture, US-SECT-1 ↔ US-BOUNDS-1). Second click → `onSectionBaseline(a, b)`. */
+  drawSection?: { nonce: number };
+  onSectionBaseline?: (a: [number, number], b: [number, number]) => void;
+  /** The open section view (undefined ⇒ ordinary 3D). Camera locks orthographic face-on
+   *  (u right, Z up); 3D content hides; the section content groups render instead. */
+  sectionView?: SectionViewState;
+  /** Step to the adjacent parallel section (PageUp/PageDown while in section view). */
+  onSectionStep?: (dir: -1 | 1) => void;
+  /** Translucent plane quads shown in the 3D view (US-SECT-5). */
+  sectionQuads?: SectionQuad[];
+  /** Digitizing tool state (armed = plane-locked pointer edits are live). */
+  digitize?: { armed: boolean };
+  onDigitizeClick?: (world: [number, number, number]) => void;
+  onDigitizeMove?: (lineId: string, vertexIndex: number, world: [number, number, number]) => void;
+  onDigitizeDelete?: (lineId: string, vertexIndex: number) => void;
 }) {
   const mountRef = useRef<HTMLDivElement | null>(null);
   const stateRef = useRef<{
@@ -271,10 +338,31 @@ export function Viewer(props: {
     group: THREE.Group;
     axes: THREE.Group | null;
     boundsBox: THREE.LineSegments | null;
-    rubber: THREE.LineLoop | null; // live rectangle during digitization
+    rubber: THREE.Line | null; // live rectangle/baseline during digitization
     framedKey: string | null; // the data-bounds key we last auto-framed (frame only on NEW data)
     overlay: THREE.Group | null; // authored points/normals overlay
+    // --- feature 005: cross-sections ---
+    sectionActive: boolean; // true while the section view owns the camera (3D content hidden)
+    sectionCam: THREE.OrthographicCamera | null;
+    sectionControls: OrbitControls | null;
+    sectionGroup: THREE.Group | null; // traces/fills/backdrop/digitized lines
+    quadGroup: THREE.Group | null; // the 3D translucent plane quads
   } | null>(null);
+  // Live digitize-callback ref so pointer handlers never capture stale closures.
+  const digitizeCbRef = useRef<{
+    click?: (w: [number, number, number]) => void;
+    move?: (lineId: string, vi: number, w: [number, number, number]) => void;
+    del?: (lineId: string, vi: number) => void;
+    lines: DigLineView[];
+    armed: boolean;
+  }>({ lines: [], armed: false });
+  digitizeCbRef.current = {
+    click: props.onDigitizeClick,
+    move: props.onDigitizeMove,
+    del: props.onDigitizeDelete,
+    lines: props.sectionView?.content.lines ?? [],
+    armed: !!props.digitize?.armed,
+  };
 
   // One-time three.js setup.
   useEffect(() => {
@@ -303,7 +391,11 @@ export function Viewer(props: {
     controls.target.set(500, 500, 500);
     controls.update();
 
-    stateRef.current = { renderer, scene, camera, controls, group, axes: null, boundsBox: null, rubber: null, framedKey: null, overlay: null };
+    stateRef.current = {
+      renderer, scene, camera, controls, group,
+      axes: null, boundsBox: null, rubber: null, framedKey: null, overlay: null,
+      sectionActive: false, sectionCam: null, sectionControls: null, sectionGroup: null, quadGroup: null,
+    };
     if (props.viewApiRef) {
       props.viewApiRef.current = {
         getView: () => ({
@@ -327,8 +419,15 @@ export function Viewer(props: {
     }
     let raf = 0;
     const tick = () => {
-      controls.update(); // damping only; no scene rotation
-      renderer.render(scene, camera);
+      const st = stateRef.current;
+      // Section view swaps in the orthographic camera + its pan/zoom-only controls (005).
+      if (st?.sectionActive && st.sectionCam) {
+        st.sectionControls?.update();
+        renderer.render(scene, st.sectionCam);
+      } else {
+        controls.update(); // damping only; no scene rotation
+        renderer.render(scene, camera);
+      }
       raf = requestAnimationFrame(tick);
     };
     tick();
@@ -357,6 +456,7 @@ export function Viewer(props: {
     const min = dataBox ? dataBox.min : ([ex0, ey0, ez0] as [number, number, number]);
     const max = dataBox ? dataBox.max : ([ex1, ey1, ez1] as [number, number, number]);
     const gnomon = buildGnomon(min, max);
+    gnomon.visible = !st.sectionActive; // 005: 3D content stays hidden while a section is open
     st.scene.add(gnomon);
     st.axes = gnomon;
   }, [dataBox, props.extent]);
@@ -394,6 +494,7 @@ export function Viewer(props: {
     }
     if (props.showBounds) {
       const box = buildBoundsBox(props.extent);
+      box.visible = !st.sectionActive; // 005: hidden while a section is open
       st.scene.add(box);
       st.boundsBox = box;
     }
@@ -423,6 +524,7 @@ export function Viewer(props: {
       arrow: sizes?.arrow ?? 1,
       label: sizes?.label ?? 1,
     });
+    overlay.visible = !st.sectionActive; // 005: hidden while a section is open
     st.scene.add(overlay);
     st.overlay = overlay;
   }, [props.authoredData, props.showAuthored, sizes?.point, sizes?.arrow, sizes?.label, dataBox, props.extent]);
@@ -537,6 +639,450 @@ export function Viewer(props: {
       dom.style.cursor = "";
     };
   }, [props.drawBounds]);
+
+  // =====================================================================================
+  // Feature 005 — cross-sections.
+  // =====================================================================================
+
+  // SECTION-BASELINE digitization (US-SECT-1): a clone of the bounds gesture above — snap
+  // top-down, two ground-plane clicks A→B, amber rubber LINE, Escape cancels. A degenerate
+  // baseline (shorter than 0.1% of the extent diagonal) ignores the second click.
+  useEffect(() => {
+    const st = stateRef.current;
+    if (!st || !props.drawSection) return;
+    const { renderer, camera, controls, scene } = st;
+    const dom = renderer.domElement;
+    const [ex0, ex1, ey0, ey1, ez0, ez1] = props.extent;
+    const bmin = dataBox ? dataBox.min : ([ex0, ey0, ez0] as [number, number, number]);
+    const bmax = dataBox ? dataBox.max : ([ex1, ey1, ez1] as [number, number, number]);
+    const cx = (bmin[0] + bmax[0]) / 2;
+    const cy = (bmin[1] + bmax[1]) / 2;
+    const zmid = (bmin[2] + bmax[2]) / 2;
+    const span = Math.max(bmax[0] - bmin[0], bmax[1] - bmin[1]) || 1;
+    const minLen = 1e-3 * Math.hypot(ex1 - ex0, ey1 - ey0, ez1 - ez0); // BASELINE_MIN_FRACTION
+
+    const damp = controls.enableDamping;
+    controls.enableDamping = false;
+    controls.update();
+    camera.up.set(0, 1, 0);
+    const dist = span * 2.0 || 1000;
+    camera.position.set(cx, cy, zmid + dist);
+    camera.near = Math.max(dist * 1e-3, 0.01);
+    camera.far = dist * 100;
+    camera.updateProjectionMatrix();
+    controls.target.set(cx, cy, zmid);
+    controls.update();
+    controls.enableDamping = damp;
+    controls.enabled = false;
+
+    const raycaster = new THREE.Raycaster();
+    const plane = new THREE.Plane(new THREE.Vector3(0, 0, 1), -zmid);
+    const groundXY = (e: PointerEvent): THREE.Vector3 | null => {
+      const r = dom.getBoundingClientRect();
+      const ndc = new THREE.Vector2(
+        ((e.clientX - r.left) / r.width) * 2 - 1,
+        -((e.clientY - r.top) / r.height) * 2 + 1,
+      );
+      raycaster.setFromCamera(ndc, camera);
+      const hit = new THREE.Vector3();
+      return raycaster.ray.intersectPlane(plane, hit) ? hit : null;
+    };
+
+    let pointA: THREE.Vector3 | null = null;
+    const clearRubber = () => {
+      if (st.rubber) {
+        scene.remove(st.rubber);
+        st.rubber.geometry.dispose();
+        st.rubber = null;
+      }
+    };
+    const onMove = (e: PointerEvent) => {
+      if (!pointA) return;
+      const b = groundXY(e);
+      if (!b) return;
+      clearRubber();
+      const line = new THREE.Line(
+        new THREE.BufferGeometry().setFromPoints([
+          new THREE.Vector3(pointA.x, pointA.y, zmid),
+          new THREE.Vector3(b.x, b.y, zmid),
+        ]),
+        new THREE.LineBasicMaterial({ color: 0xfacc15 }),
+      );
+      scene.add(line);
+      st.rubber = line;
+    };
+    const onDown = (e: PointerEvent) => {
+      const p = groundXY(e);
+      if (!p) return;
+      if (!pointA) {
+        pointA = p.clone();
+        return;
+      }
+      if (Math.hypot(p.x - pointA.x, p.y - pointA.y) < minLen) return; // degenerate — ignore
+      const a: [number, number] = [pointA.x, pointA.y];
+      const b: [number, number] = [p.x, p.y];
+      cleanup();
+      props.onSectionBaseline?.(a, b);
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") cleanup();
+    };
+    function cleanup() {
+      dom.removeEventListener("pointerdown", onDown);
+      dom.removeEventListener("pointermove", onMove);
+      window.removeEventListener("keydown", onKey);
+      clearRubber();
+      controls.enabled = true;
+    }
+    dom.addEventListener("pointerdown", onDown);
+    dom.addEventListener("pointermove", onMove);
+    window.addEventListener("keydown", onKey);
+    dom.style.cursor = "crosshair";
+    return () => {
+      cleanup();
+      dom.style.cursor = "";
+    };
+  }, [props.drawSection]);
+
+  // SECTION VIEW camera (US-SECT-3): an OrthographicCamera on the side ŝ points toward,
+  // looking −s at the plane, up = +Z — u to screen-right, Z up (contract §1). Controls are
+  // pan/zoom only (enableRotate = false). Entering hides the 3D content; exiting restores
+  // it and returns to the untouched perspective camera. PageUp/PageDown step slices.
+  useEffect(() => {
+    const st = stateRef.current;
+    if (!st) return;
+    const sv = props.sectionView;
+    if (!sv) {
+      // exit (or never entered)
+      if (st.sectionActive) {
+        st.sectionControls?.dispose();
+        st.sectionControls = null;
+        st.sectionCam = null;
+        st.sectionActive = false;
+        st.controls.enabled = true;
+        st.group.visible = true;
+        if (st.axes) st.axes.visible = true;
+        if (st.overlay) st.overlay.visible = true;
+        if (st.boundsBox) st.boundsBox.visible = true;
+        if (st.quadGroup) st.quadGroup.visible = true;
+      }
+      return;
+    }
+    const { renderer } = st;
+    const dom = renderer.domElement;
+    const aspect = dom.clientWidth / Math.max(dom.clientHeight, 1);
+    const { frame, zRange } = sv;
+    const [z0, z1] = zRange;
+    const zmid = (z0 + z1) / 2;
+    const center = fromInPlane(frame, frame.uLen / 2, zmid);
+    const dist = Math.max(frame.uLen, z1 - z0, 1) * 2;
+    let halfW = frame.uLen * 0.55;
+    let halfH = Math.max(z1 - z0, 1) * 0.55;
+    if (halfW / halfH > aspect) halfH = halfW / aspect;
+    else halfW = halfH * aspect;
+
+    if (!st.sectionCam) {
+      st.sectionCam = new THREE.OrthographicCamera(-halfW, halfW, halfH, -halfH, dist * 1e-3, dist * 10);
+      st.sectionControls = new OrbitControls(st.sectionCam, dom);
+      st.sectionControls.enableRotate = false; // pan + zoom only — the view stays face-on
+      st.sectionControls.enableDamping = false;
+    }
+    const cam = st.sectionCam;
+    cam.left = -halfW;
+    cam.right = halfW;
+    cam.top = halfH;
+    cam.bottom = -halfH;
+    cam.near = dist * 1e-3;
+    cam.far = dist * 10;
+    cam.zoom = 1;
+    cam.up.set(0, 0, 1);
+    cam.position.set(center[0] + frame.s[0] * dist, center[1] + frame.s[1] * dist, center[2] + frame.s[2] * dist);
+    cam.lookAt(center[0], center[1], center[2]);
+    cam.updateProjectionMatrix();
+    st.sectionControls!.target.set(center[0], center[1], center[2]);
+    st.sectionControls!.update();
+
+    st.sectionActive = true;
+    st.controls.enabled = false; // the perspective controls sleep while the section owns input
+    st.group.visible = false; // 3D meshes hidden — the section reads as a 2D drawing
+    if (st.axes) st.axes.visible = false;
+    if (st.overlay) st.overlay.visible = false;
+    if (st.boundsBox) st.boundsBox.visible = false;
+    if (st.quadGroup) st.quadGroup.visible = false;
+
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "PageUp") props.onSectionStep?.(-1);
+      else if (e.key === "PageDown") props.onSectionStep?.(1);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [props.sectionView?.key]);
+
+  // SECTION CONTENT (US-SECT-3/6, US-DIG-2): traces, filled unit intervals, backdrop points
+  // and digitized lines with the younging affordance. All content is computed in-plane by
+  // main.tsx (section/slice.ts); this effect only lifts it onto the plane and draws. Small
+  // +s offsets layer lines over fills without z-fighting.
+  useEffect(() => {
+    const st = stateRef.current;
+    if (!st) return;
+    if (st.sectionGroup) {
+      st.sectionGroup.traverse((o) => {
+        if (o instanceof THREE.Mesh || o instanceof THREE.Line || o instanceof THREE.Points) {
+          (o as THREE.Mesh).geometry?.dispose();
+          const m = (o as THREE.Mesh).material as THREE.Material | undefined;
+          m?.dispose();
+        }
+      });
+      st.scene.remove(st.sectionGroup);
+      st.sectionGroup = null;
+    }
+    const sv = props.sectionView;
+    if (!sv) return;
+    const { frame, content } = sv;
+    const lift = (l: number): [number, number, number] => [frame.s[0] * l, frame.s[1] * l, frame.s[2] * l];
+    const L = Math.max(frame.uLen, 1) * 1e-3;
+    const g = new THREE.Group();
+
+    // world position of an in-plane point, lifted by `k` layers toward the camera
+    const at = (p: [number, number], k: number): THREE.Vector3 => {
+      const w = fromInPlane(frame, p[0], p[1]);
+      const o = lift(k * L);
+      return new THREE.Vector3(w[0] + o[0], w[1] + o[1], w[2] + o[2]);
+    };
+
+    // Filled unit intervals (solid mode). ShapeGeometry triangulates in local XY; the basis
+    // matrix maps local x→u, y→w(=+Z), z→s onto the plane.
+    const basis = new THREE.Matrix4().makeBasis(
+      new THREE.Vector3(...frame.u),
+      new THREE.Vector3(0, 0, 1),
+      new THREE.Vector3(...frame.s),
+    );
+    basis.setPosition(new THREE.Vector3(...frame.origin));
+    for (const f of content.fills) {
+      for (const sh of f.shapes) {
+        const shape = new THREE.Shape(sh.outer.map(([x, y]) => new THREE.Vector2(x, y)));
+        for (const hole of sh.holes) {
+          shape.holes.push(new THREE.Path(hole.map(([x, y]) => new THREE.Vector2(x, y))));
+        }
+        const geom = new THREE.ShapeGeometry(shape);
+        geom.applyMatrix4(basis);
+        g.add(new THREE.Mesh(geom, new THREE.MeshBasicMaterial({ color: f.color, side: THREE.DoubleSide })));
+      }
+    }
+
+    // Traces (contact mode; also the solid-mode unfilled fallback chains).
+    for (const t of content.traces) {
+      for (const poly of t.polys) {
+        if (poly.length < 2) continue;
+        g.add(new THREE.Line(
+          new THREE.BufferGeometry().setFromPoints(poly.map((p) => at(p, 1))),
+          new THREE.LineBasicMaterial({ color: t.color }),
+        ));
+      }
+    }
+
+    // Backdrop authored points within the slab tolerance (US-SECT-3).
+    const dotR = Math.max(frame.uLen, 1) * 0.004;
+    const dotGeom = new THREE.SphereGeometry(dotR, 10, 8);
+    for (const bp of content.backdrop) {
+      const mesh = new THREE.Mesh(dotGeom.clone(), new THREE.MeshBasicMaterial({ color: bp.color }));
+      mesh.position.copy(at(bp.p, 2));
+      g.add(mesh);
+    }
+
+    // Digitized lines + the YOUNGING AFFORDANCE (US-DIG-2): the polyline, its vertices, a
+    // direction arrow at the end, and hachure ticks on the EFFECTIVE younger side
+    // (sign · (ŝ × t̂) — what the fit will see; contracts §2–3).
+    const vR = Math.max(frame.uLen, 1) * (0.006);
+    for (const line of content.lines) {
+      const pts = line.vertices.map((v) => {
+        const o = lift(3 * L);
+        return new THREE.Vector3(v[0] + o[0], v[1] + o[1], v[2] + o[2]);
+      });
+      if (pts.length >= 2) {
+        g.add(new THREE.Line(
+          new THREE.BufferGeometry().setFromPoints(pts),
+          new THREE.LineBasicMaterial({ color: line.color, linewidth: line.isTarget ? 2 : 1 }),
+        ));
+      }
+      const sGeom = new THREE.SphereGeometry(line.isTarget ? vR * 1.4 : vR, 10, 8);
+      for (const p of pts) {
+        const m = new THREE.Mesh(sGeom.clone(), new THREE.MeshBasicMaterial({ color: line.color }));
+        m.position.copy(p);
+        g.add(m);
+      }
+      // per-segment poles → hachures; last segment → direction arrow. Derived from the
+      // LINE's own plane normal (not the viewing frame's), so a twin-baseline section
+      // reads the same younging the fit will use.
+      const poles = derivePoles(line.vertices, line.s);
+      const hachLen = Math.max(frame.uLen, 1) * 0.015;
+      for (const d of poles) {
+        const mid = new THREE.Vector3(...d.pos).add(new THREE.Vector3(...lift(3 * L)));
+        const younger = new THREE.Vector3(...d.pole).multiplyScalar(line.sign * hachLen);
+        g.add(new THREE.Line(
+          new THREE.BufferGeometry().setFromPoints([mid, mid.clone().add(younger)]),
+          new THREE.LineBasicMaterial({ color: line.color, transparent: true, opacity: 0.8 }),
+        ));
+      }
+      if (line.vertices.length >= 2) {
+        const a = line.vertices[line.vertices.length - 2];
+        const b = line.vertices[line.vertices.length - 1];
+        const dir = new THREE.Vector3(b[0] - a[0], b[1] - a[1], b[2] - a[2]);
+        if (dir.lengthSq() > 0) {
+          dir.normalize();
+          const tip = pts[pts.length - 1];
+          g.add(new THREE.ArrowHelper(dir, tip, hachLen * 2, line.color, hachLen, hachLen * 0.5));
+        }
+      }
+    }
+
+    st.scene.add(g);
+    st.sectionGroup = g;
+  }, [props.sectionView]);
+
+  // 3D PLANE QUADS (US-SECT-5): one translucent quad per shown plane, with its baseline
+  // edge and viewing-normal arrow. Hidden while a section view is open (it owns the scene).
+  useEffect(() => {
+    const st = stateRef.current;
+    if (!st) return;
+    if (st.quadGroup) {
+      st.quadGroup.traverse((o) => {
+        if (o instanceof THREE.Mesh || o instanceof THREE.Line) {
+          (o as THREE.Mesh).geometry?.dispose();
+          ((o as THREE.Mesh).material as THREE.Material | undefined)?.dispose();
+        }
+      });
+      st.scene.remove(st.quadGroup);
+      st.quadGroup = null;
+    }
+    const quads = props.sectionQuads;
+    if (!quads || quads.length === 0) return;
+    const g = new THREE.Group();
+    for (const q of quads) {
+      const { frame, zRange, active } = q;
+      const [z0, z1] = zRange;
+      const zmid = (z0 + z1) / 2;
+      const center = fromInPlane(frame, frame.uLen / 2, zmid);
+      const geom = new THREE.PlaneGeometry(frame.uLen, z1 - z0);
+      const basis = new THREE.Matrix4().makeBasis(
+        new THREE.Vector3(...frame.u),
+        new THREE.Vector3(0, 0, 1),
+        new THREE.Vector3(...frame.s),
+      );
+      basis.setPosition(new THREE.Vector3(...center));
+      geom.applyMatrix4(basis);
+      g.add(new THREE.Mesh(
+        geom,
+        new THREE.MeshBasicMaterial({
+          color: active ? 0xf59e0b : 0x22d3ee,
+          transparent: true,
+          opacity: active ? 0.3 : 0.15,
+          side: THREE.DoubleSide,
+          depthWrite: false,
+        }),
+      ));
+      // baseline edge (at z0) + the out-of-plane viewing normal at the centre
+      const b0 = fromInPlane(frame, 0, z0);
+      const b1 = fromInPlane(frame, frame.uLen, z0);
+      g.add(new THREE.Line(
+        new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(...b0), new THREE.Vector3(...b1)]),
+        new THREE.LineBasicMaterial({ color: 0xf59e0b }),
+      ));
+      const arrowLen = Math.max(frame.uLen, z1 - z0) * 0.15;
+      g.add(new THREE.ArrowHelper(
+        new THREE.Vector3(...frame.s),
+        new THREE.Vector3(...center),
+        arrowLen,
+        active ? 0xf59e0b : 0x22d3ee,
+      ));
+    }
+    g.visible = !st.sectionActive;
+    st.scene.add(g);
+    st.quadGroup = g;
+  }, [props.sectionQuads]);
+
+  // DIGITIZING pointer tool (US-DIG-1): plane-locked click-to-append; drag a vertex to move
+  // it (committed on pointerup); alt-click a vertex to delete it. Reuses the same
+  // ray∩plane picking as the gestures above, against the ACTIVE section plane. The left
+  // button is free because rotate is disabled in section view.
+  useEffect(() => {
+    const st = stateRef.current;
+    const sv = props.sectionView;
+    if (!st || !sv || !props.digitize?.armed) return;
+    const { renderer } = st;
+    const dom = renderer.domElement;
+    const frame = sv.frame;
+    const plane = new THREE.Plane(
+      new THREE.Vector3(...frame.s),
+      -(frame.s[0] * frame.origin[0] + frame.s[1] * frame.origin[1] + frame.s[2] * frame.origin[2]),
+    );
+    const raycaster = new THREE.Raycaster();
+    const hitPlane = (e: PointerEvent): [number, number, number] | null => {
+      const cam = st.sectionCam;
+      if (!cam) return null;
+      const r = dom.getBoundingClientRect();
+      const ndc = new THREE.Vector2(
+        ((e.clientX - r.left) / r.width) * 2 - 1,
+        -((e.clientY - r.top) / r.height) * 2 + 1,
+      );
+      raycaster.setFromCamera(ndc, cam);
+      const hit = new THREE.Vector3();
+      return raycaster.ray.intersectPlane(plane, hit) ? [hit.x, hit.y, hit.z] : null;
+    };
+    const pickRadius = Math.max(frame.uLen, 1) * 0.02;
+    const nearestVertex = (w: [number, number, number]): { lineId: string; vi: number } | null => {
+      let best: { lineId: string; vi: number; d: number } | null = null;
+      for (const line of digitizeCbRef.current.lines) {
+        if (!line.isTarget) continue; // only the target surface's lines are editable
+        line.vertices.forEach((v, vi) => {
+          const d = Math.hypot(v[0] - w[0], v[1] - w[1], v[2] - w[2]);
+          if (d < pickRadius && (!best || d < best.d)) best = { lineId: line.lineId, vi, d };
+        });
+      }
+      return best;
+    };
+
+    let drag: { lineId: string; vi: number } | null = null;
+    let downAt: [number, number] | null = null;
+    const onDown = (e: PointerEvent) => {
+      if (e.button !== 0) return;
+      const w = hitPlane(e);
+      if (!w) return;
+      downAt = [e.clientX, e.clientY];
+      const hit = nearestVertex(w);
+      if (hit && e.altKey) {
+        digitizeCbRef.current.del?.(hit.lineId, hit.vi);
+        downAt = null;
+        return;
+      }
+      if (hit) {
+        drag = hit;
+        if (st.sectionControls) st.sectionControls.enabled = false; // don't pan while dragging
+      }
+    };
+    const onUp = (e: PointerEvent) => {
+      if (e.button !== 0 || !downAt) return;
+      const moved = Math.hypot(e.clientX - downAt[0], e.clientY - downAt[1]) > 3;
+      const w = hitPlane(e);
+      if (drag) {
+        if (w && moved) digitizeCbRef.current.move?.(drag.lineId, drag.vi, w);
+        drag = null;
+        if (st.sectionControls) st.sectionControls.enabled = true;
+      } else if (w && !moved) {
+        digitizeCbRef.current.click?.(w);
+      }
+      downAt = null;
+    };
+    dom.addEventListener("pointerdown", onDown);
+    dom.addEventListener("pointerup", onUp);
+    dom.style.cursor = "crosshair";
+    return () => {
+      dom.removeEventListener("pointerdown", onDown);
+      dom.removeEventListener("pointerup", onUp);
+      dom.style.cursor = "";
+      if (st.sectionControls) st.sectionControls.enabled = true;
+    };
+  }, [props.sectionView?.key, props.digitize?.armed]);
 
   // Apply an imported view (declared AFTER the extent re-center so it overrides the
   // auto-centered target). Fires whenever `importedView` is a new object (each Import).

@@ -10,6 +10,7 @@
 //   T028 [US4] reorderContainers / reorderWithin
 
 import {
+  type DigitizedLine,
   type InterfaceData,
   type Lithology,
   type LithologyCatalog,
@@ -22,6 +23,7 @@ import {
   UNKNOWN_ID,
   newId,
 } from "./project";
+import { projectToPlane } from "../section/frame";
 
 function emptyInterface(name: string): InterfaceData {
   return { id: newId("iface"), name, points: [], orientations: [] };
@@ -181,7 +183,7 @@ export function findInterface(
   project: Project,
   elementId: string,
   interfaceId: string,
-): { name: string; parentName: string; points: PointRow[]; orientations: OrientationRow[] } | null {
+): { name: string; parentName: string; points: PointRow[]; orientations: OrientationRow[]; digitized: DigitizedLine[] } | null {
   const el = project.elements.find((e) => e.id === elementId);
   if (!el) return null;
   const hit = interfacesOf(el).find((x) => x.iface.id === interfaceId);
@@ -191,6 +193,7 @@ export function findInterface(
     parentName: hit.role,
     points: hit.iface.points,
     orientations: hit.iface.orientations,
+    digitized: hit.iface.digitized ?? [],
   };
 }
 
@@ -226,15 +229,40 @@ function mapElement(project: Project, elementId: string, fn: (el: ProjectElement
   return { ...project, elements: project.elements.map((el) => (el.id === elementId ? fn(el) : el)) };
 }
 
-/** Commit edited point/orientation tables back to an interface (the modal Apply target). */
+/** Commit edited point/orientation tables back to an interface (the modal Apply target).
+ *  `digitized` (feature 005) is the modal's edited digitized-line set: vertices are
+ *  PROJECTED back onto each line's plane (table edits can't take a vertex off-plane) and
+ *  emptied lines are dropped. Omitted ⇒ digitized lines untouched. */
 export function applyInterfaceData(
   project: Project,
   elementId: string,
   interfaceId: string,
   points: PointRow[],
   orientations: OrientationRow[],
+  digitized?: DigitizedLine[],
 ): Project {
-  return mapElement(project, elementId, (el) => mapInterface(el, interfaceId, (i) => ({ ...i, points, orientations })));
+  return mapElement(project, elementId, (el) =>
+    mapInterface(el, interfaceId, (i) => ({
+      ...i,
+      points,
+      orientations,
+      ...(digitized !== undefined
+        ? {
+            digitized: digitized
+              .map((l) => ({ ...l, vertices: l.vertices.map((v) => projectToPlane(l.frame, v)) }))
+              .filter((l) => l.vertices.length > 0),
+          }
+        : {}),
+    })),
+  );
+}
+
+/** Raw InterfaceData lookup (feature 005) — unlike findInterface (a display projection for
+ *  the modal), this returns the live interface record incl. its digitized lines. */
+export function getInterface(project: Project, elementId: string, interfaceId: string): InterfaceData | null {
+  const el = project.elements.find((e) => e.id === elementId);
+  if (!el) return null;
+  return interfacesOf(el).find((x) => x.iface.id === interfaceId)?.iface ?? null;
 }
 
 export function renameInterface(project: Project, elementId: string, interfaceId: string, name: string): Project {
@@ -323,6 +351,160 @@ export function setImportExtend(project: Project, elementId: string, extend: boo
  *  retained inner envelope's authored points survive a round-trip through solid mode. */
 export function setIntrusionMode(project: Project, elementId: string, mode: "solid" | "shell"): Project {
   return mapElement(project, elementId, (el) => (el.kind === "intrusion" ? { ...el, mode } : el));
+}
+
+// ============================================================================
+// Digitized section lines (feature 005 US2/US4) — all GEOMETRY edits: the caller commits
+// (dirty + deferred re-fit), unlike section-SET ops which are non-dirty view-state.
+// ============================================================================
+
+/** Every parametric interface in the project with a display label — the digitize-target
+ *  picker's option list (imported meshes excluded: no authored data). */
+export function parametricInterfaces(
+  project: Project,
+): { elementId: string; interfaceId: string; label: string }[] {
+  const out: { elementId: string; interfaceId: string; label: string }[] = [];
+  for (const el of project.elements) {
+    for (const { iface, role } of interfacesOf(el)) {
+      out.push({ elementId: el.id, interfaceId: iface.id, label: role === iface.name ? role : `${role} — ${iface.name}` });
+    }
+  }
+  return out;
+}
+
+/** Create a NEW standalone conformable series to digitize into (US-DIG-1's "a new one I
+ *  create for this purpose"). Inserted at the oldest end, like addSurface; the user
+ *  re-orders / re-relations it afterwards like any element (US-DIG-6). */
+export function createDigitizedSurface(
+  project: Project,
+  ids?: { elementId: string; interfaceId: string },
+): { project: Project; elementId: string; interfaceId: string } {
+  let n = 1;
+  for (const el of project.elements) if (el.kind === "series" && /^Digitized /.test(el.name)) n++;
+  const name = `Digitized ${n}`;
+  // `ids` lets a FUNCTIONAL committer (main.tsx commitFn) pre-generate the ids outside the
+  // updater, so the caller can target the new surface before React applies the update.
+  const iface: InterfaceData = { id: ids?.interfaceId ?? newId("iface"), name, points: [], orientations: [] };
+  const el: ProjectElement = {
+    kind: "series",
+    id: ids?.elementId ?? newId("el"),
+    name,
+    relation: "conformable",
+    unboundedAbove: false,
+    interfaces: [iface],
+  };
+  return {
+    project: { ...project, elements: [...project.elements, el] },
+    elementId: el.id,
+    interfaceId: iface.id,
+  };
+}
+
+function mapDigitized(
+  project: Project,
+  elementId: string,
+  interfaceId: string,
+  fn: (lines: DigitizedLine[]) => DigitizedLine[],
+): Project {
+  return mapElement(project, elementId, (el) =>
+    mapInterface(el, interfaceId, (i) => ({ ...i, digitized: fn(i.digitized ?? []) })),
+  );
+}
+
+/** Start a new digitized line (its `frame` snapshots the active plane — the line stays
+ *  valid even if the section is later deleted). Returns the new line's id via out-param
+ *  convention: the caller supplies the id (newId) so it can track the active line. */
+export function addDigitizedLine(
+  project: Project,
+  elementId: string,
+  interfaceId: string,
+  line: DigitizedLine,
+): Project {
+  return mapDigitized(project, elementId, interfaceId, (lines) => [...lines, line]);
+}
+
+export function appendDigitizedVertex(
+  project: Project,
+  elementId: string,
+  interfaceId: string,
+  lineId: string,
+  v: [number, number, number],
+): Project {
+  return mapDigitized(project, elementId, interfaceId, (lines) =>
+    lines.map((l) => (l.id === lineId ? { ...l, vertices: [...l.vertices, projectToPlane(l.frame, v)] } : l)),
+  );
+}
+
+/** Move one vertex. The new position is PROJECTED onto the line's plane (plane-locked by
+ *  construction — also how points-table edits stay on-plane, data-model.md). */
+export function moveDigitizedVertex(
+  project: Project,
+  elementId: string,
+  interfaceId: string,
+  lineId: string,
+  vertexIndex: number,
+  v: [number, number, number],
+): Project {
+  return mapDigitized(project, elementId, interfaceId, (lines) =>
+    lines.map((l) =>
+      l.id === lineId
+        ? { ...l, vertices: l.vertices.map((old, i) => (i === vertexIndex ? projectToPlane(l.frame, v) : old)) }
+        : l,
+    ),
+  );
+}
+
+/** Delete one vertex; deleting the last vertex removes the line entirely. */
+export function deleteDigitizedVertex(
+  project: Project,
+  elementId: string,
+  interfaceId: string,
+  lineId: string,
+  vertexIndex: number,
+): Project {
+  return mapDigitized(project, elementId, interfaceId, (lines) =>
+    lines
+      .map((l) => (l.id === lineId ? { ...l, vertices: l.vertices.filter((_, i) => i !== vertexIndex) } : l))
+      .filter((l) => l.vertices.length > 0),
+  );
+}
+
+export function deleteDigitizedLine(
+  project: Project,
+  elementId: string,
+  interfaceId: string,
+  lineId: string,
+): Project {
+  return mapDigitized(project, elementId, interfaceId, (lines) => lines.filter((l) => l.id !== lineId));
+}
+
+/** "Flip this line to match" (validate() rule 5's one-action fix): REVERSES the line's
+ *  vertex order — a geometry edit that negates every one of ITS derived poles and nothing
+ *  else (contracts/younging-derivation.md §3). Distinct from the per-surface flip toggle,
+ *  which negates the whole surface's poles without touching any vertices. */
+export function reverseDigitizedLine(
+  project: Project,
+  elementId: string,
+  interfaceId: string,
+  lineId: string,
+): Project {
+  return mapDigitized(project, elementId, interfaceId, (lines) =>
+    lines.map((l) => (l.id === lineId ? { ...l, vertices: [...l.vertices].reverse() } : l)),
+  );
+}
+
+/** Delete every line of `interfaceId` drawn on the given section plane (matched by the
+ *  soft sectionRef) — the "redraw this slice" action (US-DIG-5): clear, then re-arm the tool. */
+export function deleteSliceLines(
+  project: Project,
+  elementId: string,
+  interfaceId: string,
+  setId: string,
+  index: number,
+): Project {
+  return mapDigitized(project, elementId, interfaceId, (lines) =>
+    lines.filter((l) => !(l.sectionRef?.setId === setId && l.sectionRef.index === index)),
+  );
 }
 
 // --- unit names (feature 003 §1) — units are DERIVED; only their display name is authored ---

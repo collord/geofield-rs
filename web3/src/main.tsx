@@ -12,11 +12,22 @@ import { createRoot } from "react-dom/client";
 import { HierarchyPanel, LithologyCatalog, VolumeVisibility, applyCoreUpdate, emptyState, type HierarchyState } from "./HierarchyPanel";
 import type { RelationDto } from "./HierarchyPanel/dto";
 import "./HierarchyPanel/hierarchy.css";
-import { Viewer, type ViewState } from "./Viewer";
+import {
+  SERIES_COLORS,
+  Viewer,
+  surfaceKey,
+  type DigLineView,
+  type SectionContent,
+  type SectionQuad,
+  type SectionViewState,
+  type ViewState,
+} from "./Viewer";
 import { exportObj } from "./exportObj";
 import { TEMPLATES, templateById, blankProject } from "./scenarios";
 import {
+  type DigitizedLine,
   type Project,
+  type SectionSet,
   type SurfaceType,
   loadProject,
   saveProject,
@@ -30,8 +41,26 @@ import {
   newId,
 } from "./HierarchyPanel/project";
 import {
+  planeK,
+  slabTol,
+  distToPlane,
+  toInPlane,
+  fromInPlane,
+  extentDiagonal,
+} from "./section/frame";
+import { classifyLoops, sectionLoops, sectionPolylines } from "./section/slice";
+import { SectionSetForm, SectionsPanel } from "./HierarchyPanel/SectionsPanel";
+import {
   addSurface,
   applyInterfaceData,
+  addDigitizedLine,
+  appendDigitizedVertex,
+  moveDigitizedVertex,
+  deleteDigitizedVertex,
+  deleteSliceLines,
+  reverseDigitizedLine,
+  createDigitizedSurface,
+  getInterface,
   renameInterface,
   flipOrientation,
   duplicateInterface,
@@ -164,6 +193,19 @@ function App() {
   const [drawNonce, setDrawNonce] = useState(0);
   const [pendingBounds, setPendingBounds] = useState<{ x0: number; x1: number; y0: number; y1: number } | null>(null);
   const drawBounds = useMemo(() => (drawNonce ? { nonce: drawNonce } : undefined), [drawNonce]);
+  // --- Cross-sections (feature 005). `activeSection` = the open section VIEW (view-state,
+  // exported inside Project.view.section); sections themselves live in project.sections.
+  // Section mutations go through `commitSections` (save immediately, NEVER dirty, never
+  // re-fit — the setRelation pattern, spec FR-009). Digitizing state is the tool: a target
+  // interface + an armed flag; `activeLineRef` tracks the line being extended on the
+  // current slice (cleared on step/open/redraw, so a new slice starts a new line).
+  const [activeSection, setActiveSection] = useState<{ setId: string; index: number } | null>(null);
+  const [drawSectionNonce, setDrawSectionNonce] = useState(0);
+  const drawSection = useMemo(() => (drawSectionNonce ? { nonce: drawSectionNonce } : undefined), [drawSectionNonce]);
+  const [pendingBaseline, setPendingBaseline] = useState<{ a: [number, number]; b: [number, number] } | null>(null);
+  const [digitizeTarget, setDigitizeTarget] = useState<{ elementId: string; interfaceId: string } | null>(null);
+  const [digitizeArmed, setDigitizeArmed] = useState(false);
+  const activeLineRef = useRef<string | null>(null);
   // Authored points/normals overlay payload — rebuilt only when the elements change (pure).
   const authoredData = useMemo(() => buildAuthoredOverlay(project), [project]);
   // Camera round-trip: the Viewer fills `viewApiRef` with a getter (read on Export);
@@ -359,6 +401,23 @@ function App() {
     saveProject(reconciled);
   }
 
+  // FUNCTIONAL commit (feature 005): rapid successive geometry edits — pointer-event
+  // digitizing and back-to-back `__digitizeLine` hook calls — can outrun React's render, so
+  // a plain `commit(op(project))` builds on a STALE closure and last-write-wins silently
+  // drops the earlier edit. Digitizing paths therefore commit through `prev`-based updaters.
+  // (The autosave inside the updater is a debounced idempotent write; the app does not run
+  // under StrictMode, so updaters execute once.)
+  function commitFn(fn: (prev: Project) => Project) {
+    setProject((prev) => {
+      const next = fn(prev);
+      if (next === prev) return prev;
+      const reconciled = syncInferredLithologies(next);
+      saveProject(reconciled);
+      return reconciled;
+    });
+    setDirty(true);
+  }
+
   // A lithology/metadata edit is NOT a geometry change — it never needs a re-fit and must not
   // gate behind Apply (no `dirty`). It saves immediately; in SOLID mode it re-meshes so the
   // new colour/assignment shows (the tags are applied at mesh-collect time). (feature 003 §6.)
@@ -385,6 +444,224 @@ function App() {
     setProject(lastApplied.current);
     setDirty(false);
   }
+
+  // =====================================================================================
+  // Cross-sections (feature 005).
+  // =====================================================================================
+
+  // Section-set mutations are VIEW-state (FR-009): save immediately, never `commit`, never
+  // re-fit, `dirty` untouched — the same immediate path as setRelation/commitLithology.
+  function commitSections(next: Project) {
+    setProject(next);
+    saveProject(next);
+  }
+
+  const activeSet = activeSection ? (project.sections ?? []).find((s) => s.id === activeSection.setId) : undefined;
+
+  const onSectionBaseline = (a: [number, number], b: [number, number]) => setPendingBaseline({ a, b });
+  function onCreateSections(name: string, spacing: number, count: number, offset: number) {
+    if (!pendingBaseline) return;
+    const set: SectionSet = { id: newId("sect"), name, a: pendingBaseline.a, b: pendingBaseline.b, spacing, count, offset };
+    commitSections({ ...project, sections: [...(project.sections ?? []), set] });
+    setPendingBaseline(null);
+    activeLineRef.current = null;
+    setActiveSection({ setId: set.id, index: 0 });
+  }
+  function onDeleteSectionSet(setId: string) {
+    // Deleting a section never deletes geometry: digitized lines carry their own plane
+    // snapshot and stay valid surface data (spec edge case / data-model.md).
+    commitSections({ ...project, sections: (project.sections ?? []).filter((s) => s.id !== setId) });
+    if (activeSection?.setId === setId) setActiveSection(null);
+  }
+  function onToggleShowSection(setId: string, on: boolean) {
+    commitSections({
+      ...project,
+      sections: (project.sections ?? []).map((s) => (s.id === setId ? { ...s, showInScene: on } : s)),
+    });
+  }
+  function onOpenSection(setId: string) {
+    activeLineRef.current = null;
+    setActiveSection({ setId, index: 0 });
+  }
+  function onCloseSection() {
+    setActiveSection(null);
+    setDigitizeArmed(false);
+    activeLineRef.current = null;
+  }
+  // Step next/previous through a serial set, clamped at the ends; the digitizing tool and
+  // its target survive the step (US-SECT-4), only the per-slice active line resets.
+  function onStepSection(dir: -1 | 1) {
+    if (!activeSection || !activeSet) return;
+    const index = Math.min(Math.max(activeSection.index + dir, 0), activeSet.count - 1);
+    if (index !== activeSection.index) {
+      activeLineRef.current = null;
+      setActiveSection({ setId: activeSection.setId, index });
+    }
+  }
+
+  // --- digitizing (GEOMETRY: everything below commits → dirty → deferred re-fit) --------
+  function onPickDigitizeTarget(t: { elementId: string; interfaceId: string } | "new" | null) {
+    activeLineRef.current = null;
+    if (t === null) {
+      setDigitizeTarget(null);
+      setDigitizeArmed(false);
+      return;
+    }
+    if (t === "new") {
+      const ids = { elementId: newId("el"), interfaceId: newId("iface") };
+      commitFn((prev) => createDigitizedSurface(prev, ids).project);
+      setDigitizeTarget(ids);
+      return;
+    }
+    setDigitizeTarget(t);
+  }
+  // All digitizing edits commit FUNCTIONALLY (commitFn) — pointer events and e2e hook calls
+  // arrive faster than renders, and a stale-closure commit would silently drop edits.
+  function onDigitizeClick(world: [number, number, number]) {
+    if (!activeSection || !activeSet || !digitizeTarget) return;
+    const frame = planeK(activeSet, activeSection.index);
+    const { elementId, interfaceId } = digitizeTarget;
+    const sect = activeSection;
+    commitFn((prev) => {
+      const iface = getInterface(prev, elementId, interfaceId);
+      if (!iface) return prev;
+      const sliceLines = (iface.digitized ?? []).filter(
+        (l) => l.sectionRef?.setId === sect.setId && l.sectionRef.index === sect.index,
+      );
+      let lineId = activeLineRef.current;
+      if (lineId && !sliceLines.some((l) => l.id === lineId)) lineId = null; // stale after redraw/undo
+      if (!lineId) {
+        // clicking near an existing slice line's TAIL resumes it (click-to-extend, US-DIG-1)
+        const pick = Math.max(frame.uLen, 1) * 0.02;
+        for (const l of sliceLines) {
+          const tail = l.vertices[l.vertices.length - 1];
+          if (tail && Math.hypot(tail[0] - world[0], tail[1] - world[1], tail[2] - world[2]) < pick) {
+            activeLineRef.current = l.id;
+            return prev;
+          }
+        }
+        const id = newId("line");
+        activeLineRef.current = id;
+        const line: DigitizedLine = {
+          id,
+          frame: { origin: frame.origin, s: frame.s }, // plane SNAPSHOT — the line outlives the section
+          vertices: [world],
+          sectionRef: { setId: sect.setId, index: sect.index },
+        };
+        return addDigitizedLine(prev, elementId, interfaceId, line);
+      }
+      return appendDigitizedVertex(prev, elementId, interfaceId, lineId, world);
+    });
+  }
+  const onDigitizeMoveVertex = (lineId: string, vi: number, world: [number, number, number]) => {
+    if (!digitizeTarget) return;
+    const { elementId, interfaceId } = digitizeTarget;
+    commitFn((prev) => moveDigitizedVertex(prev, elementId, interfaceId, lineId, vi, world));
+  };
+  const onDigitizeDeleteVertex = (lineId: string, vi: number) => {
+    if (!digitizeTarget) return;
+    const { elementId, interfaceId } = digitizeTarget;
+    commitFn((prev) => deleteDigitizedVertex(prev, elementId, interfaceId, lineId, vi));
+  };
+  function onRedigitizeSlice() {
+    if (!activeSection || !digitizeTarget) return;
+    activeLineRef.current = null;
+    const { elementId, interfaceId } = digitizeTarget;
+    const sect = activeSection;
+    commitFn((prev) => deleteSliceLines(prev, elementId, interfaceId, sect.setId, sect.index));
+    setDigitizeArmed(true);
+  }
+  const onFlipLineToMatch = (elementId: string, interfaceId: string, lineId: string) =>
+    commitFn((prev) => reverseDigitizedLine(prev, elementId, interfaceId, lineId));
+
+  // The SECTION SCENE: everything the section view draws, computed UI-side from the
+  // already-returned mesh payloads (research.md R1/R2 — no worker round-trip; stepping
+  // re-slices instantly). Traces in contact mode; filled unit intervals in solid mode
+  // (open chains = the Manifold-off watertightness fallback, drawn unfilled).
+  const sectionScene: SectionViewState | undefined = useMemo(() => {
+    if (!activeSection || !activeSet) return undefined;
+    const frame = planeK(activeSet, activeSection.index);
+    const [, , , , z0, z1] = project.extent;
+    const quantum = Math.max(frame.uLen, z1 - z0, 1) * 1e-5;
+    const hexToNum = (hex: string) => parseInt(hex.replace("#", ""), 16) || 0x888888;
+    const lithoColors = Object.fromEntries(catalogOf(project).lithologies.map((l) => [l.id, l.color]));
+    const traces: SectionContent["traces"] = [];
+    const fills: SectionContent["fills"] = [];
+    for (const s of surfaces) {
+      if (hiddenKeys.has(surfaceKey(s))) continue;
+      const color =
+        renderMode === "solid"
+          ? s.lithologyId && lithoColors[s.lithologyId] !== undefined
+            ? hexToNum(lithoColors[s.lithologyId])
+            : 0xc8c8cd
+          : SERIES_COLORS[s.series % SERIES_COLORS.length];
+      if (renderMode === "solid") {
+        const { closed, open } = sectionLoops(s.positions, s.indices, frame, quantum);
+        if (closed.length > 0) fills.push({ color, shapes: classifyLoops(closed) });
+        if (open.length > 0) traces.push({ color, polys: open });
+      } else {
+        const polys = sectionPolylines(s.positions, s.indices, frame, quantum);
+        if (polys.length > 0) traces.push({ color, polys });
+      }
+    }
+    const tol = slabTol(activeSet, project.extent);
+    const backdrop = authoredData.points
+      .filter((p) => Math.abs(distToPlane(frame, p.pos)) <= tol)
+      .map((p) => ({ p: toInPlane(frame, p.pos), color: SERIES_COLORS[p.colorIndex % SERIES_COLORS.length] }));
+    // digitized lines lying on THIS plane (matched by geometry, not sectionRef — a line
+    // whose section was deleted still shows wherever a coincident plane is opened)
+    const planeEps = Math.max(1e-6 * extentDiagonal(project.extent), quantum * 10);
+    const lines: DigLineView[] = [];
+    project.elements.forEach((el, colorIndex) => {
+      const defaultFlip = el.kind === "series" && el.relation === "erode";
+      const ifaces =
+        el.kind === "series" ? el.interfaces
+        : el.kind === "vein" ? [el.footWall, el.hangingWall]
+        : el.kind === "intrusion" ? ((el.mode ?? "shell") === "solid" ? [el.envelopeOuter] : [el.envelopeInner, el.envelopeOuter])
+        : el.kind === "topography" ? [el.ground]
+        : [];
+      for (const iface of ifaces) {
+        const sign = ((!!iface.flipped !== defaultFlip) ? -1 : 1) as 1 | -1;
+        for (const line of iface.digitized ?? []) {
+          const parallel = Math.abs(line.frame.s[0] * frame.s[0] + line.frame.s[1] * frame.s[1]) > 0.9999;
+          if (!parallel || Math.abs(distToPlane(frame, line.frame.origin)) > planeEps) continue;
+          lines.push({
+            lineId: line.id,
+            color: SERIES_COLORS[colorIndex % SERIES_COLORS.length],
+            isTarget: digitizeTarget?.interfaceId === iface.id,
+            sign,
+            s: line.frame.s,
+            vertices: line.vertices,
+          });
+        }
+      }
+    });
+    return {
+      key: `${activeSection.setId}:${activeSection.index}`,
+      label: `${activeSet.name}${activeSet.count > 1 ? ` · ${activeSection.index + 1}/${activeSet.count}` : ""}`,
+      frame,
+      zRange: [z0, z1],
+      content: { traces, fills, backdrop, lines },
+    };
+  }, [activeSection, activeSet, project, surfaces, renderMode, hiddenKeys, digitizeTarget, authoredData]);
+
+  // 3D plane quads for sets with showInScene on (US-SECT-5).
+  const sectionQuads: SectionQuad[] | undefined = useMemo(() => {
+    const sets = (project.sections ?? []).filter((s) => s.showInScene);
+    if (sets.length === 0) return undefined;
+    const [, , , , z0, z1] = project.extent;
+    const quads: SectionQuad[] = [];
+    for (const set of sets) {
+      for (let k = 0; k < set.count; k++) {
+        quads.push({
+          frame: planeK(set, k),
+          zRange: [z0, z1],
+          active: activeSection?.setId === set.id && activeSection.index === k,
+        });
+      }
+    }
+    return quads;
+  }, [project.sections, project.extent, activeSection]);
 
   // --- cheap declared-state edits: immediate re-fit, dirty stays false ------------------
   function setRelation(elementId: string, rel: RelationDto) {
@@ -479,6 +756,20 @@ function App() {
       __exactSpikeDigest?: () => Promise<string | undefined>;
       __slimForExport?: (p: Project) => Project;
       __importProjectJson?: (jsonText: string) => Promise<Project>;
+      __project?: () => Project;
+      __sections?: () => SectionSet[];
+      __activeSection?: () => { setId: string; index: number } | null;
+      __addSectionSet?: (set: Partial<SectionSet> & { a: [number, number]; b: [number, number] }) => string;
+      __openSection?: (setId: string, index: number) => void;
+      __sectionTraces?: (setId: string, index: number) => { series: number; block: number; iface: number; polylines: number[][][] }[];
+      __digitizeLine?: (
+        elementId: string | null,
+        interfaceId: string | null,
+        setId: string,
+        index: number,
+        verts2d: [number, number][],
+      ) => { elementId: string; interfaceId: string; lineId: string } | null;
+      __exportState?: () => Project;
     };
     w.__reorderContainers = onReorderContainers;
     w.__moveSurface = onMoveSurface;
@@ -495,6 +786,83 @@ function App() {
     w.__importProjectJson = (jsonText: string) => importProjectJson(new File([jsonText], "rt.geoproj.json"));
     w.__surfaces = surfaces;
     w.__getView = () => viewApiRef.current?.getView();
+    // --- feature 005 hooks (e2e; harmless in the demo — contracts/project-json.md) -------
+    w.__project = () => project;
+    w.__sections = () => project.sections ?? [];
+    w.__activeSection = () => activeSection;
+    // Programmatic set creation (the gesture path is separately covered by canvas clicks).
+    // FUNCTIONAL update: a hook call right after another hook's commit must not build on the
+    // stale closure `project` (React's update queue preserves order between updaters).
+    w.__addSectionSet = (partial) => {
+      const set: SectionSet = {
+        id: newId("sect"),
+        name: partial.name ?? "Sections",
+        a: partial.a,
+        b: partial.b,
+        spacing: partial.spacing ?? 0,
+        count: partial.count ?? 1,
+        offset: partial.offset ?? 0,
+        showInScene: partial.showInScene ?? false,
+      };
+      setProject((prev) => {
+        const next = { ...prev, sections: [...(prev.sections ?? []), set] };
+        saveProject(next); // non-dirty view-state, like commitSections
+        return next;
+      });
+      return set.id;
+    };
+    w.__openSection = (setId, index) => {
+      activeLineRef.current = null;
+      setActiveSection({ setId, index });
+    };
+    // World-space traces of every payload on plane (setId, index) — the loft "trace lands
+    // on the drawn line" assertion reads these (research.md R9).
+    w.__sectionTraces = (setId, index) => {
+      const set = (project.sections ?? []).find((s) => s.id === setId);
+      if (!set) return [];
+      const frame = planeK(set, index);
+      const [, , , , z0, z1] = project.extent;
+      const quantum = Math.max(frame.uLen, z1 - z0, 1) * 1e-5;
+      return surfaces.map((s) => ({
+        series: s.series,
+        block: s.block,
+        iface: s.interface,
+        polylines: sectionPolylines(s.positions, s.indices, frame, quantum).map((poly) =>
+          poly.map((p) => fromInPlane(frame, p[0], p[1]) as number[]),
+        ),
+      }));
+    };
+    // Programmatic digitizing (bypasses pointer math; same commit path as the tool).
+    // elementId/interfaceId null ⇒ creates a new digitized surface and targets it. Commits
+    // FUNCTIONALLY (commitFn): back-to-back hook calls outrun renders, and a stale-closure
+    // commit would drop the prior line (the race the section-validation specs exposed).
+    w.__digitizeLine = (elementId, interfaceId, setId, index, verts2d) => {
+      const create = !elementId || !interfaceId ? { elementId: newId("el"), interfaceId: newId("iface") } : null;
+      const el = create?.elementId ?? elementId!;
+      const ifid = create?.interfaceId ?? interfaceId!;
+      const lineId = newId("line");
+      // The SET is resolved inside the updater too (it may have been added by an
+      // immediately-preceding __addSectionSet whose updater hasn't applied yet). Ids are
+      // returned optimistically; an unknown setId makes the commit a no-op.
+      commitFn((prev) => {
+        const set = (prev.sections ?? []).find((s) => s.id === setId);
+        if (!set || index < 0 || index >= set.count) return prev;
+        const frame = planeK(set, index);
+        const line: DigitizedLine = {
+          id: lineId,
+          frame: { origin: frame.origin, s: frame.s },
+          vertices: verts2d.map(([du, dw]) => fromInPlane(frame, du, dw)),
+          sectionRef: { setId, index },
+        };
+        const p = create ? createDigitizedSurface(prev, create).project : prev;
+        return addDigitizedLine(p, el, ifid, line);
+      });
+      setDigitizeTarget({ elementId: el, interfaceId: ifid });
+      return { elementId: el, interfaceId: ifid, lineId };
+    };
+    // The exact object Export serializes (incl. the view block with the active section) —
+    // lets the persistence e2e round-trip without driving a real file download.
+    w.__exportState = () => buildExportProject();
     // Stage 0 exact-corefiner determinism gate (e2e/exact-determinism.spec.ts, docs/12 §2.3). Runs
     // the exact tri-tri spike in the browser's wasm and returns its digest hex. `spike_digest` is
     // pure compute (no field/kernel), so we init the engine module standalone. The export only
@@ -538,6 +906,13 @@ function App() {
       if (p.view.overlayLabelScale !== undefined) setOverlayLabelScale(p.view.overlayLabelScale);
       setImportedView({ camera: p.view.camera, target: p.view.target, up: p.view.up, fov: p.view.fov });
     }
+    // Restore the open section (feature 005, FR-010). Guarded: a dangling/clamped ref was
+    // already sanitized on import; a seed/template without one lands in the 3D view.
+    const sect = p.view?.section;
+    activeLineRef.current = null;
+    setDigitizeTarget(null);
+    setDigitizeArmed(false);
+    setActiveSection(sect && (p.sections ?? []).some((s) => s.id === sect.setId) ? sect : null);
     if (p.elements.length > 0 && validate(p).canApply) runStack(p, undefined, mode, clip);
     else {
       setSurfaces([]);
@@ -559,7 +934,10 @@ function App() {
         setStatus("seed failed: " + (err instanceof Error ? err.message : String(err)));
       }
     });
-  const onExport = () => {
+  // The exported project = the live project + the captured view block (camera, render
+  // toggles, and — feature 005 — the open section, so a reopened export lands on the same
+  // slice, FR-010). Shared by onExport and the __exportState e2e hook.
+  function buildExportProject(): Project {
     const cam = viewApiRef.current?.getView();
     const view = cam && {
       ...cam,
@@ -570,8 +948,12 @@ function App() {
       overlayPointScale,
       overlayArrowScale,
       overlayLabelScale,
+      section: activeSection ?? undefined,
     };
-    exportProjectJson(view ? { ...project, view } : project);
+    return view ? { ...project, view } : project;
+  }
+  const onExport = () => {
+    exportProjectJson(buildExportProject());
   };
   const onImportFile = async (file: File) => {
     confirmIfDirty(async () => {
@@ -831,6 +1213,25 @@ function App() {
             {!validation.canApply && firstHardError && (
               <div className="apply-reason" data-testid="apply-reason">{firstHardError}</div>
             )}
+            {validation.softWarnings.length > 0 && (
+              <div className="soft-warnings" data-testid="soft-warnings" style={{ fontSize: "0.75em", color: "#96690a", display: "grid", gap: "0.2rem", width: "100%" }}>
+                {validation.softWarnings.slice(0, 4).map((wrn, i) => (
+                  <div key={i}>
+                    ⚠ {wrn.reason}
+                    {wrn.fix === "flipLine" && wrn.lineId && wrn.interfaceId && (
+                      <button
+                        type="button"
+                        data-testid="flip-line-to-match"
+                        style={{ marginLeft: "0.4em" }}
+                        onClick={() => onFlipLineToMatch(wrn.elementId, wrn.interfaceId!, wrn.lineId!)}
+                      >
+                        flip this line to match
+                      </button>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
         )}
 
@@ -863,6 +1264,21 @@ function App() {
           catalog={catalogOf(project).lithologies}
           lithologyOf={(elementId, unitIndex) => lithologyOf(project, elementId, unitIndex)}
           onAssignLithology={(elementId, unitIndex, id) => commitLithology(assignLithology(project, elementId, unitIndex, id))}
+        />
+
+        <SectionsPanel
+          project={project}
+          activeSection={activeSection}
+          onDrawBaseline={() => setDrawSectionNonce((n) => n + 1)}
+          onOpen={onOpenSection}
+          onClose={onCloseSection}
+          onDelete={onDeleteSectionSet}
+          onToggleShow={onToggleShowSection}
+          digitizeTarget={digitizeTarget}
+          onPickTarget={onPickDigitizeTarget}
+          digitizeArmed={digitizeArmed}
+          onArmDigitize={setDigitizeArmed}
+          onRedigitizeSlice={onRedigitizeSlice}
         />
 
         {addMenuOpen && (
@@ -920,6 +1336,15 @@ function App() {
           drawBounds={drawBounds}
           onBoundsXY={onBoundsXY}
           fitNonce={fitNonce}
+          drawSection={drawSection}
+          onSectionBaseline={onSectionBaseline}
+          sectionView={sectionScene}
+          onSectionStep={onStepSection}
+          sectionQuads={sectionQuads}
+          digitize={{ armed: digitizeArmed }}
+          onDigitizeClick={onDigitizeClick}
+          onDigitizeMove={onDigitizeMoveVertex}
+          onDigitizeDelete={onDigitizeDeleteVertex}
         />
         {pendingBounds && (
           <ZRangeForm
@@ -929,6 +1354,49 @@ function App() {
             onCancel={() => setPendingBounds(null)}
           />
         )}
+        {pendingBaseline && (
+          <SectionSetForm
+            baseline={pendingBaseline}
+            defaultSpacing={extentDiagonal(project.extent) / 10}
+            nextName={`Section ${(project.sections?.length ?? 0) + 1}`}
+            onConfirm={onCreateSections}
+            onCancel={() => setPendingBaseline(null)}
+          />
+        )}
+        {sectionScene && activeSet && activeSection && (
+          <div
+            data-testid="section-active"
+            style={{
+              position: "absolute", top: 12, right: 12, zIndex: 10, background: "#fff",
+              border: "1px solid #ccd", borderRadius: 6, padding: "0.35rem 0.6rem",
+              display: "flex", gap: "0.4rem", alignItems: "center", fontSize: "0.85em",
+              boxShadow: "0 2px 8px rgba(0,0,0,0.15)",
+            }}
+          >
+            <span data-testid="section-label">{sectionScene.label}</span>
+            <button
+              type="button"
+              data-testid="section-step-prev"
+              title="previous parallel section (PageUp)"
+              disabled={activeSection.index <= 0}
+              onClick={() => onStepSection(-1)}
+            >
+              ◀
+            </button>
+            <button
+              type="button"
+              data-testid="section-step-next"
+              title="next parallel section (PageDown)"
+              disabled={activeSection.index >= activeSet.count - 1}
+              onClick={() => onStepSection(1)}
+            >
+              ▶
+            </button>
+            <button type="button" data-testid="section-close" title="back to the 3D view" onClick={onCloseSection}>
+              ✕ 3D
+            </button>
+          </div>
+        )}
       </main>
 
       {editing && editingIface && (
@@ -937,8 +1405,9 @@ function App() {
           parentName={editingIface.parentName}
           points={editingIface.points}
           orientations={editingIface.orientations}
-          onApply={(points, orientations) => {
-            commit(applyInterfaceData(project, editing.elementId, editing.interfaceId, points, orientations));
+          digitized={editingIface.digitized}
+          onApply={(points, orientations, digitized) => {
+            commit(applyInterfaceData(project, editing.elementId, editing.interfaceId, points, orientations, digitized));
             setEditing(null);
           }}
           onCancel={() => setEditing(null)}
