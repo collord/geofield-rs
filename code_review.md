@@ -412,6 +412,12 @@ diagnostic when cells remain double-crossed at `max_depth`.
   face in `clip` (`mesh_clip.rs:1164`) — quadratic on large imported meshes. *Direction:* route
   membership through BVH-signed distance / hierarchical winding number; reuse the WGrid for the
   nearest-W query.
+  > **UPDATE (prototype — done for `winding()`):** `TriMesh::winding` is now a BVH-accelerated
+  > first-order fast winding number (Barill 2018): each `TriBvh` node caches a dipole moment, so a
+  > query far from a cluster evaluates the whole subtree in O(1) and only near nodes recurse (exact
+  > near the surface) → O(log n). `winding_exact` + `fast_winding_matches_exact_scan` prove membership
+  > never flips and the far-field converges to exact. (The `nearest_w_signed` quadratic in `clip`
+  > remains.)
 - **[HIGH] Three.js geometry/material leak on every mesh rebuild** — `Viewer.tsx:566-604`:
   `st.group.clear()` (`:569`) only detaches; it never disposes the prior `BufferGeometry`,
   `MeshStandardMaterial`, or per-mesh `WireframeGeometry`/`LineBasicMaterial` (`:597-601`). Re-runs

@@ -62,6 +62,7 @@ both crates build clean for `wasm32-unknown-unknown`):**
 | **NEW residual (I surfaced):** `sym3_eig` raw `.unwrap()` reachable from a host-staged NaN coordinate | §4.6 | ✅ Two layers: `sym3_eig` sort now uses `f64::total_cmp` (never panics on NaN), and `decode_fit` **rejects any non-finite coordinate/pole at the ABI edge** with a `host_log` warning + empty fit (loud + attributable, like the `.obj` guard). Tested (`decode_fit_rejects_non_finite_coordinates`). |
 | `gf_alloc`/`gf_free` capacity-mismatch UB | §4.4 | ✅ Both now use a shared fixed `Layout` (`buffer_layout`) so alloc and free agree exactly; `len == 0` handled. Tested (`gf_alloc_free_roundtrips_various_sizes`). |
 | Uncapped `.obj` parse (hostile-large-file OOM before the fit cap) | §4.5 | ✅ `parse_obj` now enforces a byte/vertex/face budget (`ObjError::TooLarge`); byte cap is O(1) up front. Tested (`rejects_oversize_input`). |
+| **A1.2 fast winding number** — O(n) `winding()`/point-in-mesh scan | §7-perf | 🟡 Prototyped: first-order Barill dipole on the existing `TriBvh` → O(log n); membership proven exact vs. the flat scan, far-field converges to exact. Tested (`fast_winding_matches_exact_scan`). See A1.2 for the remaining 2nd-order/robust-SDF work. |
 
 **Still open (verified NOT addressed):**
 
@@ -125,7 +126,18 @@ Root-causes `code_review.md §2, §3.2, §5.1–5.6`. Two routes, not mutually e
   Attene 2020 (CAD); Shewchuk 1997.
 
 **A1.2 [HIGH] Replace the O(n) winding/point-in-mesh test with a BVH-accelerated *fast winding
-number*.**
+number*. — 🟡 PROTOTYPED (first-order, 2026-07-18).**
+Landed a first-order (dipole) Barill fast winding number on the existing `TriBvh`
+(`octree.rs`): each node caches an aggregate dipole moment + area-weighted centre + cluster radius
+(computed in one reverse pass since children follow parents in the node array), and `TriMesh::winding`
+now tree-walks — far nodes contribute their whole subtree in O(1), near leaves stay exact — for
+O(log n) queries instead of the O(n) flat scan. The exact scan is kept as `winding_exact` and the test
+`fast_winding_matches_exact_scan` proves (a) membership (`>0.5`) never flips vs. the exact scan — the
+property every consumer (`inside`, `MeshSdf` sign) actually depends on, safe because the 0.5 crossing
+is always near-field/exact — and (b) the far-field **converges** to exact as β grows (1.8e-2 at β=2 →
+<1e-3 at β=8), confirming the dipole is the correct asymptotic. Builds clean for `wasm32`; all
+imported-mesh suites green. **Remaining to fully close:** add the 2nd-order term (or raise β) if a
+use emerges that needs the winding *magnitude* (none does today); and the paired robust SDF below.
 Fixes `code_review.md §7` (unaccelerated `winding()`), and — crucially — the generalized winding
 number is **defect-tolerant**, so it keeps working on the not-guaranteed-watertight meshes the
 engine currently emits (unlike a ray-parity test). Pair the BVH nearest-triangle (unsigned distance)
@@ -314,9 +326,10 @@ System & drillhole import; RockWorks/Micromine.)*
 > A1.4/A1.5 meshing, and B3 validation/QC. Those are the front of the queue now.
 
 **Phase 1 — Trustworthy foundation (do first; unblocks everything).**
-~~A1.6 make-failure-loud~~ ✅ (incl. the §4.4/§4.5/§4.6-residual/§7 cleanup); **remaining:** B3
-validation/QC; A1.1 consolidate on exact-predicate N-body booleans; A1.2 fast winding number; A1.3
-determinism + native/wasm golden test; A1.4 QEF spike clamp.
+~~A1.6 make-failure-loud~~ ✅ (incl. the §4.4/§4.5/§4.6-residual/§7 cleanup); ~~A1.2 fast winding
+number~~ 🟡 prototyped (first-order; 2nd-order/robust-SDF still open); **remaining:** B3 validation/QC;
+A1.1 consolidate on exact-predicate N-body booleans; A1.3 determinism + native/wasm golden test; A1.4
+QEF spike clamp.
 *Outcome:* the "reliably compose arbitrary CSG" goal is actually met for the geology the engine
 already models, and failures are visible instead of silent.
 
