@@ -591,16 +591,95 @@ impl<M: SeriesModel> Stack<M> {
                     // below ground: fall through to older elements
                 }
                 // A fill-upward series (the floor) is present everywhere not yet claimed; a
-                // bounded series / cross-cutting body claims only where it is present.
+                // bounded series / cross-cutting body claims only where it is present — AND, for a
+                // stacking slab, only ABOVE its floor surface ([`Self::below_floor`]). A raw
+                // `present_at` is true everywhere below the element's own top, unbounded down, so
+                // without the floor bound the youngest element would swallow the whole column and
+                // hide every older bed (the classification path then disagrees with the solid
+                // slabs). Erode/onlap deposits stay unbounded ([`Self::slab_bounded_below`]) —
+                // they legitimately overlap older elements.
                 _ => {
                     let fills_upward = matches!(e, StackElement::Series(s) if s.unbounded_above);
-                    if fills_upward || e.present_at(p) {
+                    let claimed = (fills_upward || e.present_at(p))
+                        && !(self.slab_bounded_below(i) && self.below_floor(i, p));
+                    if claimed {
                         return (i, e.model().lithology_unit(p));
                     }
                 }
             }
         }
         (self.series.len(), 0)
+    }
+
+    /// The next-older element whose TOP surface floors element `i`'s below-rock slab: the first
+    /// older `ImportedSurface` in a stratigraphic role (`Contact`/`Erosion`) or `Series` whose
+    /// relation is conformable (or `None`, the floor) — REGARDLESS of source (imported .obj vs
+    /// fitted field). Vein-wall/topography-role imports, cross-cut bodies, topography, and
+    /// erode/onlap-relation series are skipped: they are not stacking floors (an erosion truncates
+    /// via its clip masker; a cross-cut body is not stratigraphic; erode/onlap deposits sit ON,
+    /// not under, what follows them).
+    ///
+    /// This is the single floor oracle behind both renderings of "bounded below by the next-older
+    /// surface": the solid-path subtract prism ([`Self::floor_prim`]) and the field-path point
+    /// predicate ([`Self::below_floor`]). Keeping selection in one place is what makes the two
+    /// paths agree for every element-type pairing (imported↔imported, parametric↔parametric
+    /// across series, and the mixed boundaries that used to flood full-height columns).
+    fn floor_element(&self, i: usize) -> Option<usize> {
+        for j in (i + 1)..self.series.len() {
+            match &self.series[j] {
+                StackElement::ImportedSurface(older) => {
+                    if older.role == ImportRole::Contact || older.role == ImportRole::Erosion {
+                        return Some(j);
+                    }
+                }
+                StackElement::Series(s) => {
+                    if !matches!(s.relation, Some(Relation::Erode) | Some(Relation::Onlap)) {
+                        return Some(j);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// Is element `i`'s below-rock slab bounded below by the next-older floor surface? True for
+    /// every stratigraphic imported surface (contact and erosion alike — an erosion's below-rock is
+    /// the cover deposited on the unconformity, still a slab) and for a series whose relation is
+    /// not Erode/Onlap. Erode/onlap parametric DEPOSITS legitimately overlap older elements and
+    /// stay unbounded (their capping is the deferred erode-interleave problem); cross-cut bodies
+    /// and topography are never slabs.
+    fn slab_bounded_below(&self, i: usize) -> bool {
+        match &self.series[i] {
+            StackElement::ImportedSurface(im) => {
+                im.role == ImportRole::Contact || im.role == ImportRole::Erosion
+            }
+            StackElement::Series(s) => {
+                !matches!(s.relation, Some(Relation::Erode) | Some(Relation::Onlap))
+            }
+            _ => false,
+        }
+    }
+
+    /// Field-path rendering of the floor: is `p` SPATIALLY below element `i`'s floor surface?
+    /// Imported floor → the mesh's local signed distance; fitted floor → field-vs-`iso_top` with
+    /// the LOCAL gradient's z-sign deciding which side is "below" (a deposit-above field decreases
+    /// with z, so below is `field > iso` there). `false` when there is no floor. Must mirror
+    /// [`Self::floor_prim`] so the classification path agrees with the solid path.
+    fn below_floor(&self, i: usize, p: [f64; 3]) -> bool {
+        let Some(j) = self.floor_element(i) else { return false };
+        match &self.series[j] {
+            StackElement::ImportedSurface(older) => {
+                older.mesh.local_signed_distance(p).map(|d| d < 0.0).unwrap_or(false)
+            }
+            StackElement::Series(s) => {
+                let Some(iso) = s.iso_top() else { return false };
+                let f = s.model.scalar_field(p);
+                let gz = s.model.field().scalar_field_gradient(p)[2];
+                if gz >= 0.0 { f < iso } else { f > iso }
+            }
+            _ => false,
+        }
     }
 
     /// The contributions that CLIP element `i`'s surfaces — each a [`Masker`] describing
@@ -2188,36 +2267,45 @@ impl<M: SeriesModel + BlockModel> Stack<M> {
         refs
     }
 
-    /// The below-prism of the nearest OLDER imported CONTACT beneath a conformable imported contact
-    /// at `i`, as a fresh subtract primitive — or `None` if there is no such sibling.
+    /// Solid-path rendering of the floor: the watertight below-prism of element `i`'s floor
+    /// surface, as a fresh subtract primitive — or `None` if there is no floor.
     ///
-    /// Independent imported contacts each emit a full-height below-prism (down to a floor under the
-    /// domain); with no subtraction they OVERLAP (each spans the whole column below its own surface),
-    /// so a conformable stack of imported meshes renders as interpenetrating prisms, not slabs. A
-    /// conformable series solves this by slab-differencing WITHIN one field (`below(iso_u) −
-    /// below(iso_{u-1})`, above); imported contacts are separate elements, so we mirror it here by
-    /// subtracting the next-older imported contact's own below-prism — turning `below(this)` into the
-    /// slab between the two surfaces. Only conformable/contact siblings count: an erosion surface
-    /// truncates via its clip masker instead, and a cross-cut body is not a stacking floor.
-    fn older_imported_contact_prism(
+    /// Independent elements each emit a full-height below-prism; with no subtraction they OVERLAP
+    /// (each spans the whole column below its own surface). A multi-interface series solves this by
+    /// slab-differencing WITHIN one field (`below(iso_u) − below(iso_{u-1})`); ACROSS elements we
+    /// mirror it by subtracting the next-older floor surface's own below-prism — turning
+    /// `below(this)` into the slab between the two surfaces. The prism is built from the floor's
+    /// native representation: an imported mesh seals its exact triangles (`close_sheet_below` — no
+    /// re-fielding), a fitted series contours `below(iso_top)` of its field, up-sense-normalized
+    /// via [`NegatedField`] when the field decreases with z (deposit-above); a folded field
+    /// (`field_up_sense` = `None`) conservatively yields no floor (today's behavior).
+    fn floor_prim(
         &self,
         i: usize,
         min: [f64; 3],
         size: f64,
+        ext_max: [f64; 3],
         cfg: OctreeConfig,
     ) -> Option<Mesh> {
-        for j in (i + 1)..self.series.len() {
-            if let StackElement::ImportedSurface(older) = &self.series[j] {
-                // Skip vein-wall / erosion roles: only a stratigraphic contact forms the slab floor.
-                if older.role != ImportRole::Contact && older.role != ImportRole::Erosion {
-                    continue;
-                }
+        match &self.series[self.floor_element(i)?] {
+            StackElement::ImportedSurface(older) => {
                 let cell = size / (1u32 << cfg.max_depth.max(1)) as f64;
                 let floor = min[2] - cell * 3.0;
-                return older.mesh.close_sheet_below(floor);
+                older.mesh.close_sheet_below(floor)
             }
+            StackElement::Series(s) => {
+                let iso = s.iso_top()?;
+                let ext = [min[0], ext_max[0], min[1], ext_max[1], min[2], ext_max[2]];
+                match crate::schema::field_up_sense(&s.model, ext) {
+                    Some(true) => Some(below_solid(&s.model.field(), iso, min, size, ext_max, cfg)),
+                    Some(false) => {
+                        Some(below_solid(&NegatedField(s.model.field()), -iso, min, size, ext_max, cfg))
+                    }
+                    None => None,
+                }
+            }
+            _ => None,
         }
-        None
     }
 
     /// THE unified volume mesher: a boolean RECIPE over single-level-set PRIMITIVES that the boolean
@@ -2244,6 +2332,21 @@ impl<M: SeriesModel + BlockModel> Stack<M> {
             match &self.series[i] {
                 StackElement::Topography(_) => continue, // never a rock unit; only a clip on older elements
                 StackElement::Series(s) => {
+                    // The slab FLOOR of this series' oldest unit against the next-older stacking
+                    // surface (imported or fitted alike, [`Self::floor_prim`]) — one prim per
+                    // ELEMENT, shared across blocks. Without it unit 0's `below(iso_0)` runs
+                    // full-height to the domain floor THROUGH every older element (the mixed
+                    // imported↔parametric interleave rendered as 60%-overlapping columns).
+                    let floor_id = if self.slab_bounded_below(i) {
+                        self.floor_prim(i, min, size, ext_max, cfg).map(|m| {
+                            let id = next_id;
+                            next_id += 1;
+                            out.push((0, 0, 0, 255, id, m));
+                            id
+                        })
+                    } else {
+                        None
+                    };
                     for b in 0..self.series_block_count(i).max(1) {
                         let isos = s.model.block_interface_isovalues(b);
                         let Some(bf) = s.model.block_field(b) else { continue };
@@ -2265,6 +2368,8 @@ impl<M: SeriesModel + BlockModel> Stack<M> {
                             }
                             if u > 0 {
                                 out.push((i, b, u, 2, bed_ids[u - 1], Mesh::default())); // − below(iso_{u-1})
+                            } else if let Some(fid) = floor_id {
+                                out.push((i, b, 0, 2, fid, Mesh::default())); // − below(next-older floor)
                             }
                             for &(kind, id) in &clip_refs {
                                 out.push((i, b, u, kind, id, Mesh::default()));
@@ -2346,7 +2451,7 @@ impl<M: SeriesModel + BlockModel> Stack<M> {
                     // erosion's below-rock is the cover unit deposited on the unconformity — still a
                     // slab bounded below by the next-older contact); the erode CLIP (clip_refs) then
                     // additionally truncates OLDER surfaces where the erosion cut into them.
-                    let slab_floor_id = self.older_imported_contact_prism(i, min, size, cfg).map(|floor_prim| {
+                    let slab_floor_id = self.floor_prim(i, min, size, ext_max, cfg).map(|floor_prim| {
                         let id = next_id;
                         next_id += 1;
                         out.push((0, 0, 0, 255, id, floor_prim));
@@ -2379,6 +2484,21 @@ impl<M: SeriesModel + BlockModel> Stack<M> {
             }
         }
         out
+    }
+}
+
+/// A field with its sign flipped: `{-f < -iso}` ≡ `{f > iso}` — lets [`below_solid`] emit the
+/// SPATIALLY-below prism of a deposit-above contact (a field that DECREASES with z, the erode
+/// convention), and is the seam future erode-parametric floor work plugs into.
+struct NegatedField<F>(F);
+
+impl<F: ScalarField> ScalarField for NegatedField<F> {
+    fn scalar_field(&self, p: [f64; 3]) -> f64 {
+        -self.0.scalar_field(p)
+    }
+    fn scalar_field_gradient(&self, p: [f64; 3]) -> [f64; 3] {
+        let g = self.0.scalar_field_gradient(p);
+        [-g[0], -g[1], -g[2]]
     }
 }
 

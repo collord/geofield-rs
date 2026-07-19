@@ -169,7 +169,7 @@ pub struct CoreUpdate {
 ///   * `Some(false)` — field DECREASES with z (a deposit-above / erode field; unit index 0 is the top).
 ///   * `None`        — mixed sign (a FOLDED field, no single up-sense) or ~flat in z → caller keeps
 ///                     the default mesher order. Sampling a 3×3 (x,y) grid at z-mid ± h detects folds.
-fn field_up_sense<M: SeriesModel>(model: &M, ext: [f64; 6]) -> Option<bool> {
+pub(crate) fn field_up_sense<M: SeriesModel>(model: &M, ext: [f64; 6]) -> Option<bool> {
     let [x0, x1, y0, y1, z0, z1] = ext;
     let zc = 0.5 * (z0 + z1);
     let h = 1e-3 * (z1 - z0).abs().max(1.0); // small step; field |grad| ~1e-3/unit ≫ f64 noise

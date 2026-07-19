@@ -102,6 +102,9 @@ export interface SurfacePayload {
   lithologyId?: string;
   /** Solid mode only: the unit index within the series, for diagnostics/grouping. */
   unit?: number;
+  /** Solid mode only: the Manifold volume of the clipped unit solid — lets e2e specs assert a
+   *  partition proxy (unit volumes must sum to ≈ the rock volume, not multiples of it). */
+  volume?: number;
 }
 
 /** One op of a unified volume-mesh RECIPE (`mesh_volume_recipe_octree`): a single-level-set primitive

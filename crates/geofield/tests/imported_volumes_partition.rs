@@ -30,8 +30,17 @@ struct VolMeta {
     tris: usize,
 }
 
+/// Which dump to measure: `GEOFIELD_PARTITION_DIR` (absolute, or relative to the crate root) —
+/// e.g. `tests/fixtures/imported_volumes_mixed` for the `conformal-stack-mixed` dump — defaulting
+/// to the all-imported template's `tests/fixtures/imported_volumes`.
 fn fixtures_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/imported_volumes")
+    match std::env::var("GEOFIELD_PARTITION_DIR") {
+        Ok(d) => {
+            let p = PathBuf::from(&d);
+            if p.is_absolute() { p } else { PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(d) }
+        }
+        Err(_) => PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/imported_volumes"),
+    }
 }
 
 /// Parse a minimal `v`/`f` OBJ (the dump format) into a `TriMesh`.

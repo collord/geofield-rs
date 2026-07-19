@@ -4,9 +4,9 @@
 //! Regression for the "Erosion over stack (imported meshes)" template. Each imported contact emits a
 //! below-prism down to a floor under the domain, so with no subtraction three stacked contacts would
 //! each span the whole column below their OWN surface — three overlapping prisms. The fix
-//! (`Stack::older_imported_contact_prism`, wired in `mesh_volume_recipe`) makes each conformable
-//! contact's below-rock unit subtract the next-older contact's below-prism, turning it into the slab
-//! between the two surfaces.
+//! (`Stack::floor_prim` — the unified next-older-floor oracle, wired in `mesh_volume_recipe`) makes
+//! each conformable contact's below-rock unit subtract the next-older contact's below-prism, turning
+//! it into the slab between the two surfaces.
 //!
 //! The Manifold booleans run on the JS main thread, so the native side is asserted on the RECIPE it
 //! emits (as the sibling `imported_mesh_domain_inside`/`imported_mesh_exact` tests do): the younger

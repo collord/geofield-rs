@@ -59,4 +59,16 @@ test("the mixed imported+parametric conformal stack fits and renders 5 slab volu
     return new Set(s.filter((x) => x.indices.length > 0 && x.unit === 0).map((x) => x.series)).size;
   });
   expect(seriesWithSlab, "all five interleaved surfaces yield a below-rock slab in Solids").toBe(5);
+
+  // Partition proxy: the five slabs must TILE the sub-topography column, not stack on top of each
+  // other — so their Manifold volumes sum to at most the domain box (1000³), with slack for the
+  // known thin edge/contact film. The regression this pins measured 60.8% grid overlap (each slab
+  // flooding its full below-column), which roughly doubles the sum — a decisive failure.
+  const volumeSum = await page.evaluate(() => {
+    const s = (window as { __surfaces?: { unit?: number; volume?: number }[] }).__surfaces ?? [];
+    return s.filter((x) => x.unit === 0).reduce((acc, x) => acc + (x.volume ?? 0), 0);
+  });
+  const DOMAIN = 1000 ** 3;
+  expect(volumeSum, "slab volumes must not sum past the domain (overlapping columns)").toBeLessThan(DOMAIN * 1.05);
+  expect(volumeSum, "slab volumes must fill a substantial share of the domain (vanished slabs)").toBeGreaterThan(DOMAIN * 0.2);
 });

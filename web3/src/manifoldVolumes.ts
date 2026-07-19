@@ -105,8 +105,15 @@ export function executeRecipe(
       const m = pool.get(o.primId);
       if (!m) { failed = true; break; } // a primitive failed → drop this unit
       if (o.op === 0) {
-        result = m;
-        ownsResult = false; // pooled — don't delete
+        // Clip the Base to the domain BEFORE the boolean ops — set-identical to clipping after
+        // (`(A−B)∩box ≡ (A∩box)−B`), but it kills the primitive's margin-overhang ring up front.
+        // Left until the end, that ring survives any Subtract whose prim spans exactly the domain
+        // footprint (an imported `close_sheet_below` prism, unlike a `below_solid` contour, has no
+        // lateral margin), and the final clip then crushes it into zero-thickness coincident faces
+        // on the domain wall — flap triangles in `getMesh()` that break downstream nearest-facet
+        // sign tests (the partition harness measured a phantom 10% overlap from exactly this).
+        result = m.intersect(domainBox);
+        ownsResult = true;
       } else if (result) {
         const next: Solid = o.op === 1 ? result.intersect(m) : result.subtract(m);
         if (ownsResult) result.delete();
@@ -124,7 +131,8 @@ export function executeRecipe(
     }
     const clipped = result.intersect(domainBox);
     if (ownsResult) result.delete();
-    if (clipped.status() === "NoError" && clipped.volume() > 0) {
+    const volume = clipped.status() === "NoError" ? clipped.volume() : 0;
+    if (volume > 0) {
       const [series, block, unit] = key.split(":").map(Number);
       const mesh = clipped.getMesh();
       out.push({
@@ -132,6 +140,7 @@ export function executeRecipe(
         block,
         interface: unit,
         unit,
+        volume,
         lithologyId: assignment[`${series}:${unit}`],
         positions: Float32Array.from(mesh.vertProperties),
         normals: new Float32Array(0),
