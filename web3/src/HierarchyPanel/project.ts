@@ -101,6 +101,18 @@ export interface DigitizedLine {
   sectionRef?: { setId: string; index: number };
 }
 
+/** One POST-DESURVEY drillhole lithology interval (prototype drillhole import). The table is
+ *  desurveyed upstream (an external library), so each interval carries its 3D endpoints directly —
+ *  no depth/trajectory math here. Contacts are extracted at within-hole unit transitions: the
+ *  shared boundary XYZ (`prev.end` ≈ `next.start`) becomes a contact point of the LOWER unit's
+ *  top surface. */
+export interface DrillholeInterval {
+  holeId: string;
+  start: { x: number; y: number; z: number };
+  end: { x: number; y: number; z: number };
+  unit: string;
+}
+
 /** One interface's interpolation data — the unit a user adds and edits. */
 export interface InterfaceData {
   id: string; // stable client id
@@ -190,6 +202,10 @@ export interface Project {
   /** Cross-section sets (feature 005). VIEW/AUTHORING constructs, not geology: mutations
    *  save immediately without dirty/re-fit (the setRelation pattern). Absent ⇒ none. */
   sections?: SectionSet[];
+  /** Raw imported drillhole intervals (prototype drillhole import). UI metadata only — never
+   *  compiled; the derived "top of <unit>" contact elements are the geology. Kept so the source
+   *  table round-trips with the project. Absent ⇒ none. */
+  drillholes?: DrillholeInterval[];
   /** Optional saved VIEW state — captured on Export and re-applied on Import so a viewpoint
    *  round-trips and an exact view can be shared for repro. UI-only (never sent to the
    *  worker as geology). Covers the camera AND the render toggles, so "what I'm looking at"
@@ -753,6 +769,9 @@ export async function importProjectJson(file: File): Promise<Project> {
   if (p.version !== 1 || !Array.isArray(p.elements)) {
     throw new Error("not a valid .geoproj.json (version 1) file");
   }
+  // Best-effort guard (like view state): a malformed `drillholes` is dropped, not fatal — the
+  // derived contact elements are the geology; the raw table is only kept for round-trip.
+  if (p.drillholes !== undefined && !Array.isArray(p.drillholes)) delete p.drillholes;
   return hydrateMeshPaths(sanitizeSections(p));
 }
 

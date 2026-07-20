@@ -88,6 +88,9 @@ import {
 } from "./HierarchyPanel/projectOps";
 import { AddSurfaceMenu } from "./HierarchyPanel/AddSurfaceMenu";
 import { SurfaceDataModal } from "./HierarchyPanel/SurfaceDataModal";
+import { DrillholeImportModal } from "./HierarchyPanel/DrillholeImportModal";
+import { applyDrillholeImport } from "./HierarchyPanel/drillholes";
+import type { DrillholeInterval } from "./HierarchyPanel/project";
 import type { ManifoldMessage, RenderMode, RunCommand, SurfacePayload, WorkerMessage } from "./protocol";
 
 /** The minZ/maxZ form shown after the 2-point XY bounds digitization, to complete the rectangular
@@ -216,6 +219,7 @@ function App() {
   const [addMenuOpen, setAddMenuOpen] = useState(false);
   // Which interface the data modal is editing: { elementId, interfaceId } | null.
   const [editing, setEditing] = useState<{ elementId: string; interfaceId: string } | null>(null);
+  const [showDrillholeImport, setShowDrillholeImport] = useState(false);
 
   const lastApplied = useRef<Project>(project);
   const workerRef = useRef<Worker | null>(null);
@@ -991,6 +995,16 @@ function App() {
     }
   };
 
+  // --- Import DRILLHOLES (prototype): a pasted post-desurvey interval table auto-builds the
+  //     conformable stack (contacts → "top of <unit>" elements + lithologies + data-fit extent).
+  //     A geometry edit like any other → commit marks dirty, the panel Apply runs the one fit. ---
+  const onImportDrillholes = (intervals: DrillholeInterval[]) => {
+    const { project: next, summary } = applyDrillholeImport(project, intervals);
+    commit(next);
+    setShowDrillholeImport(false);
+    setStatus(`imported ${summary.createdElements.length} contact surfaces — press Apply to fit`);
+  };
+
   // --- OBJ export (US6) -----------------------------------------------------------------
   const canExportObj = surfaces.length > 0 && !dirty;
   const onExportObj = () => {
@@ -1057,6 +1071,9 @@ function App() {
                 }}
               />
             </label>
+            <button type="button" data-testid="import-drillholes-btn" onClick={() => setShowDrillholeImport(true)}>
+              Import drillholes
+            </button>
             <button type="button" onClick={onExport}>Export</button>
             <select
               data-testid="seed-template"
@@ -1412,6 +1429,10 @@ function App() {
           }}
           onCancel={() => setEditing(null)}
         />
+      )}
+
+      {showDrillholeImport && (
+        <DrillholeImportModal onApply={onImportDrillholes} onCancel={() => setShowDrillholeImport(false)} />
       )}
     </div>
   );
