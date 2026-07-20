@@ -16,6 +16,7 @@ import {
   SERIES_COLORS,
   Viewer,
   surfaceKey,
+  unassignedSolidColor,
   type DigLineView,
   type SectionContent,
   type SectionQuad,
@@ -593,11 +594,13 @@ function App() {
     const fills: SectionContent["fills"] = [];
     for (const s of surfaces) {
       if (hiddenKeys.has(surfaceKey(s))) continue;
+      // Match the 3D viewer's solid colouring: assigned lithology hex, else a distinct per-volume
+      // fallback (not flat grey) so a section reads the same as the Solids view.
       const color =
         renderMode === "solid"
           ? s.lithologyId && lithoColors[s.lithologyId] !== undefined
             ? hexToNum(lithoColors[s.lithologyId])
-            : 0xc8c8cd
+            : unassignedSolidColor(s)
           : SERIES_COLORS[s.series % SERIES_COLORS.length];
       if (renderMode === "solid") {
         const { closed, open } = sectionLoops(s.positions, s.indices, frame, quantum);

@@ -14,6 +14,20 @@ import { derivePoles } from "./section/digitizeDerive";
 /** Element palette — exported so main.tsx colours section traces identically (feature 005). */
 export const SERIES_COLORS = [0x4f83cc, 0xcc7a4f, 0x6aa84f, 0x9b59b6, 0xc0392b];
 
+/** A distinct, stable colour for an UNASSIGNED solid volume (no lithology), so the units of a
+ *  catalog-less template (or a fresh authored project) are visually separable instead of all
+ *  flat grey. Keyed by the volume's DISTINCT per-unit identity — `series` plus the unit index,
+ *  which for a solid payload rides the `interface` field (each bed of a multi-bed series is its
+ *  own solid at the same `unit`, differing only by `interface`; see `surfaceKey`). The combined
+ *  ordinal walks the golden-angle hue sequence so successive volumes land far apart on the wheel;
+ *  muted saturation/lightness keeps them readable next to the assigned-lithology earth tones.
+ *  Deterministic (no per-scene state) → a volume keeps its colour across re-renders. */
+export function unassignedSolidColor(s: SurfacePayload): number {
+  const ordinal = s.series * 8 + (s.interface ?? s.unit ?? 0); // fan units within a series
+  const hue = (ordinal * 137.508) % 360; // golden angle → maximal spacing for successive volumes
+  return new THREE.Color().setHSL(hue / 360, 0.5, 0.6).getHex();
+}
+
 // ---------------------------------------------------------------------------------------
 // Feature 005 (cross-sections): the section-view content contract between main.tsx (which
 // SLICES — section/slice.ts over the already-returned payloads) and the Viewer (which only
@@ -1148,12 +1162,14 @@ export function Viewer(props: {
         geom.computeVertexNormals();
       }
       // Solid mode: colour each unit solid by its assigned lithology (Air is never emitted,
-      // so there is nothing transparent to draw). Contact mode: colour by series index.
+      // so there is nothing transparent to draw); an UNASSIGNED solid falls back to a distinct
+      // per-volume colour (not flat grey) so a catalog-less template's units stay separable.
+      // Contact mode: colour by series index.
       const color =
         byLithology && s.lithologyId && props.lithoColors?.[s.lithologyId] !== undefined
           ? hexToNum(props.lithoColors[s.lithologyId])
           : byLithology
-            ? 0xc8c8cd // Unknown / unassigned solid (neutral grey)
+            ? unassignedSolidColor(s)
             : SERIES_COLORS[s.series % SERIES_COLORS.length];
       const mat = new THREE.MeshStandardMaterial({ color, side: THREE.DoubleSide, flatShading: true });
       st.group.add(new THREE.Mesh(geom, mat));
