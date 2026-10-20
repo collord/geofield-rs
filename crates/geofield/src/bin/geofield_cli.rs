@@ -10,7 +10,7 @@
 //!   reads:
 //!     <DIR>/input_surface_points.csv   gempy format: X,Y,Z,formation
 //!     <DIR>/input_orientations.csv     gempy format: X,Y,Z,azimuth,dip,polarity,formation
-//!     <DIR>/kernel_options.json        live range,c_o,i_res,gi_res,uni_degree,(nugget)
+//!     <DIR>/kernel_options.json        live kernel_function,range,c_o,i_res,gi_res,uni_degree,(nugget)
 //!     <DIR>/series.json                ordered formation list (bottom→top per series)
 //!     <DIR>/grid.npy                   (N,3) f64 grid points gempy evaluated, world coords
 //!   writes:
@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 
 use geofield_kernel::assemble::KernelOptions;
 use geofield_kernel::data::{Orientation, Series, SurfacePoint};
-use geofield_kernel::Model;
+use geofield_kernel::{KernelFunction, Model};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -94,7 +94,8 @@ fn dump_kernel(dir: &Path) -> Result<(), String> {
     let sys = assemble(&series, opts);
     let (k, b, n) = sys.dump_matrix();
     eprintln!(
-        "[cli] dump-kernel: dim={n}  range={} c_o={} gi_res={} i_res={} nugget(g/sp)={}/{}",
+        "[cli] dump-kernel: dim={n}  kernel={} range={} c_o={} gi_res={} i_res={} nugget(g/sp)={}/{}",
+        opts.kernel.gempy_name(),
         opts.range, opts.c_o, opts.gi_res, opts.i_res, opts.grad_nugget, opts.sp_nugget
     );
     write_npy_2d(&dir.join("rust_K.npy"), k, n, n)?;
@@ -109,10 +110,11 @@ fn run(dir: &Path) -> Result<(), String> {
     let grid = read_grid(dir)?;
 
     eprintln!(
-        "[cli] {} surface points, {} orientations, {} grid pts; range={} c_o={} nugget(g/sp)={}/{}",
+        "[cli] {} surface points, {} orientations, {} grid pts; kernel={} range={} c_o={} nugget(g/sp)={}/{}",
         series.surface_points.len(),
         series.orientations.len(),
         grid.len(),
+        opts.kernel.gempy_name(),
         opts.range,
         opts.c_o,
         opts.grad_nugget,
@@ -270,7 +272,16 @@ fn read_kernel_options(dir: &Path) -> Result<KernelOptions, String> {
         .or_else(|| v.get("surface_points_nugget"))
         .and_then(|x| x.as_f64())
         .unwrap_or(d.sp_nugget);
+    // gempy's `kernel_function` member name; absent → the cubic default. An unknown
+    // name is an error, never a silent fallback to cubic (that would "validate" the
+    // wrong kernel against the fixture).
+    let kernel = match v.get("kernel_function").and_then(|x| x.as_str()) {
+        None => d.kernel,
+        Some(name) => KernelFunction::from_gempy_name(name)
+            .ok_or_else(|| format!("kernel_options.json: unsupported kernel_function {name:?}"))?,
+    };
     Ok(KernelOptions {
+        kernel,
         range: f("range", d.range),
         c_o: f("c_o", d.c_o),
         i_res: f("i_res", d.i_res),
@@ -281,6 +292,7 @@ fn read_kernel_options(dir: &Path) -> Result<KernelOptions, String> {
             .unwrap_or(d.uni_degree as u64) as u32,
         grad_nugget,
         sp_nugget,
+        ..d
     })
 }
 

@@ -1,0 +1,19 @@
+{
+  "gempy_version": "2025.2.0",
+  "generated_utc": "2026-10-20T07:14:34.101873+00:00",
+  "model": "jan_models/model1 horizontal stratigraphy",
+  "series": {
+    "Strat_Series": [
+      "rock2",
+      "rock1",
+      "basement"
+    ]
+  },
+  "gempy_isovalues_at_surface_points": [
+    [
+      0.12500000000000003,
+      -0.12499999999999997
+    ]
+  ],
+  "note": "interface points mark the BOTTOM of a layer (gempy convention)"
+}

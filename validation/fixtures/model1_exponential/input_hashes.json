@@ -1,0 +1,6 @@
+{
+  "surface_points_sha256": "6f1a39ed77e87a4057f03629c946b1876b87e24409cadfe0e1cf7ab1488f69e4",
+  "orientations_sha256": "04c307ae23f70252fe54144a2fb95ca7d96584a2d497ea539ed32dfd23e7cd5d",
+  "surface_points_url": "https://raw.githubusercontent.com/cgre-aachen/gempy_data/master/data/input_data/jan_models/model1_surface_points.csv",
+  "orientations_url": "https://raw.githubusercontent.com/cgre-aachen/gempy_data/master/data/input_data/jan_models/model1_orientations.csv"
+}

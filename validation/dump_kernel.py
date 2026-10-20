@@ -8,6 +8,13 @@ the inputs and live kernel_options. This is the step-5 block-diff input — the
 authority on where the geofield-rs assembly diverges from gempy.
 
 Run:  cd validation && uv run python dump_kernel.py --out fixtures/kernel_tiny
+
+Kernel choice: `--kernel {cubic,matern_5_2,exponential}` selects gempy's
+`AvailableKernelFunctions` member (default cubic, the original gate). `--model multi`
+uses a 3-orientation / 2-interface model so the CG_CG off-diagonal (orientation pairs
+at different locations — where kernels differ most, incl. gempy's exponential r⁴
+divisor, KERNEL_MATH.md §1c.4) is actually exercised; the tiny model's single
+orientation never reaches it.
 """
 
 from __future__ import annotations
@@ -68,8 +75,9 @@ def build_tiny():
     return gp  # placeholder; real builder set in main once we choose the model
 
 
-def build_from_csv(sp_csv: Path, ori_csv: Path, extent, resolution, mapping):
+def build_from_csv(sp_csv: Path, ori_csv: Path, extent, resolution, mapping, kernel="cubic"):
     import gempy as gp
+    from gempy_engine.core.data.kernel_classes.kernel_functions import AvailableKernelFunctions
 
     def _builder():
         data = gp.create_geomodel(
@@ -83,6 +91,7 @@ def build_from_csv(sp_csv: Path, ori_csv: Path, extent, resolution, mapping):
             ),
         )
         gp.map_stack_to_surfaces(gempy_model=data, mapping_object=mapping)
+        data.interpolation_options.kernel_options.kernel_function = AvailableKernelFunctions[kernel]
         gp.compute_model(data)
         return data
 
@@ -126,6 +135,12 @@ def extract_kernel_options(data) -> dict:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", type=Path, default=SCRIPT_DIR / "fixtures/kernel_tiny")
+    ap.add_argument("--kernel", default="cubic",
+                    choices=["cubic", "matern_5_2", "exponential"],
+                    help="gempy AvailableKernelFunctions member (default cubic)")
+    ap.add_argument("--model", default="tiny", choices=["tiny", "multi"],
+                    help="tiny: 2 points + 1 orientation; multi: 5 points on 2 "
+                         "interfaces + 3 orientations (exercises CG_CG off-diagonal)")
     args = ap.parse_args()
     outdir = args.out
     outdir.mkdir(parents=True, exist_ok=True)
@@ -134,14 +149,36 @@ def main():
     # CSVs so gempy's standard reader path is exercised (same as model1).
     sp_csv = outdir / "input_surface_points.csv"
     ori_csv = outdir / "input_orientations.csv"
-    sp_csv.write_text("X,Y,Z,formation\n0,0,0,rockA\n1000,0,200,rockA\n")
-    ori_csv.write_text("X,Y,Z,azimuth,dip,polarity,formation\n500,0,100,90,0,1,rockA\n")
+    if args.model == "tiny":
+        sp_csv.write_text("X,Y,Z,formation\n0,0,0,rockA\n1000,0,200,rockA\n")
+        ori_csv.write_text("X,Y,Z,azimuth,dip,polarity,formation\n500,0,100,90,0,1,rockA\n")
+        extent, formations = [0, 1000, -100, 100, 0, 300], ("rockA",)
+    else:
+        # Rows are written in gempy's stack order (rockB above rockA, so rockB first):
+        # gempy groups its rows by surface in stack order, while geofield-cli keeps file
+        # order — writing them pre-sorted keeps the two row layouts identical.
+        # The data span is 600 on EVERY axis: current gempy rescales anisotropically
+        # (and transforms the poles) when the spans differ, which geofield's isotropic
+        # Transform (KERNEL_MATH.md §5.1) does not reproduce — a known, separate
+        # divergence this kernel gate must not be confounded by.
+        sp_csv.write_text(
+            "X,Y,Z,formation\n"
+            "100,-200,500,rockB\n550,250,600,rockB\n"
+            "0,-300,100,rockA\n400,300,0,rockA\n600,0,150,rockA\n")
+        ori_csv.write_text(
+            "X,Y,Z,azimuth,dip,polarity,formation\n"
+            "300,0,550,80,8,1,rockB\n"
+            "100,-100,90,90,10,1,rockA\n"
+            "500,200,80,100,15,1,rockA\n")
+        extent, formations = [-100, 700, -400, 400, -100, 700], ("rockB", "rockA")
+    n_interfaces = len(formations)
 
     builder = build_from_csv(
         sp_csv, ori_csv,
-        extent=[0, 1000, -100, 100, 0, 300],
+        extent=extent,
         resolution=[2, 2, 2],
-        mapping={"Series": ("rockA",)},
+        mapping={"Series": formations},
+        kernel=args.kernel,
     )
 
     print("[1/2] computing + capturing kernel ...")
@@ -152,7 +189,7 @@ def main():
     np.save(outdir / "gempy_w.npy", snap["w"])
     (outdir / "kernel_options.json").write_text(
         json.dumps(extract_kernel_options(data), indent=2, default=str))
-    (outdir / "series.json").write_text(json.dumps({"order": ["rockA"]}, indent=2))
+    (outdir / "series.json").write_text(json.dumps({"order": list(formations)}, indent=2))
 
     print(f"[ok] K {snap['cov'].shape}  b {snap['b'].shape}  w {snap['w'].shape}")
     print(f"[ok] dumped to {outdir}")
@@ -163,7 +200,6 @@ def main():
     n = snap["cov"].shape[0]
     n_ori = _count_csv_rows(ori_csv)
     n_sp_total = _count_csv_rows(sp_csv)
-    n_interfaces = 1  # rockA only
     n_grad = 3 * n_ori
     n_sp = n_sp_total - n_interfaces
     layout = {"n": n, "n_grad": n_grad, "n_sp": n_sp, "n_uni": 3,

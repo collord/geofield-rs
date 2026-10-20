@@ -65,8 +65,9 @@ RESOLUTION = [50, 50, 50]
 # ----------------------------------------------------------------------------
 # gempy side
 # ----------------------------------------------------------------------------
-def build_and_compute():
+def build_and_compute(kernel: str = "cubic"):
     import gempy as gp
+    from gempy_engine.core.data.kernel_classes.kernel_functions import AvailableKernelFunctions
 
     data = gp.create_geomodel(
         project_name="horizontal",
@@ -90,6 +91,10 @@ def build_and_compute():
         data.interpolation_options.compute_scalar_gradient = True
     except Exception as e:
         print(f"[warn] could not set compute_scalar_gradient: {e}", file=sys.stderr)
+
+    # Kernel choice (gempy AvailableKernelFunctions member). Recorded in the dumped
+    # kernel_options.json, which geofield-cli reads — so both sides use the same kernel.
+    data.interpolation_options.kernel_options.kernel_function = AvailableKernelFunctions[kernel]
 
     gp.compute_model(data)
     return gp, data
@@ -433,6 +438,11 @@ def main():
                          "pass to run it and diff")
     ap.add_argument("--no-rust", action="store_true",
                     help="only write gempy fixtures; skip the Rust diff")
+    ap.add_argument("--kernel", default="cubic",
+                    choices=["cubic", "matern_5_2", "exponential"],
+                    help="gempy kernel_function (default cubic, the original gate); "
+                         "pair a non-cubic kernel with its own --out dir, e.g. "
+                         "fixtures/model1_matern_5_2")
     ap.add_argument("--show-contract", action="store_true",
                     help="print the Rust CLI contract and exit")
     args = ap.parse_args()
@@ -442,7 +452,7 @@ def main():
         return
 
     print("[1/3] building gempy model + computing ...")
-    gp, data = build_and_compute()
+    gp, data = build_and_compute(args.kernel)
 
     print("[2/3] writing fixtures ...")
     write_fixtures(args.out, gp, data)
