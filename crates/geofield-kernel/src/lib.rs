@@ -40,6 +40,7 @@ use litho::Lithology;
 use solve::{solve, Solution};
 
 pub use fault::{FaultStack, OneFault, PlanarFault};
+pub use kernel::KernelFunction;
 
 /// The field-oracle contract — defined in the permissive `geofield-types` interface
 /// crate (the boundary between this EUPL kernel and the BSD meshing engine), re-exported

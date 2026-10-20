@@ -1,4 +1,4 @@
-# KERNEL_MATH.md — cubic covariance kernel & cokriging block layout
+# KERNEL_MATH.md — covariance kernels & cokriging block layout
 
 Reference implementation: `gempy_engine`, branch `main`
 (`github.com/gempy-project/gempy_engine`). All formulas below are transcribed
@@ -8,6 +8,19 @@ multi-series stacking, octrees, and dual contouring are out.
 
 Everything is `f64`. The cubic kernel consumes **raw distance `r`, not `r²`**
 (`consume_sq_distance=False`).
+
+**Kernels.** The blocks of §3 consume a kernel only through the triple
+`C`, `C'/r`, `C''` plus gempy's distance convention for it. geofield implements
+exactly gempy's `AvailableKernelFunctions` that it validates against (Rust:
+`geofield_kernel::KernelFunction`; ABI code in parentheses):
+
+| gempy name | §  | argument | geofield variant |
+|---|---|---|---|
+| `cubic` (0, default) | §1 | floored `r` | `Cubic` |
+| `matern_5_2` (1) | §1b | floored `r` | `Matern52` |
+| `exponential` (2) — a **Gaussian** | §1c | **raw `r²`** | `Exponential` |
+
+A kernel with no gempy reference does not belong in this crate (Constitution I).
 
 ---
 
@@ -116,6 +129,115 @@ factored form expands to exactly this. ✓ **`cubic_function_a` IS C''(r).**
 > which is exactly the decomposition into separation-vector and perpendicular
 > radial coefficients. (`cubic_function_p_div_r` likewise carries its own
 > `−14/a²` and is the plain `C'/r`.)
+
+---
+
+## 1b. The Matérn ν=5/2 triple — `matern_5_2` (CONFIRMED verbatim from source)
+
+Source: `gempy_engine/core/data/kernel_classes/kernel_functions.py`
+(`matern_function_5_2_numpy`, `…_p_div_r_numpy`, `…_a_numpy`), gempy_engine
+`main` @ `098b2b1` (2026-10-17). `consume_sq_distance=False`: the argument is the
+**floored `r`** (`sqrt(r² + 1e-10)`), exactly as for the cubic. With `x = r/a`:
+
+### 1b.1 `C(r)`
+```
+C(r) = (1 + √5·x + (5/3)·x²) · exp(−√5·x)          C(0) = 1
+```
+### 1b.2 `C'(r)/r`
+```
+C'(r)/r = −5 · exp(−√5·x) · (a + √5·r) / (3a³)      → −5/(3a²) at r = 0
+```
+### 1b.3 `C''(r)` (the plain second derivative, like §1.3)
+```
+C''(r) = −5 · exp(−√5·x) · (a² + √5·a·r − 5r²) / (3a⁴)   → −5/(3a²) at r = 0
+```
+
+Both derivatives are finite at `r = 0`, which is what lets this kernel carry
+orientation (gradient) data — a kernel with a cusp at the origin (exponential
+`e^{−r/a}`, spherical, linear) cannot.
+
+> **Trap — truncated constants.** gempy writes `√5` as the literal
+> `2.2360679775` and `5/3` (in `C` only) as `1.6666666667`; the derivatives use
+> the exact `5/3` algebra. `C` and its derivatives therefore disagree at ~1e-11
+> relative. The Rust transcription keeps the literals verbatim for parity; do
+> not "fix" one side without the other.
+
+No compact support: the kernel decays exponentially, so the §1.1 in-range
+precondition (and its debug assertion) applies to the cubic only.
+
+---
+
+## 1c. gempy's `exponential` triple — a **Gaussian** (CONFIRMED verbatim from source)
+
+Source: the same file (`exp_function_numpy`, `exp_function_p_div_r_numpy`,
+`exp_function_a_numpy`), same commit. Despite the name this is the
+squared-exponential (Gaussian) covariance, and it is gempy's only
+`consume_sq_distance=True` kernel.
+
+### 1c.1–1c.3 The triple, as functions of `s = r²`
+```
+C       = exp(−s / (2a²))                       C(0) = 1
+C'(r)/r = −(1/a²) · exp(−s / (2a²))             → −1/a² at r = 0
+C''(r)  = (s/a⁴ − 1/a²) · exp(−s / (2a²))       → −1/a² at r = 0
+```
+(`C'/r` and `C''` are the true derivatives with respect to `r`, merely written in
+terms of `s`.)
+
+> **Trap — the argument is `r²`, un-floored.** With `square_distance=True`,
+> `_compute_distances_generic` skips the `sqrt(r² + 1e-10)` step entirely: all
+> three functions receive the raw squared distance. Passing `r` is silently wrong
+> (it is still a valid-looking positive number). `KernelFunction::arg` is the one
+> place this switch lives.
+
+### 1c.4 ⚠ LANDMINE — the CG_CG divisor becomes `r⁴ + 1e-5`
+
+§3.1's divisor is written in source as `hu·hv / (r_ref_ref**2 + 1e-5)`, where
+`r_ref_ref` is **the kernel argument**. For the distance kernels that is
+`r² + 1e-5` (§3.1, unchanged). For `exponential` the argument is already `r²`,
+so gempy's divisor is **`r⁴ + 1e-5`** — not the `r²` that the Hessian
+decomposition `(C'' − C'/r)·d dᵀ/r² + (C'/r)·I` calls for.
+
+This is a gempy quirk, reproduced **deliberately** for parity
+(`KernelFunction::cg_cg_divisor`). Consequences, stated so nobody "fixes" it by
+accident:
+- It only touches the CG_CG coupling between orientations at **different**
+  locations (`hu·hv = 0` on the diagonal), so single-orientation models are
+  unaffected.
+- The assembled covariance is then not the exact derivative-covariance of the
+  Gaussian, so with **interacting** orientations the fitted field's gradient
+  does not reproduce the poles. Measured (`gradient_consistency.rs`,
+  `pole_reproduction_with_interacting_orientations_per_kernel`, 3 orientations):
+  worst pole-direction misfit **7.6°** (others 2.2°, 2.7°) for `exponential`,
+  versus < 0.01° for `cubic` and `matern_5_2`. Fits remain well-posed (solve
+  residual ~1e-15); orientations are honored only approximately. The UI says so
+  in the kernel picker's tooltip.
+- **The validation gate distinguishes the two**: with the `r⁴` divisor the
+  multi-orientation block diff (`dump_kernel.py --kernel exponential --model
+  multi`) matches gempy to `max|Δ| = 4.4e-15`; with an `r²` divisor the same gate
+  **fails** at `max|Δ| = 0.77` (CG_CG ratio 0.17–1.32). Changing this is a
+  deliberate deviation from the reference and must be recorded here.
+
+### 1d. Validation record (2026-10-20, gempy_engine `098b2b1`)
+
+Assembly gate (`validation/dump_kernel.py`, full-`K` max|Δ| vs gempy, gate 1e-4):
+
+| kernel | `--model tiny` (1 orientation) | `--model multi` (3 orientations, 2 interfaces) |
+|---|---|---|
+| `cubic` | 0 | 8.9e-9 |
+| `matern_5_2` | 1.2e-10 | 4.6e-10 |
+| `exponential` | 0 | 4.4e-15 |
+
+The cubic's `8.9e-9` on `multi` is the known divisor detail: geofield uses
+`r² + 1e-5`, gempy `(sqrt(r²+1e-10))² + 1e-5` — they differ by the `1e-10`
+floor (+ rounding). Matérn's residual is `exp` ULPs.
+
+Field gate (`validation/run_model1_validation.py --kernel …`, model1, 125 000
+grid points): every kernel shows the same profile as the cubic baseline —
+affine `rust ≈ 1.000000·gempy − 2.0e-6` (the known inert offset), normalized
+RMS residual 2.8e-16 (cubic) / 7.8e-16 (matern_5_2) / 7.2e-16 (exponential),
+lithology voxel agreement **100.0000%**. (model1 is flat-lying strata, so this
+gate discriminates between kernels only weakly; the `multi` block diff above is
+the sharper oracle.)
 
 ---
 
@@ -329,6 +451,16 @@ A Cholesky that "succeeds" means the drift border was assembled wrong.
 ---
 
 ## 7. Open items to confirm against a live model dump
+
+0. **Anisotropic rescaling (found 2026-10-20, not yet handled).** Current gempy
+   `main` rescales **per axis** when the data's x/y/z spans differ (observed
+   scale `[0.0005, 0.00132, 0.0005]` on an 1000×350×380 point cloud) and
+   transforms the orientation gradients to match (`dip_gradients` ≠ the raw
+   poles). §5.1's isotropic box — which geofield's `Transform` implements — is
+   only what gempy does when the spans are equal. model1 and the `tiny`/`multi`
+   gate models have equal spans and so match; a non-cubic data cloud would not.
+   This is independent of the kernel choice. Until resolved, the gate models
+   keep equal spans on purpose (see `dump_kernel.py --model multi`).
 
 1. Exact placement/ordering of the `selector` border rows vs. our `K` index
    layout (gempy interleaves orientation components; we must match the RHS

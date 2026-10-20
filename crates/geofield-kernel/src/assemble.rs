@@ -13,10 +13,8 @@
 //! border kills positive-definiteness) → Bunch-Kaufman at the solve step.
 
 use crate::data::{Series, Transform};
-use crate::geometry::{
-    cg_cg_divisor, debug_assert_within_range, diff, hv, hu, kernel_arg_dist, perp_matrix, r2,
-};
-use crate::kernel::{cubic_a, cubic_c, cubic_p_div_r};
+use crate::geometry::{debug_assert_within_range, diff, hu, hv, perp_matrix, r2};
+use crate::kernel::KernelFunction;
 
 /// Live kernel options (read from the validation fixture, never hardcoded in
 /// Iterative, residual-guided surface-point decimation (a kriging "coreset").
@@ -64,6 +62,9 @@ impl Default for DecimateConfig {
 /// tests — KERNEL_MATH.md §7). Defaults mirror gempy's octree defaults.
 #[derive(Debug, Clone, Copy)]
 pub struct KernelOptions {
+    /// Covariance kernel (gempy `kernel_function`). Default [`KernelFunction::Cubic`],
+    /// the original validated path.
+    pub kernel: KernelFunction,
     /// Kernel range `a`.
     pub range: f64,
     /// Covariance scaling constant `c_o`.
@@ -86,6 +87,7 @@ pub struct KernelOptions {
 impl Default for KernelOptions {
     fn default() -> Self {
         Self {
+            kernel: KernelFunction::Cubic,
             range: 1.7,
             c_o: 10.0,
             i_res: 4.0,
@@ -222,6 +224,7 @@ pub fn assemble(series: &Series, opts: KernelOptions) -> System {
     let geom = AssembledGeometry::build(series, opts);
     let dim = geom.dim();
     let a = opts.range;
+    let kf = opts.kernel;
 
     let mut sys = System {
         k: vec![0.0; dim * dim],
@@ -230,9 +233,9 @@ pub fn assemble(series: &Series, opts: KernelOptions) -> System {
         dim,
     };
 
-    assemble_cov_grad(&mut sys, a);
-    assemble_cov_grad_sp(&mut sys, a);
-    assemble_cov_sp(&mut sys, a);
+    assemble_cov_grad(&mut sys, kf, a);
+    assemble_cov_grad_sp(&mut sys, kf, a);
+    assemble_cov_sp(&mut sys, kf, a);
     // Nuggets are added to the covariance blocks BEFORE the c_o scaling — gempy
     // folds them into cov_grad / cov_surface_points, then multiplies the sum by
     // c_o (`cov = c_o*(cov_grad + cov_sp + cov_grad_sp) + drift`). Adding them
@@ -248,8 +251,9 @@ pub fn assemble(series: &Series, opts: KernelOptions) -> System {
 
 /// §3.1 CG_CG — `_get_cov_grad`. Writes the raw block (pre-`c_o`, pre-nugget).
 ///
-/// `cov_grad = (hu·hv)/(r²+1e-5)·(−k_p_ref + k_a) − k_p_ref·perp`.
-fn assemble_cov_grad(sys: &mut System, a: f64) {
+/// `cov_grad = (hu·hv)/(r²+1e-5)·(−k_p_ref + k_a) − k_p_ref·perp` — with the divisor
+/// per [`KernelFunction::cg_cg_divisor`] (`r⁴+1e-5` for gempy's `exponential`, §1c.4).
+fn assemble_cov_grad(sys: &mut System, kf: KernelFunction, a: f64) {
     let n_ori = sys.geom.n_ori;
     for oa in 0..n_ori {
         for ob in 0..n_ori {
@@ -257,11 +261,13 @@ fn assemble_cov_grad(sys: &mut System, a: f64) {
             let pb = sys.geom.ori_pos[ob];
             let d = diff(pa, pb);
             let rr2 = r2(pa, pb);
-            debug_assert_within_range(rr2, a);
-            let r = kernel_arg_dist(rr2);
-            let k_p_ref = cubic_p_div_r(r, a); // C'(r)/r
-            let k_a = cubic_a(r, a); // C''(r)
-            let div = cg_cg_divisor(rr2); // r² + 1e-5
+            if kf.needs_in_range_precondition() {
+                debug_assert_within_range(rr2, a);
+            }
+            let r = kf.arg(rr2);
+            let k_p_ref = kf.p_div_r(r, a); // C'(r)/r
+            let k_a = kf.a(r, a); // C''(r)
+            let div = kf.cg_cg_divisor(rr2); // r² + 1e-5 (r⁴ + 1e-5 for exponential)
             for di in 0..3 {
                 for dj in 0..3 {
                     let huv_hu = hu(d, di);
@@ -289,17 +295,17 @@ fn assemble_cov_grad(sys: &mut System, a: f64) {
 /// This is NOT the CG_CG `huv = hu − hv = 2·d` reduction (that helper conflates
 /// the two blocks' selector conventions). Using `huv()` here produced a uniform
 /// `−2×` error vs gempy; this single-axis `(ori − point)[di]` form matches.
-fn assemble_cov_grad_sp(sys: &mut System, a: f64) {
+fn assemble_cov_grad_sp(sys: &mut System, kf: KernelFunction, a: f64) {
     let gi_res = sys.geom.opts.gi_res;
     for oa in 0..sys.geom.n_ori {
         let ori = sys.geom.ori_pos[oa];
         for k in 0..sys.geom.n_sp_inc {
             let (rest, refp) = sys.geom.sp_increments[k];
 
-            let r_ref = kernel_arg_dist(r2(refp, ori));
-            let r_rest = kernel_arg_dist(r2(rest, ori));
-            let k_p_ref = cubic_p_div_r(r_ref, a);
-            let k_p_rest = cubic_p_div_r(r_rest, a);
+            let r_ref = kf.arg(r2(refp, ori));
+            let r_rest = kf.arg(r2(rest, ori));
+            let k_p_ref = kf.p_div_r(r_ref, a);
+            let k_p_rest = kf.p_div_r(r_rest, a);
 
             for di in 0..3 {
                 // huv = (ori − point)[di], single axis, factor 1.
@@ -318,17 +324,17 @@ fn assemble_cov_grad_sp(sys: &mut System, a: f64) {
 /// §3.3 SP_SP — `_get_cov_surface_points`. The four-term second difference.
 ///
 /// `cov_sp = i_res·(k_rest_rest − k_rest_ref − k_ref_rest + k_ref_ref)`.
-fn assemble_cov_sp(sys: &mut System, a: f64) {
+fn assemble_cov_sp(sys: &mut System, kf: KernelFunction, a: f64) {
     let i_res = sys.geom.opts.i_res;
     for ka in 0..sys.geom.n_sp_inc {
         let (rest_a, ref_a) = sys.geom.sp_increments[ka];
         for kb in 0..sys.geom.n_sp_inc {
             let (rest_b, ref_b) = sys.geom.sp_increments[kb];
 
-            let k_rest_rest = cubic_c(kernel_arg_dist(r2(rest_a, rest_b)), a);
-            let k_rest_ref = cubic_c(kernel_arg_dist(r2(rest_a, ref_b)), a);
-            let k_ref_rest = cubic_c(kernel_arg_dist(r2(ref_a, rest_b)), a);
-            let k_ref_ref = cubic_c(kernel_arg_dist(r2(ref_a, ref_b)), a);
+            let k_rest_rest = kf.c(kf.arg(r2(rest_a, rest_b)), a);
+            let k_rest_ref = kf.c(kf.arg(r2(rest_a, ref_b)), a);
+            let k_ref_rest = kf.c(kf.arg(r2(ref_a, rest_b)), a);
+            let k_ref_ref = kf.c(kf.arg(r2(ref_a, ref_b)), a);
 
             let val = i_res * (k_rest_rest - k_rest_ref - k_ref_rest + k_ref_ref);
             let i = sys.geom.sp_index(ka);

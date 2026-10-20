@@ -12,7 +12,7 @@
 
 use crate::data::{Orientation, Series, SurfacePoint};
 use crate::fault::{OneFault, PlanarFault};
-use crate::{KernelOptions, Model, ScalarField};
+use crate::{KernelFunction, KernelOptions, Model, ScalarField};
 use std::cell::RefCell;
 
 // ---------------------------------------------------------------------------
@@ -198,13 +198,18 @@ unsafe fn read_f64s(ptr: *const u8, n: usize) -> Vec<f64> {
 // ---------------------------------------------------------------------------
 // Input decoding. The host stages one f64 buffer laid out as:
 //   [n_sp, n_ori,  range, c_o, i_res, gi_res, uni_degree, grad_nugget, sp_nugget,
-//    decimate_on, seed_cell, threshold_frac, point_budget,
+//    decimate_on, seed_cell, threshold_frac, point_budget, kernel,
 //    sp_xyz (3*n_sp), sp_if (n_sp), ori_xyz (3*n_ori), ori_pole (3*n_ori)]
 // (everything as f64 — ids/degree/budget are small integers carried losslessly). A
 // trailing optional fault plane (6 f64: point xyz + normal xyz) is read by
 // `gf_fit_faulted`. `decimate_on` ≠ 0 enables the coreset; NaN seed_cell/threshold use
-// the DecimateConfig defaults.
+// the DecimateConfig defaults. `kernel` is the `KernelFunction::code` (0 cubic, 1 matern_5_2,
+// 2 exponential); NaN → the cubic default.
 // ---------------------------------------------------------------------------
+
+/// Header length in f64 scalars (everything before `sp_xyz`). The engine's encoder
+/// (`geofield::wasm::build_fit_buffer`) writes exactly this many.
+const HEADER: usize = 14;
 
 struct FitInput {
     series: Series,
@@ -214,20 +219,36 @@ struct FitInput {
 
 /// A well-defined empty (data-less) fit for a malformed/short input buffer — `Model::fit` of an
 /// empty series yields a "no contact" model (field `+∞`, unit 0) the host handles, rather than an
-/// OOB read (review 4.3). `consumed = 13` so the faulted path's trailing-plane read is also bounded.
+/// OOB read (review 4.3). `consumed = HEADER` so the faulted path's trailing-plane read is also bounded.
 fn empty_fit() -> FitInput {
     FitInput {
         series: Series::new(Vec::new(), Vec::new()),
         opts: KernelOptions::default(),
-        consumed: 13,
+        consumed: HEADER,
+    }
+}
+
+/// The header's kernel slot → [`KernelFunction`]. NaN (the host's "default") → cubic. An
+/// unknown code also degrades to cubic rather than trapping (like `uni_degree`, 4.6), but
+/// is logged: silently fitting a different kernel than the one asked for must be visible.
+fn decode_kernel(x: f64) -> KernelFunction {
+    if x.is_nan() {
+        return KernelFunction::default();
+    }
+    match (x >= 0.0 && x.fract() == 0.0).then(|| KernelFunction::from_code(x as u32)).flatten() {
+        Some(k) => k,
+        None => {
+            host_log(2, "fit: unknown kernel code; using the cubic default");
+            KernelFunction::default()
+        }
     }
 }
 
 /// # Safety
 /// `ptr` must point to a valid host-staged f64 buffer of at least the encoded length.
 unsafe fn decode_fit(ptr: *const u8, len_f64: usize) -> FitInput {
-    // The 13-scalar header must be present before we can read the point/orientation counts.
-    if len_f64 < 13 {
+    // The header must be present before we can read the point/orientation counts.
+    if len_f64 < HEADER {
         return empty_fit();
     }
     let v = read_f64s(ptr, len_f64);
@@ -240,11 +261,11 @@ unsafe fn decode_fit(ptr: *const u8, len_f64: usize) -> FitInput {
     }
     let n_sp = v[0] as usize;
     let n_ori = v[1] as usize;
-    // 13 header + 4·n_sp (xyz + interface) + 6·n_ori (xyz + pole), guarding overflow.
+    // HEADER + 4·n_sp (xyz + interface) + 6·n_ori (xyz + pole), guarding overflow.
     let body = n_sp
         .checked_mul(4)
         .and_then(|a| n_ori.checked_mul(6).and_then(|b| a.checked_add(b)))
-        .and_then(|ab| ab.checked_add(13));
+        .and_then(|ab| ab.checked_add(HEADER));
     let need = match body {
         Some(need) if need <= len_f64 => need,
         _ => return empty_fit(),
@@ -254,8 +275,8 @@ unsafe fn decode_fit(ptr: *const u8, len_f64: usize) -> FitInput {
     // into the covariance eigensolve and the kriging system and fits a garbage field; decoding to
     // an empty (data-less) fit and warning is loud and attributable at input time, rather than
     // relying on the downstream field going non-finite (code_review §4.6 residual). `need` bounds
-    // the body; the 13 header scalars were validated above.
-    if v[13..need].iter().any(|x| !x.is_finite()) {
+    // the body; the header scalars were validated above.
+    if v[HEADER..need].iter().any(|x| !x.is_finite()) {
         host_log(2, "fit input rejected: non-finite coordinate or orientation");
         return empty_fit();
     }
@@ -280,11 +301,12 @@ unsafe fn decode_fit(ptr: *const u8, len_f64: usize) -> FitInput {
         // Only degree-1 drift is implemented; `assemble` asserts it. Clamp any other value at the
         // ABI edge so a stray host arg degrades to the default instead of trapping the kernel (4.6).
         uni_degree: if v[6] as u32 == 1 { 1 } else { d.uni_degree },
+        kernel: decode_kernel(v[13]),
         grad_nugget: or(v[7], d.grad_nugget),
         sp_nugget: or(v[8], d.sp_nugget),
         decimate,
     };
-    let mut off = 13;
+    let mut off = HEADER;
     let sps: Vec<SurfacePoint> = (0..n_sp)
         .map(|i| {
             let p = [v[off + 3 * i], v[off + 3 * i + 1], v[off + 3 * i + 2]];
@@ -584,21 +606,21 @@ mod tests {
 
     #[test]
     fn decode_fit_rejects_short_and_mismatched_buffers() {
-        // A buffer shorter than the 13-scalar header → empty (data-less) fit, no OOB.
+        // A buffer shorter than the header → empty (data-less) fit, no OOB.
         assert_eq!(decode_counts(&[0.0; 5], None), (0, 0));
 
         // Header claims 100 surface points but the body is not there. Without the bounds check
-        // this indexes `v[13 + ...]` far past the end → OOB abort. With it → empty fit.
-        let mut v = vec![0.0; 13];
+        // this indexes `v[HEADER + ...]` far past the end → OOB abort. With it → empty fit.
+        let mut v = vec![0.0; HEADER];
         v[0] = 100.0; // n_sp
         v[1] = 0.0; // n_ori
         assert_eq!(decode_counts(&v, None), (0, 0), "header-count desync yields empty, not OOB");
 
         // NaN / negative counts must not become huge usizes.
-        let mut nanv = vec![0.0; 13];
+        let mut nanv = vec![0.0; HEADER];
         nanv[0] = f64::NAN;
         assert_eq!(decode_counts(&nanv, None), (0, 0), "NaN count → empty");
-        let mut negv = vec![0.0; 13];
+        let mut negv = vec![0.0; HEADER];
         negv[1] = -1.0;
         assert_eq!(decode_counts(&negv, None), (0, 0), "negative count → empty");
     }
@@ -624,43 +646,66 @@ mod tests {
     fn decode_fit_rejects_non_finite_coordinates() {
         // A well-formed-LENGTH buffer (1 sp + 1 ori) but with a NaN surface-point coordinate must
         // decode to an empty fit — the NaN must never reach the eigensolve / kriging system.
-        let mut v = vec![0.0; 13 + 4 + 6];
+        let mut v = vec![0.0; HEADER + 4 + 6];
         v[0] = 1.0; // n_sp
         v[1] = 1.0; // n_ori
         v[6] = 1.0; // uni_degree
-        v[13] = f64::NAN; // sp x
-        v[14] = 2.0;
-        v[15] = 3.0;
-        v[22] = 1.0; // pole z
+        v[HEADER + 0] = f64::NAN; // sp x
+        v[HEADER + 1] = 2.0;
+        v[HEADER + 2] = 3.0;
+        v[HEADER + 9] = 1.0; // pole z
         assert_eq!(decode_counts(&v, None), (0, 0), "NaN coordinate → empty fit, no panic");
 
         // An inf orientation pole is likewise rejected.
-        let mut w = vec![0.0; 13 + 4 + 6];
+        let mut w = vec![0.0; HEADER + 4 + 6];
         w[0] = 1.0;
         w[1] = 1.0;
         w[6] = 1.0;
-        w[13] = 1.0;
-        w[14] = 2.0;
-        w[15] = 3.0;
-        w[20] = f64::INFINITY; // pole x
+        w[HEADER + 0] = 1.0;
+        w[HEADER + 1] = 2.0;
+        w[HEADER + 2] = 3.0;
+        w[HEADER + 7] = f64::INFINITY; // pole x
         assert_eq!(decode_counts(&w, None), (0, 0), "inf pole → empty fit");
     }
 
     #[test]
     fn decode_fit_accepts_a_well_formed_buffer() {
-        // 13 header + 1 surface point (3 xyz + 1 interface = 4) + 1 orientation (3 xyz + 3 pole = 6).
-        let mut v = vec![0.0; 13 + 4 + 6];
+        // HEADER + 1 surface point (3 xyz + 1 interface = 4) + 1 orientation (3 xyz + 3 pole = 6).
+        let mut v = vec![0.0; HEADER + 4 + 6];
         v[0] = 1.0; // n_sp
         v[1] = 1.0; // n_ori
         v[6] = 1.0; // uni_degree
-                    // sp xyz at 13..16, sp interface at 16, ori xyz at 17..20, ori pole at 20..23
-        v[13] = 1.0;
-        v[14] = 2.0;
-        v[15] = 3.0;
-        v[16] = 0.0; // interface id
-        v[20] = 0.0; // pole x
-        v[21] = 0.0; // pole y
-        v[22] = 1.0; // pole z
+                    // sp xyz at H..H+3, sp interface at H+3, ori xyz at H+4..H+7, ori pole at H+7..H+10
+        v[HEADER + 0] = 1.0;
+        v[HEADER + 1] = 2.0;
+        v[HEADER + 2] = 3.0;
+        v[HEADER + 3] = 0.0; // interface id
+        v[HEADER + 7] = 0.0; // pole x
+        v[HEADER + 8] = 0.0; // pole y
+        v[HEADER + 9] = 1.0; // pole z
         assert_eq!(decode_counts(&v, None), (1, 1));
+    }
+
+    #[test]
+    fn decode_kernel_maps_codes_and_defaults_to_cubic() {
+        assert_eq!(decode_kernel(f64::NAN), KernelFunction::Cubic, "NaN → default");
+        for k in KernelFunction::ALL {
+            assert_eq!(decode_kernel(k.code() as f64), k);
+        }
+        // Unknown / non-integer / negative codes degrade to the default (logged), never trap.
+        for bad in [3.0, 1.5, -1.0, f64::INFINITY] {
+            assert_eq!(decode_kernel(bad), KernelFunction::Cubic, "code {bad}");
+        }
+        // The header slot reaches the decoded options.
+        let mut v = vec![0.0; HEADER + 4 + 6];
+        v[0] = 1.0;
+        v[1] = 1.0;
+        v[6] = 1.0;
+        v[13] = KernelFunction::Matern52.code() as f64;
+        v[HEADER + 9] = 1.0; // pole z
+        let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+        // SAFETY: `bytes` outlives the call and holds `v.len()` f64s.
+        let fi = unsafe { decode_fit(bytes.as_ptr(), v.len()) };
+        assert_eq!(fi.opts.kernel, KernelFunction::Matern52);
     }
 }

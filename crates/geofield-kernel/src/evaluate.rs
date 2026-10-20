@@ -29,7 +29,6 @@
 
 use crate::assemble::AssembledGeometry;
 use crate::geometry::{kernel_arg_dist, r2};
-use crate::kernel::{cubic_a, cubic_c, cubic_p_div_r};
 use crate::solve::Solution;
 
 /// A field evaluator: borrows the assembled geometry and the solved weights.
@@ -63,6 +62,7 @@ impl<'a> Field<'a> {
     ///   cov             = c_o·(sigma_0_sp + sigma_0_grad_sp) + uni_drift
     ///   uni_drift       = gi_res · x[u]                       (degree-1 linear basis)
     pub fn scalar_field_norm(&self, x: [f64; 3]) -> f64 {
+        let kf = self.geom.opts.kernel;
         let a = self.geom.opts.range;
         let c_o = self.geom.opts.c_o;
         let gi_res = self.geom.opts.gi_res;
@@ -73,8 +73,7 @@ impl<'a> Field<'a> {
         // Gradient functionals: c_o·gi_res·(ori − x)[dim]·(C'/r).
         for o in 0..self.geom.n_ori {
             let ori = self.geom.ori_pos[o];
-            let r = kernel_arg_dist(r2(x, ori));
-            let k_p = cubic_p_div_r(r, a); // C'(r)/r
+            let k_p = kf.p_div_r(kf.arg(r2(x, ori)), a); // C'(r)/r
             for dim in 0..3 {
                 let w = self.weights[self.geom.grad_index(dim, o)];
                 z += w * c_o * gi_res * (ori[dim] - x[dim]) * k_p;
@@ -84,8 +83,8 @@ impl<'a> Field<'a> {
         // Surface-point increments: c_o·(−i_res)·(C(‖x−rest‖) − C(‖x−ref‖)).
         for k in 0..self.geom.n_sp_inc {
             let (rest, refp) = self.geom.sp_increments[k];
-            let c_rest = cubic_c(kernel_arg_dist(r2(x, rest)), a);
-            let c_ref = cubic_c(kernel_arg_dist(r2(x, refp)), a);
+            let c_rest = kf.c(kf.arg(r2(x, rest)), a);
+            let c_ref = kf.c(kf.arg(r2(x, refp)), a);
             let w = self.weights[self.geom.sp_index(k)];
             z += w * c_o * (-i_res) * (c_rest - c_ref);
         }
@@ -111,6 +110,7 @@ impl<'a> Field<'a> {
 
     /// Analytic gradient w.r.t. the **normalized** coordinates.
     pub fn scalar_field_gradient_norm(&self, x: [f64; 3]) -> [f64; 3] {
+        let kf = self.geom.opts.kernel;
         let a = self.geom.opts.range;
         let c_o = self.geom.opts.c_o;
         let gi_res = self.geom.opts.gi_res;
@@ -122,11 +122,15 @@ impl<'a> Field<'a> {
         // Let d = x − ori, so (ori − x)[dim] = −d[dim]. ∂r/∂x_e = d[e]/r,
         // dk_p/dr = d(C'/r)/dr = (k_a − k_p)/r.
         // ∂/∂x_e [ −d[dim]·k_p ] = −δ(e,dim)·k_p − d[dim]·(dk_p/dr)·d[e]/r.
+        // `r` here is the geometric (floored) distance; `k_p`/`k_a` are evaluated at
+        // the kernel's own argument (`r²` for gempy `exponential`, §1c) — the same
+        // values, so the chain rule is unchanged.
         for o in 0..self.geom.n_ori {
             let ori = self.geom.ori_pos[o];
-            let r = kernel_arg_dist(r2(x, ori));
-            let k_p = cubic_p_div_r(r, a);
-            let k_a = cubic_a(r, a);
+            let rr2 = r2(x, ori);
+            let r = kernel_arg_dist(rr2);
+            let k_p = kf.p_div_r(kf.arg(rr2), a);
+            let k_a = kf.a(kf.arg(rr2), a);
             let dkp_dr = (k_a - k_p) / r; // d(C'/r)/dr
             let d = [x[0] - ori[0], x[1] - ori[1], x[2] - ori[2]];
             for dim in 0..3 {
@@ -146,10 +150,8 @@ impl<'a> Field<'a> {
         for k in 0..self.geom.n_sp_inc {
             let (rest, refp) = self.geom.sp_increments[k];
             let w = self.weights[self.geom.sp_index(k)];
-            let r_rest = kernel_arg_dist(r2(x, rest));
-            let r_ref = kernel_arg_dist(r2(x, refp));
-            let kp_rest = cubic_p_div_r(r_rest, a);
-            let kp_ref = cubic_p_div_r(r_ref, a);
+            let kp_rest = kf.p_div_r(kf.arg(r2(x, rest)), a);
+            let kp_ref = kf.p_div_r(kf.arg(r2(x, refp)), a);
             let coeff = w * c_o * (-i_res);
             for e in 0..3 {
                 let g_rest = kp_rest * (x[e] - rest[e]);
