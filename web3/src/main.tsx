@@ -92,7 +92,7 @@ import { SurfaceDataModal } from "./HierarchyPanel/SurfaceDataModal";
 import { DrillholeImportModal } from "./HierarchyPanel/DrillholeImportModal";
 import { applyDrillholeImport } from "./HierarchyPanel/drillholes";
 import type { DrillholeInterval } from "./HierarchyPanel/project";
-import type { ManifoldMessage, RenderMode, RunCommand, SurfacePayload, WorkerMessage } from "./protocol";
+import type { KernelName, ManifoldMessage, RenderMode, RunCommand, SurfacePayload, WorkerMessage } from "./protocol";
 
 /** The minZ/maxZ form shown after the 2-point XY bounds digitization, to complete the rectangular
  *  prism (feature: draw model bounds). Prefilled from the current extent's Z range. */
@@ -350,6 +350,7 @@ function App() {
       type: "run",
       series: toSeriesJson(p),
       extent: p.extent,
+      kernel: p.kernel ?? "cubic",
       maxDepth: 6,
       renderMode: mode,
       // Solid-mode lithology tags, keyed by (seriesIndex, unitIndex). The compile seam emits
@@ -681,6 +682,15 @@ function App() {
     setProject(updated);
     saveProject(updated);
     runStack(updated); // immediate — never stale (dirty stays false)
+  }
+
+  // Project-wide interpolation kernel: a declared model choice like setRelation / the bounds — saved
+  // and re-fit immediately (dirty untouched). Range/c_o stay automatic (gempy's defaults).
+  function setKernel(kernel: KernelName) {
+    const updated: Project = { ...project, kernel };
+    setProject(updated);
+    saveProject(updated);
+    if (updated.elements.length > 0 && validate(updated).canApply) runStack(updated);
   }
 
   // --- Add surface (US1) ----------------------------------------------------------------
@@ -1147,6 +1157,21 @@ function App() {
                 onChange={(e) => setShowBounds(e.target.checked)}
               />
               bounds
+            </label>
+            <label
+              className="debug-toggle"
+              title="Interpolation kernel (covariance) for every surface fit — gempy's kernels. Cubic: the default, compactly supported. Matérn 5/2: smooth, decays exponentially. Gaussian (gempy 'exponential'): smoothest, but reproduces gempy's quirk of honoring dip readings only approximately (a few degrees off where several interact). Re-fits on change."
+            >
+              kernel{" "}
+              <select
+                data-testid="kernel-select"
+                value={project.kernel ?? "cubic"}
+                onChange={(e) => setKernel(e.target.value as KernelName)}
+              >
+                <option value="cubic">Cubic</option>
+                <option value="matern_5_2">Matérn 5/2</option>
+                <option value="exponential">Gaussian</option>
+              </select>
             </label>
             <label
               className="debug-toggle"

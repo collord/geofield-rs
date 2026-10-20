@@ -45,6 +45,11 @@ export interface SeriesJson {
   };
 }
 
+/** The cokriging covariance kernel — gempy's `kernel_function` member names, the only kernels
+ *  the EUPL kernel module implements (validated against gempy: KERNEL_MATH.md §1/§1b/§1c).
+ *  "exponential" is gempy's name for the GAUSSIAN `exp(-r²/2a²)`. */
+export type KernelName = "cubic" | "matern_5_2" | "exponential";
+
 /** Open contact sheets vs. closed lithology-unit solids (the web/ render modes). */
 export type RenderMode = "contact" | "solid";
 
@@ -54,6 +59,8 @@ export interface RunCommand {
   type: "run";
   series: SeriesJson[]; // youngest first (add_series call order)
   extent: [number, number, number, number, number, number];
+  /** Project-wide covariance kernel for every fit. Absent ⇒ "cubic" (the default). */
+  kernel?: KernelName;
   maxDepth: number;
   renderMode: RenderMode;
   /** Solid-mode lithology assignment, keyed by `${seriesIndex}:${unitIndex}` (the worker

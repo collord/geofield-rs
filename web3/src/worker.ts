@@ -16,6 +16,7 @@ import kernelWasmUrl from "./wasm-kernel/geofield_kernel.wasm?url";
 import type {
   Command,
   DoneMessage,
+  KernelName,
   RecipeOp,
   RunCommand,
   SeriesJson,
@@ -57,14 +58,21 @@ function initWasm(): Promise<void> {
 
 const f64 = (a: number[]) => new Float64Array(a);
 
-/** Fit the whole stack youngest-first. NaN kernel options → crate defaults; uni_degree = 1;
- *  decimate off (testbed inputs are tiny). The new ABI arg order puts `unboundedAbove`
- *  (Axis B) right after `relation` (Axis A) — see WasmStack::add_series (contract D1). */
-function buildStack(series: SeriesJson[]): WasmStack {
+/** The engine's `kernel` argument: `KernelFunction::code` in geofield-kernel (the source of
+ *  truth — this is only its wire encoding, like the relation/role codes below). */
+const KERNEL_CODE: Record<KernelName, number> = { cubic: 0, matern_5_2: 1, exponential: 2 };
+
+/** Fit the whole stack youngest-first. NaN kernel options → crate defaults (range/c_o stay
+ *  automatic for every kernel, as in gempy); uni_degree = 1; decimate off (testbed inputs are
+ *  tiny). The new ABI arg order puts `unboundedAbove` (Axis B) right after `relation`
+ *  (Axis A) — see WasmStack::add_series (contract D1). */
+function buildStack(series: SeriesJson[], kernel: KernelName): WasmStack {
   const stack = new WasmStack();
+  const kernelCode = KERNEL_CODE[kernel];
   for (const s of series) {
     const fit = [f64(s.sp_xyz), f64(s.sp_if), f64(s.ori_xyz), f64(s.ori_pole)] as const;
-    const opts = [NAN, NAN, NAN, NAN, 1, NAN] as const; // range, c_o, i_res, gi_res, uni_degree, nugget
+    // range, c_o, i_res, gi_res, uni_degree, kernel, nugget
+    const opts = [NAN, NAN, NAN, NAN, 1, kernelCode, NAN] as const;
     const faults = [f64(s.fault_point), f64(s.fault_normal)] as const;
     if (s.importedMesh) {
       // Imported mesh surface (feature 004): the engine parses the .obj bytes and fits a field
@@ -310,7 +318,7 @@ async function run(cmd: RunCommand) {
   await initWasm();
 
   emit({ type: "status", phase: "fitting stack…" });
-  const stack = buildStack(cmd.series);
+  const stack = buildStack(cmd.series, cmd.kernel ?? "cubic");
 
   const solid = cmd.renderMode === "solid";
   // UNIFIED volume mesher (docs/14, path b): in SOLID mode (the default), emit a boolean RECIPE over

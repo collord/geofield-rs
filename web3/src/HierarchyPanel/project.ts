@@ -10,7 +10,7 @@
 // Design source of record: docs/enhanced_authoring_spec.md; plan/contracts under
 // specs/002-enhanced-authoring/. No Rust/worker/ABI/schema changes accompany this file.
 
-import type { SeriesJson } from "../protocol";
+import type { KernelName, SeriesJson } from "../protocol";
 import { derivePoles, meanPole, selfCrosses } from "../section/digitizeDerive";
 import { PLANE_EPS_FRACTION, extentDiagonal } from "../section/frame";
 
@@ -191,6 +191,9 @@ export interface Project {
   version: 1;
   name: string;
   extent: [number, number, number, number, number, number]; // [x0,x1,y0,y1,z0,z1]
+  /** Interpolation kernel for EVERY fit in the project (geology: changing it re-fits). Absent ⇒
+   *  "cubic", so projects saved before the setting existed load unchanged. */
+  kernel?: KernelName;
   elements: ProjectElement[]; // YOUNGEST FIRST (matches add_* call order / SeriesJson order)
   /** Optional per-UNIT display names (feature 003 §1), keyed `${elementId}:${unitIndex}`.
    *  Units are DERIVED (not authored) — only their NAME is UI metadata. Absent ⇒ a default
