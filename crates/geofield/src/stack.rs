@@ -1076,7 +1076,7 @@ impl<M: SeriesModel + BlockModel> Stack<M> {
     }
 
     /// Mesh ONE interface of series `i` **within a single fault block `b`** — the
-    /// per-block open-sheet view that matches the `web/` harness: each fault block's
+    /// per-block open-sheet view of the original (removed) `web/` harness: each fault block's
     /// contact is contoured from that block's OWN smooth field and clipped flush to the
     /// block's fault half-spaces, so the offset reads as two clean separate sheets rather
     /// than one surface stretched across the discontinuity.
@@ -4479,7 +4479,7 @@ mod tests {
     /// Per-block meshing honors the fault: a faulted series has 2 blocks, and each block's
     /// contact sheet stays on its OWN side of the fault plane at its OWN offset elevation —
     /// the offset is rendered as two separate sheets, not one surface stretched across the
-    /// discontinuity. (This is the `web/`-parity property `mesh_one_block` exists to give;
+    /// discontinuity. (This is the (former) `web/`-parity property `mesh_one_block` exists to give;
     /// the whole-domain `mesh_one` would instead bridge the step.)
     #[test]
     fn faulted_series_meshes_per_block() {
@@ -4521,7 +4521,7 @@ mod tests {
     /// slabs, and — for an ERODED older series — the slab DAYLIGHTS against the erosion
     /// surface: its closed solid reaches up to the eroding contact (a kept cap face),
     /// where the open-sheet view (`mesh_one_block`) is instead trimmed back. This is the
-    /// difference the web2 "closed solids" toggle exposes.
+    /// difference a "closed solids" toggle exposes.
     #[test]
     fn closed_solids_daylight_against_erosion() {
         let stack = two_series_stack(Relation::Erode); // older bed eroded on the left

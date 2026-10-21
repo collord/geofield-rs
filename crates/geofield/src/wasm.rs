@@ -62,10 +62,13 @@ fn install_panic_hook() {
 
 /// Marshal flat input arrays + kernel options into the kernel ABI's f64 buffer:
 ///   `[n_sp, n_ori, range, c_o, i_res, gi_res, uni_degree, grad_nugget, sp_nugget,
+///     decimate_on, seed_cell, threshold_frac, point_budget, kernel,
 ///     sp_xyz(3·n_sp), sp_if(n_sp), ori_xyz(3·n_ori), ori_pole(3·n_ori)]`
 /// followed by an optional 6-f64 fault plane (point xyz + normal xyz). NaN/0 options are
-/// passed through; the kernel substitutes its own defaults. Returns `Err` on shape
-/// mismatch.
+/// passed through; the kernel substitutes its own defaults. `kernel` is an opaque code the
+/// kernel module decodes (0 cubic, 1 matern_5_2, 2 exponential — `KernelFunction::code`); the
+/// engine never interprets it, so no kernel type crosses the license seam. Returns `Err` on
+/// shape mismatch.
 #[allow(clippy::too_many_arguments)]
 fn build_fit_buffer(
     sp_xyz: &[f64],
@@ -77,6 +80,7 @@ fn build_fit_buffer(
     i_res: f64,
     gi_res: f64,
     uni_degree: u32,
+    kernel: u32,
     nugget: f64,
     decimate_frac: f64,
     fault: Option<([f64; 3], [f64; 3])>,
@@ -100,7 +104,7 @@ fn build_fit_buffer(
     // (fraction of the field's isovalue range); NaN / ≤ 0 disables it (keep all points).
     let dec_on = decimate_frac.is_finite() && decimate_frac > 0.0;
 
-    let mut buf = Vec::with_capacity(13 + 4 * n_sp + 6 * n_ori + 6);
+    let mut buf = Vec::with_capacity(14 + 4 * n_sp + 6 * n_ori + 6);
     buf.push(n_sp as f64);
     buf.push(n_ori as f64);
     buf.push(range);
@@ -114,6 +118,7 @@ fn build_fit_buffer(
     buf.push(f64::NAN); // seed_cell → kernel default
     buf.push(if dec_on { decimate_frac } else { f64::NAN }); // threshold_frac
     buf.push(f64::NAN); // point_budget → default (none)
+    buf.push(kernel as f64); // kernel code (header slot 13)
     buf.extend_from_slice(sp_xyz);
     buf.extend_from_slice(sp_interface);
     buf.extend_from_slice(ori_xyz);
@@ -349,8 +354,9 @@ fn octree_cfg(max_depth: u32, min_depth: u32, qef_threshold: f64, cap: bool) -> 
 #[wasm_bindgen]
 impl WasmModel {
     /// Fit a model from flat typed arrays. `range`, `c_o`, `i_res`, `gi_res`,
-    /// `uni_degree`, and `nugget` are the kernel options (pass gempy's live values;
-    /// NaN/0 falls back to the kernel defaults).
+    /// `uni_degree`, `kernel`, and `nugget` are the kernel options (pass gempy's live values;
+    /// NaN/0 falls back to the kernel defaults). `kernel`: 0=cubic (default) 1=matern_5_2
+    /// 2=exponential (gempy's Gaussian).
     #[wasm_bindgen(constructor)]
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -363,13 +369,14 @@ impl WasmModel {
         i_res: f64,
         gi_res: f64,
         uni_degree: u32,
+        kernel: u32,
         nugget: f64,
         decimate_frac: f64,
     ) -> Result<WasmModel, JsError> {
         install_panic_hook();
         let buf = build_fit_buffer(
             sp_xyz, sp_interface, ori_xyz, ori_pole, range, c_o, i_res, gi_res, uni_degree,
-            nugget, decimate_frac, None,
+            kernel, nugget, decimate_frac, None,
         )?;
         Ok(WasmModel { inner: remote::fit(&buf) })
     }
@@ -389,6 +396,7 @@ impl WasmModel {
         i_res: f64,
         gi_res: f64,
         uni_degree: u32,
+        kernel: u32,
         nugget: f64,
         decimate_frac: f64,
         fault_point: &[f64],
@@ -398,7 +406,7 @@ impl WasmModel {
         let fault = fault_from_flat(fault_point, fault_normal);
         let buf = build_fit_buffer(
             sp_xyz, sp_interface, ori_xyz, ori_pole, range, c_o, i_res, gi_res, uni_degree,
-            nugget, decimate_frac, fault,
+            kernel, nugget, decimate_frac, fault,
         )?;
         // A degenerate fault → no trailing plane → kernel falls back to a plain fit, so
         // `gf_fit_faulted` is still safe to call (it tolerates a missing/zero plane).
@@ -583,6 +591,7 @@ impl WasmStack {
         i_res: f64,
         gi_res: f64,
         uni_degree: u32,
+        kernel: u32,
         nugget: f64,
         decimate_frac: f64,
         fault_point: &[f64],
@@ -591,7 +600,7 @@ impl WasmStack {
         let fault = fault_from_flat(fault_point, fault_normal);
         let buf = build_fit_buffer(
             sp_xyz, sp_interface, ori_xyz, ori_pole, range, c_o, i_res, gi_res, uni_degree,
-            nugget, decimate_frac, fault,
+            kernel, nugget, decimate_frac, fault,
         )?;
         Ok(if fault.is_some() {
             remote::fit_faulted(&buf)
@@ -635,6 +644,7 @@ impl WasmStack {
         i_res: f64,
         gi_res: f64,
         uni_degree: u32,
+        kernel: u32,
         nugget: f64,
         relation: u32,
         unbounded_above: bool,
@@ -645,7 +655,7 @@ impl WasmStack {
         install_panic_hook();
         let model = self.fit_model(
             sp_xyz, sp_interface, ori_xyz, ori_pole, range, c_o, i_res, gi_res, uni_degree,
-            nugget, decimate_frac, fault_point, fault_normal,
+            kernel, nugget, decimate_frac, fault_point, fault_normal,
         )?;
         // Axis B decides the constructor; Axis A (relation) applies only to a bounded series.
         self.inner.series.push(if unbounded_above {
@@ -675,6 +685,7 @@ impl WasmStack {
         i_res: f64,
         gi_res: f64,
         uni_degree: u32,
+        kernel: u32,
         nugget: f64,
         decimate_frac: f64,
         fault_point: &[f64],
@@ -686,7 +697,7 @@ impl WasmStack {
         }
         let model = self.fit_model(
             sp_xyz, sp_interface, ori_xyz, ori_pole, range, c_o, i_res, gi_res, uni_degree,
-            nugget, decimate_frac, fault_point, fault_normal,
+            kernel, nugget, decimate_frac, fault_point, fault_normal,
         )?;
         // Pinned youngest (index 0) regardless of when it was added.
         self.inner.series.insert(0, StackElement::Topography(Topography { model }));
@@ -713,6 +724,7 @@ impl WasmStack {
         i_res: f64,
         gi_res: f64,
         uni_degree: u32,
+        kernel: u32,
         nugget: f64,
         decimate_frac: f64,
         fault_point: &[f64],
@@ -762,7 +774,7 @@ impl WasmStack {
 
         let model = self.fit_model(
             &sp_xyz, &sp_interface, &ori_xyz, &ori_pole, range, c_o, i_res, gi_res, uni_degree,
-            nugget, decimate_frac, fault_point, fault_normal,
+            kernel, nugget, decimate_frac, fault_point, fault_normal,
         )?;
 
         let role = match role {
@@ -802,6 +814,7 @@ impl WasmStack {
         i_res: f64,
         gi_res: f64,
         uni_degree: u32,
+        kernel: u32,
         nugget: f64,
         foot_wall: usize,
         hanging_wall: usize,
@@ -812,7 +825,7 @@ impl WasmStack {
         install_panic_hook();
         let model = self.fit_model(
             sp_xyz, sp_interface, ori_xyz, ori_pole, range, c_o, i_res, gi_res, uni_degree,
-            nugget, decimate_frac, fault_point, fault_normal,
+            kernel, nugget, decimate_frac, fault_point, fault_normal,
         )?;
         self.inner
             .series
@@ -835,6 +848,7 @@ impl WasmStack {
         i_res: f64,
         gi_res: f64,
         uni_degree: u32,
+        kernel: u32,
         nugget: f64,
         envelope_inner: usize,
         envelope_outer: usize,
@@ -845,7 +859,7 @@ impl WasmStack {
         install_panic_hook();
         let model = self.fit_model(
             sp_xyz, sp_interface, ori_xyz, ori_pole, range, c_o, i_res, gi_res, uni_degree,
-            nugget, decimate_frac, fault_point, fault_normal,
+            kernel, nugget, decimate_frac, fault_point, fault_normal,
         )?;
         let envelope = if envelope_inner == envelope_outer {
             Envelope::Single(envelope_inner)
@@ -963,7 +977,7 @@ impl WasmStack {
     }
 
     /// Adaptive octree mesh of interface `interface_idx` of series `series`, **within a
-    /// single fault block `block`** — the per-block open-sheet view (matches `web/`): the
+    /// single fault block `block`** — the per-block open-sheet view (the original `web/` harness's): the
     /// contact is contoured from that block's own smooth field and cut flush at the fault
     /// plane, so a faulted contact renders as separate sheets per block rather than one
     /// surface stretched across the offset. Still clipped to the series' visible region

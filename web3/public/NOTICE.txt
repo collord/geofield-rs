@@ -1,0 +1,30 @@
+geofield web3 app — third-party and component licences
+=======================================================
+
+This web application loads TWO separately-compiled WebAssembly modules. They are
+distinct works, each governed by its own licence, combined only at load time by
+the host page (the browser instantiates them as two WebAssembly instances and
+wires the engine's imports to the kernel's exports at runtime).
+
+  geofield_kernel.wasm  — EUPL-1.2
+      The universal-cokriging scalar-field kernel (re-derived from GemPy's
+      interpolation math). Governed by the European Union Public Licence v. 1.2.
+      Source: crates/geofield-kernel. Full licence: that crate's LICENSE file.
+
+  geofield_bg.wasm      — BSD-3-Clause
+      The meshing/contouring engine and its WebAssembly bindings. Independent
+      work; it does NOT embed the EUPL kernel — it reaches the kernel's field
+      oracle across a WebAssembly module boundary (runtime imports), so this
+      artifact contains no EUPL-covered code.
+      Source: crates/geofield (+ crates/geofield-types, BSD-3-Clause).
+
+Why this matters: the EUPL's reciprocity attaches to a Derivative Work / a fused
+binary. Keeping the kernel in its own artifact and importing it at runtime means
+geofield_bg.wasm is not a fused binary of EUPL code, and remains BSD-3-Clause; the
+EUPL obligations travel only with geofield_kernel.wasm.
+
+The bundled JavaScript also includes third-party libraries (React, three.js,
+@dnd-kit, wasm-bindgen glue) under their respective permissive licences, and
+manifold-3d (Apache-2.0), loaded as its own WebAssembly module.
+
+Copyright (c) 2026 Jerritt Collord

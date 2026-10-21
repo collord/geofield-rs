@@ -9,6 +9,9 @@ Given surface points and orientations, it assembles the dual cokriging system,
 solves it once, and exposes the scalar field, its analytic gradient, and a
 lithology assignment.
 
+**Try it in the browser:** the `web3/` authoring app is published to GitHub Pages at
+<https://collord.github.io/geofield-rs/> (see [Web app](#web-app)).
+
 ## Scope
 
 This crate implements the **single scalar field, non-faulted, single-series**
@@ -74,7 +77,7 @@ normals):
   and the closed mesh has zero non-manifold edges.
 
 Both are exposed over WASM (`mesh_isosurface`, `mesh_isosurface_octree`). The
-`web/` harness uses the octree path, meshing one surface per interface at its
+`web3/` app uses the octree path, meshing one surface per interface at its
 recovered isovalue (the geological contacts).
 
 ## Public API
@@ -172,6 +175,26 @@ web package, serve the repo root, and open `examples/web/index.html` to compare
 the WASM field against a native reference. Native↔WASM agreement was verified to
 `1.2e-15` (f64 round-off).
 
+### Web app
+
+`web3/` is the browser authoring app (stack hierarchy, sections, digitizing, the kernel
+picker); its behavior spec is `web3/SPEC.md`.
+
+```bash
+cd web3
+npm ci
+npm run wasm        # kernel wasm (cargo) + engine wasm (wasm-pack)
+npm run dev         # or: npm run build && npm run preview
+npm run test:e2e    # the Playwright functional gate
+```
+
+**GitHub Pages.** Pushing any tag runs `.github/workflows/pages.yml`: it builds both wasm
+modules, runs the full Playwright suite, and — only if that passes — builds with
+`GEOFIELD_BASE=/<repo>/` and deploys `web3/dist`. It can also be run by hand
+(*Actions → Pages → Run workflow*). One-time setup: *Settings → Pages → Source: GitHub
+Actions*. The workflow also generates the meshes for the imported-mesh template
+(`web3/public/meshes/README.md`).
+
 ## Tests
 
 `cargo test` runs 41 tests:
@@ -265,5 +288,5 @@ In the browser the two ship as **separate WebAssembly artifacts** —
 host. The engine does not link or embed the kernel in its wasm build; it reaches the
 kernel's field oracle across a WebAssembly module boundary (runtime imports), so
 `geofield.wasm` contains no EUPL-covered code and the EUPL obligations travel only with
-`geofield_kernel.wasm`. See `web/public/NOTICE.txt` (shipped to the web bundle) and each
+`geofield_kernel.wasm`. See `web3/public/NOTICE.txt` (shipped with the web app) and each
 crate's `LICENSE`.

@@ -21,7 +21,7 @@ native-parallel = ["faer/rayon"]
 # Build the C-ABI export layer (src/abi.rs) for the standalone kernel wasm module.
 wasm-abi = []
 # Count boundary-crossing field evals (gf_eval/gf_eval_grad) and expose gf_eval_count /
-# gf_eval_count_reset, for the web2 scale harness. Adds a couple of instructions per eval.
+# gf_eval_count_reset, for scale/profiling harnesses. Adds a couple of instructions per eval.
 wasm-abi-stats = ["wasm-abi"]
 
 [lib]

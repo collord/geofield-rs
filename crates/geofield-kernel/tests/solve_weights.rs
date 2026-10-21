@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use geofield_kernel::assemble::{assemble, AssembledGeometry, KernelOptions};
 use geofield_kernel::data::{Orientation, Series, SurfacePoint};
 use geofield_kernel::solve::solve;
+use geofield_kernel::KernelFunction;
 
 fn fixture_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -98,7 +99,10 @@ fn load_series_and_opts(dir: &Path) -> Option<(Series, KernelOptions)> {
         .collect();
 
     let f = |k: &str, d: f64| ko[k].as_f64().unwrap_or(d);
+    let kernel_name = ko["kernel_function"].as_str().unwrap_or("cubic");
     let opts = KernelOptions {
+        kernel: KernelFunction::from_gempy_name(kernel_name)
+            .unwrap_or_else(|| panic!("fixture kernel_function {kernel_name:?} not implemented")),
         range: f("range", 1.7),
         c_o: f("c_o", 10.0),
         i_res: f("i_res", 4.0),

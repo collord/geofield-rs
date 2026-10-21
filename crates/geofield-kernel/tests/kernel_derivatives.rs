@@ -85,3 +85,80 @@ fn factored_a_matches_expanded_a() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// The gempy matern_5_2 and exponential triples (KERNEL_MATH.md §1b, §1c): the same
+// three consistency gates, expressed through `KernelFunction` so the distance
+// convention (`r` vs raw `r²`, gempy's `consume_sq_distance`) is exercised too.
+// ---------------------------------------------------------------------------
+
+use geofield_kernel::KernelFunction;
+
+/// `C` as a function of the geometric distance `r`, through the kernel's own argument.
+fn c_of_r(kf: KernelFunction, r: f64, a: f64) -> f64 {
+    kf.c(kf.arg(r * r), a)
+}
+
+#[test]
+fn new_kernels_c_at_zero_is_one() {
+    for kf in [KernelFunction::Matern52, KernelFunction::Exponential] {
+        for a in [0.7_f64, 1.0, 1.7, 3.0] {
+            // The raw kernel functions at argument 0 (no 1e-10 floor) are exactly 1.
+            assert_eq!(kf.c(0.0, a), 1.0, "{kf:?}: C(0) != 1 for a={a}");
+        }
+    }
+}
+
+/// Orientation data needs `C'/r` and `C''` finite at `r → 0` (the self-covariance
+/// of a gradient functional). These are the limits the kernels must reach.
+#[test]
+fn new_kernels_derivatives_are_finite_at_zero() {
+    for a in [0.7_f64, 1.7] {
+        let m = KernelFunction::Matern52;
+        assert!((m.p_div_r(0.0, a) + 5.0 / (3.0 * a * a)).abs() < 1e-12);
+        assert!((m.a(0.0, a) + 5.0 / (3.0 * a * a)).abs() < 1e-12);
+        let e = KernelFunction::Exponential;
+        assert_eq!(e.p_div_r(0.0, a), -1.0 / (a * a));
+        assert!((e.a(0.0, a) + 1.0 / (a * a)).abs() < 1e-15);
+    }
+}
+
+#[test]
+fn new_kernels_p_div_r_times_r_matches_dc_dr() {
+    let h = 1e-6;
+    for kf in [KernelFunction::Matern52, KernelFunction::Exponential] {
+        for a in [0.7_f64, 1.0, 1.7, 3.0] {
+            for frac in [0.05, 0.2, 0.35, 0.5, 0.75, 0.95, 1.5] {
+                let r = frac * a;
+                let analytic = kf.p_div_r(kf.arg(r * r), a) * r; // = C'(r)
+                let numeric = (c_of_r(kf, r + h, a) - c_of_r(kf, r - h, a)) / (2.0 * h);
+                let tol = 1e-6 * (1.0 + analytic.abs());
+                assert!(
+                    (analytic - numeric).abs() < tol,
+                    "{kf:?}: C'(r) mismatch a={a} r={r} analytic={analytic} numeric={numeric}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn new_kernels_a_matches_d2c_dr2() {
+    let h = 1e-4;
+    for kf in [KernelFunction::Matern52, KernelFunction::Exponential] {
+        for a in [0.7_f64, 1.0, 1.7, 3.0] {
+            for frac in [0.05, 0.2, 0.35, 0.5, 0.75, 0.95, 1.5] {
+                let r = frac * a;
+                let analytic = kf.a(kf.arg(r * r), a); // = C''(r)
+                let numeric = (c_of_r(kf, r + h, a) - 2.0 * c_of_r(kf, r, a)
+                    + c_of_r(kf, r - h, a))
+                    / (h * h);
+                let tol = 1e-4 * (1.0 + analytic.abs());
+                assert!(
+                    (analytic - numeric).abs() < tol,
+                    "{kf:?}: C''(r) mismatch a={a} r={r} analytic={analytic} numeric={numeric}"
+                );
+            }
+        }
+    }
+}

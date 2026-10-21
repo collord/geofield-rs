@@ -218,6 +218,23 @@ an inner and an outer envelope — a ring dike), so I model both filled and core
 corners of the rectangle, then entering the Z (elevation) range — so I frame the domain box the
 model is meshed within.*
 
+### 3.5 The interpolation kernel
+
+**US-KERNEL-1.** *As a user, I pick the interpolation kernel for the whole project — Cubic (the
+default), Matérn 5/2, or Gaussian — from the toolbar's **kernel** picker, and the model re-fits
+immediately with it, so I can compare how smooth or local the surfaces come out.*
+
+- The three choices are exactly gempy's kernels (`cubic`, `matern_5_2`, and `exponential` — gempy's
+  name for the Gaussian), validated against gempy (`KERNEL_MATH.md` §1d). Range and covariance
+  scale stay automatic, as in gempy.
+- Like a relation change, it is a declared model choice: it saves and re-fits at once (no Apply
+  gate). It applies to every surface's fit, imported meshes included, and is saved with the project
+  (absent in older projects ⇒ Cubic).
+- **Gaussian caveat (shown in the picker's tooltip):** it reproduces a gempy quirk under which
+  several interacting dip readings are honored only approximately (a few degrees off —
+  `KERNEL_MATH.md` §1c.4). Cubic and Matérn honor them exactly.
+- *Gate:* `e2e/kernel-choice.spec.ts`.
+
 ---
 
 ## 4. Imported mesh surfaces
@@ -355,6 +372,8 @@ The harness meets this spec when a user can, end to end:
 4. Build a lithology palette and assign lithologies to units, recoloring solids live.
 5. Export the project (with view) and OBJ geometry, then re-import the project and land on the same
    model and viewpoint.
+6. Switch the interpolation kernel and see the model re-fit with it; switching back reproduces the
+   original model exactly.
 
 *(Sections §10–§11 below — cross-sections and digitizing — carry their own acceptance list, §11.6.)*
 
