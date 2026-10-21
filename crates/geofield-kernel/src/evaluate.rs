@@ -103,9 +103,10 @@ impl<'a> Field<'a> {
     pub fn scalar_field_gradient(&self, xyz: [f64; 3]) -> [f64; 3] {
         let x = self.geom.transform.apply(xyz);
         let g_norm = self.scalar_field_gradient_norm(x);
-        // ∂x_norm/∂x_world = scale (isotropic), so ∇_world = scale · ∇_norm.
+        // ∂x_norm[e]/∂x_world[e] = scale[e] (per axis, no rotation), so
+        // ∇_world[e] = scale[e] · ∇_norm[e].
         let s = self.geom.transform.scale;
-        [g_norm[0] * s, g_norm[1] * s, g_norm[2] * s]
+        [g_norm[0] * s[0], g_norm[1] * s[1], g_norm[2] * s[2]]
     }
 
     /// Analytic gradient w.r.t. the **normalized** coordinates.

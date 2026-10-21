@@ -14,7 +14,8 @@ Kernel choice: `--kernel {cubic,matern_5_2,exponential}` selects gempy's
 uses a 3-orientation / 2-interface model so the CG_CG off-diagonal (orientation pairs
 at different locations — where kernels differ most, incl. gempy's exponential r⁴
 divisor, KERNEL_MATH.md §1c.4) is actually exercised; the tiny model's single
-orientation never reaches it.
+orientation never reaches it. `--model aniso` is the same shape with unequal x/y/z
+spans, exercising gempy's per-axis rescale and pole tilt (KERNEL_MATH.md §5.1).
 """
 
 from __future__ import annotations
@@ -138,9 +139,11 @@ def main():
     ap.add_argument("--kernel", default="cubic",
                     choices=["cubic", "matern_5_2", "exponential"],
                     help="gempy AvailableKernelFunctions member (default cubic)")
-    ap.add_argument("--model", default="tiny", choices=["tiny", "multi"],
+    ap.add_argument("--model", default="tiny", choices=["tiny", "multi", "aniso"],
                     help="tiny: 2 points + 1 orientation; multi: 5 points on 2 "
-                         "interfaces + 3 orientations (exercises CG_CG off-diagonal)")
+                         "interfaces + 3 orientations (exercises CG_CG off-diagonal); "
+                         "aniso: the same shape with UNEQUAL x/y/z spans, so gempy's "
+                         "per-axis rescale + pole tilt (KERNEL_MATH.md §5.1) is exercised")
     args = ap.parse_args()
     outdir = args.out
     outdir.mkdir(parents=True, exist_ok=True)
@@ -153,14 +156,12 @@ def main():
         sp_csv.write_text("X,Y,Z,formation\n0,0,0,rockA\n1000,0,200,rockA\n")
         ori_csv.write_text("X,Y,Z,azimuth,dip,polarity,formation\n500,0,100,90,0,1,rockA\n")
         extent, formations = [0, 1000, -100, 100, 0, 300], ("rockA",)
-    else:
+    elif args.model == "multi":
         # Rows are written in gempy's stack order (rockB above rockA, so rockB first):
         # gempy groups its rows by surface in stack order, while geofield-cli keeps file
         # order — writing them pre-sorted keeps the two row layouts identical.
-        # The data span is 600 on EVERY axis: current gempy rescales anisotropically
-        # (and transforms the poles) when the spans differ, which geofield's isotropic
-        # Transform (KERNEL_MATH.md §5.1) does not reproduce — a known, separate
-        # divergence this kernel gate must not be confounded by.
+        # The data span is 600 on EVERY axis, so the rescale is isotropic and this model
+        # isolates the kernels; `--model aniso` covers the anisotropic rescale.
         sp_csv.write_text(
             "X,Y,Z,formation\n"
             "100,-200,500,rockB\n550,250,600,rockB\n"
@@ -171,6 +172,19 @@ def main():
             "100,-100,90,90,10,1,rockA\n"
             "500,200,80,100,15,1,rockA\n")
         extent, formations = [-100, 700, -400, 400, -100, 700], ("rockB", "rockA")
+    elif args.model == "aniso":
+        # Spans 1000 × 350 × 380: gempy's limit-ratio pass leaves the scale anisotropic
+        # ([1/2000, 1/760, 1/2000]) and tilts the poles (dip_gradients). Stack order as above.
+        sp_csv.write_text(
+            "X,Y,Z,formation\n"
+            "100,100,400,rockB\n900,0,480,rockB\n"
+            "0,0,100,rockA\n600,200,160,rockA\n1000,-100,210,rockA\n")
+        ori_csv.write_text(
+            "X,Y,Z,azimuth,dip,polarity,formation\n"
+            "500,150,440,80,8,1,rockB\n"
+            "200,0,130,90,10,1,rockA\n"
+            "700,-150,190,100,15,1,rockA\n")
+        extent, formations = [0, 1000, -300, 300, 0, 600], ("rockB", "rockA")
     n_interfaces = len(formations)
 
     builder = build_from_csv(

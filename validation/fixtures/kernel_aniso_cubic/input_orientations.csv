@@ -1,0 +1,4 @@
+X,Y,Z,azimuth,dip,polarity,formation
+500,150,440,80,8,1,rockB
+200,0,130,90,10,1,rockA
+700,-150,190,100,15,1,rockA

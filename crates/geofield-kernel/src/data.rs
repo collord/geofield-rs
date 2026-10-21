@@ -64,29 +64,59 @@ impl Series {
 
 /// Coordinate rescaling (KERNEL_MATH.md §5.1).
 ///
-/// Maps raw world coordinates into the isotropic normalized box via
-/// `x_norm = scale * (x − center)` (SRT order, rotation = 0). With the gempy
-/// `main` normalization, the extreme input point maps to ±0.25 per axis.
-///
-/// `scale` is a single isotropic scalar (smallest per-axis scale, from
-/// `anisotropic_limit = [1,1,1]`).
+/// Maps raw world coordinates into the normalized box via
+/// `x_norm = scale ⊙ (x − center)` (SRT order, rotation = 0) — a **per-axis** scale.
+/// With equal data spans on every axis the scale is isotropic and the extreme input
+/// point maps to ±0.25 per axis; otherwise gempy's `_adjust_scale_to_limit_ratio` can
+/// leave it anisotropic (see [`adjust_scale_to_limit_ratio`], the §5.1 landmine).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Transform {
     pub center: [f64; 3],
-    /// Isotropic scale: one scalar applied to all three axes.
-    pub scale: f64,
+    /// Per-axis scale `[sx, sy, sz]`.
+    pub scale: [f64; 3],
+}
+
+/// gempy's `Transform._adjust_scale_to_limit_ratio(s, anisotropic_limit=[1,1,1])`,
+/// transcribed verbatim (KERNEL_MATH.md §5.1).
+///
+/// ⚠ It is NOT "take the minimum". The six ratios are computed once from the **input**
+/// scales, but the assignments mutate `s` in place and later ones read the mutated
+/// values, so the result depends on axis order and can stay anisotropic: per-axis
+/// scales `[1/2000, 1/700, 1/760]` come out as `[1/2000, 1/760, 1/2000]`. That is the
+/// reference behavior; reproduce it, don't "fix" it.
+pub fn adjust_scale_to_limit_ratio(mut s: [f64; 3]) -> [f64; 3] {
+    const LIMIT: f64 = 1.0;
+    let ratios = [s[0] / s[1], s[0] / s[2], s[1] / s[0], s[1] / s[2], s[2] / s[0], s[2] / s[1]];
+    if ratios[0] > LIMIT {
+        s[0] = s[1] * LIMIT;
+    }
+    if ratios[1] > LIMIT {
+        s[0] = s[2] * LIMIT;
+    }
+    if ratios[2] > LIMIT {
+        s[1] = s[0] * LIMIT;
+    }
+    if ratios[3] > LIMIT {
+        s[1] = s[2] * LIMIT;
+    }
+    if ratios[4] > LIMIT {
+        s[2] = s[0] * LIMIT;
+    }
+    if ratios[5] > LIMIT {
+        s[2] = s[1] * LIMIT;
+    }
+    s
 }
 
 impl Transform {
     /// Build the rescaling from the concatenation of all surface-point and
-    /// orientation xyz, per §5.1:
+    /// orientation xyz, per §5.1 (gempy `Transform.from_input_points`):
     ///
     /// ```text
     /// max_coord   = max over points (per axis)
     /// min_coord   = min over points (per axis)
     /// range_coord = 2 * (max_coord − min_coord)   # per axis; 0 → 1e-10
-    /// scale_axis  = 1 / range_coord               # per axis
-    /// scale       = min over axes (isotropic cube)
+    /// scale       = adjust_scale_to_limit_ratio(1 / range_coord)
     /// center      = (max_coord + min_coord) / 2
     /// ```
     pub fn from_input_points(surface_points: &[SurfacePoint], orientations: &[Orientation]) -> Self {
@@ -116,30 +146,31 @@ impl Transform {
         );
 
         let mut center = [0.0; 3];
-        // Smallest per-axis scale → isotropic cube (anisotropic_limit = [1,1,1]).
-        let mut scale = f64::INFINITY;
+        let mut scaling_factors = [0.0; 3];
         for k in 0..3 {
             center[k] = (max_coord[k] + min_coord[k]) / 2.0;
             let mut range_coord = 2.0 * (max_coord[k] - min_coord[k]);
             if range_coord == 0.0 {
                 range_coord = 1e-10;
             }
-            let scale_axis = 1.0 / range_coord;
-            if scale_axis < scale {
-                scale = scale_axis;
-            }
+            scaling_factors[k] = 1.0 / range_coord;
         }
 
-        Self { center, scale }
+        Self { center, scale: adjust_scale_to_limit_ratio(scaling_factors) }
     }
 
-    /// World → normalized: `x_norm = scale * (x − center)`.
+    /// Whether all three axes share one scale (the common case: equal data spans).
+    pub fn is_isotropic(&self) -> bool {
+        self.scale[0] == self.scale[1] && self.scale[1] == self.scale[2]
+    }
+
+    /// World → normalized: `x_norm = scale ⊙ (x − center)`.
     #[inline]
     pub fn apply(&self, xyz: [f64; 3]) -> [f64; 3] {
         [
-            self.scale * (xyz[0] - self.center[0]),
-            self.scale * (xyz[1] - self.center[1]),
-            self.scale * (xyz[2] - self.center[2]),
+            self.scale[0] * (xyz[0] - self.center[0]),
+            self.scale[1] * (xyz[1] - self.center[1]),
+            self.scale[2] * (xyz[2] - self.center[2]),
         ]
     }
 
@@ -147,21 +178,29 @@ impl Transform {
     #[inline]
     pub fn unapply(&self, xyz_norm: [f64; 3]) -> [f64; 3] {
         [
-            xyz_norm[0] / self.scale + self.center[0],
-            xyz_norm[1] / self.scale + self.center[1],
-            xyz_norm[2] / self.scale + self.center[2],
+            xyz_norm[0] / self.scale[0] + self.center[0],
+            xyz_norm[1] / self.scale[1] + self.center[1],
+            xyz_norm[2] / self.scale[2] + self.center[2],
         ]
     }
 
-    /// Transform a gradient/pole by the inverse-transpose of the linear (3×3)
-    /// part (§5.1). For an isotropic scale `s` with no rotation the linear part
-    /// is `s·I`, so its inverse-transpose is `(1/s)·I` — i.e. world gradients
-    /// scale by `1/s` into the normalized box. (Magnitude is *not* preserved in
-    /// general; it is preserved only up to the uniform `1/s` factor. Pole-unit /
-    /// RHS-scaling questions are resolved later against the fixture, §7.)
+    /// Transform an orientation pole into the normalized box — gempy
+    /// `Transform.transform_gradient(g, preserve_magnitude=True)` (§5.1): multiply by the
+    /// inverse-transpose of the linear part (`diag(1/scale)`), then rescale back to the
+    /// input magnitude. Only the **direction** changes, and only when the scale is
+    /// anisotropic (isotropic → the input pole, up to rounding). This is what gempy puts
+    /// in the RHS (`dip_gradients`). A zero pole is returned unchanged (gempy would
+    /// produce NaN; geofield's ABI never passes one).
     #[inline]
     pub fn apply_gradient(&self, g: [f64; 3]) -> [f64; 3] {
-        [g[0] / self.scale, g[1] / self.scale, g[2] / self.scale]
+        let t = [g[0] * (1.0 / self.scale[0]), g[1] * (1.0 / self.scale[1]), g[2] * (1.0 / self.scale[2])];
+        let g_mag = (g[0] * g[0] + g[1] * g[1] + g[2] * g[2]).sqrt();
+        if g_mag == 0.0 {
+            return g;
+        }
+        let t_mag = (t[0] * t[0] + t[1] * t[1] + t[2] * t[2]).sqrt();
+        let ratio = t_mag / g_mag;
+        [t[0] / ratio, t[1] / ratio, t[2] / ratio]
     }
 }
 
@@ -187,49 +226,67 @@ mod tests {
     }
 
     #[test]
-    fn scale_is_isotropic_and_extreme_maps_to_quarter() {
-        // Largest extent is on x (0..100). The isotropic scale is set by that
-        // axis: scale = 1 / (2*100) = 1/200. The extreme x point should map to
-        // ±0.25; other axes map to smaller magnitudes (isotropic cube).
+    fn largest_span_on_x_gives_isotropic_scale_and_quarter_extreme() {
+        // x has the largest span (0..100): every other axis is pulled down to x's scale,
+        // 1/(2*100), so the box is isotropic and the extreme x point maps to +0.25.
         let sps = vec![
             SurfacePoint::new([0.0, 0.0, 0.0], 0),
             SurfacePoint::new([100.0, 50.0, 10.0], 0),
         ];
-        let oris = vec![];
-        let t = Transform::from_input_points(&sps, &oris);
-        assert!((t.scale - 1.0 / 200.0).abs() < 1e-15, "scale={}", t.scale);
+        let t = Transform::from_input_points(&sps, &[]);
+        assert_eq!(t.scale, [1.0 / 200.0; 3]);
+        assert!(t.is_isotropic());
         assert_eq!(t.center, [50.0, 25.0, 5.0]);
 
         let hi = t.apply([100.0, 50.0, 10.0]);
         assert!((hi[0] - 0.25).abs() < 1e-15, "x extreme should map to +0.25");
-        // y/z extents are smaller, so they land strictly inside ±0.25.
         assert!(hi[1].abs() < 0.25 && hi[2].abs() < 0.25);
+    }
+
+    /// The gempy order-dependence, pinned with the exact case observed in a live gempy
+    /// dump (1000 × 350 × 380 span → scale [0.0005, 0.00132, 0.0005]).
+    #[test]
+    fn gempy_limit_ratio_is_order_dependent_not_min() {
+        let s = adjust_scale_to_limit_ratio([1.0 / 2000.0, 1.0 / 700.0, 1.0 / 760.0]);
+        assert_eq!(s, [1.0 / 2000.0, 1.0 / 760.0, 1.0 / 2000.0]);
+        // Already-isotropic and min-on-x inputs collapse to the minimum.
+        assert_eq!(adjust_scale_to_limit_ratio([0.5, 0.5, 0.5]), [0.5; 3]);
+        assert_eq!(adjust_scale_to_limit_ratio([0.1, 0.2, 0.3]), [0.1; 3]);
+        assert_eq!(adjust_scale_to_limit_ratio([0.3, 0.2, 0.1]), [0.1, 0.1, 0.1]);
+        assert_eq!(adjust_scale_to_limit_ratio([0.2, 0.3, 0.1]), [0.1, 0.1, 0.1]);
+        assert_eq!(adjust_scale_to_limit_ratio([0.2, 0.1, 0.3]), [0.1, 0.1, 0.1]);
+        // Smallest scale on x with s_y > s_z: y is pulled to z's (unmodified) scale, not x's.
+        assert_eq!(adjust_scale_to_limit_ratio([0.1, 0.3, 0.2]), [0.1, 0.2, 0.1]);
     }
 
     #[test]
     fn degenerate_axis_does_not_blow_up() {
-        // A flat (zero-extent) z axis must not produce inf scale; the floored
-        // range_coord = 1e-10 gives a huge per-axis scale, but the *isotropic*
-        // scale is the minimum (set by a non-degenerate axis), so it stays sane.
+        // A flat (zero-extent) z axis floors range_coord to 1e-10 (a huge per-axis scale);
+        // the limit-ratio pass pulls it back to the finite axes' scale.
         let sps = vec![
             SurfacePoint::new([0.0, 0.0, 5.0], 0),
             SurfacePoint::new([10.0, 10.0, 5.0], 0),
         ];
         let t = Transform::from_input_points(&sps, &[]);
-        assert!(t.scale.is_finite() && t.scale > 0.0);
-        assert!((t.scale - 1.0 / 20.0).abs() < 1e-15);
+        assert_eq!(t.scale, [1.0 / 20.0; 3]);
     }
 
     #[test]
-    fn isotropic_gradient_scales_by_inverse_scale() {
-        let sps = vec![
-            SurfacePoint::new([0.0, 0.0, 0.0], 0),
-            SurfacePoint::new([10.0, 10.0, 10.0], 0),
-        ];
-        let t = Transform::from_input_points(&sps, &[]);
-        let g = t.apply_gradient([0.0, 0.0, 1.0]);
-        assert!((g[2] - 1.0 / t.scale).abs() < 1e-12);
-        assert_eq!(g[0], 0.0);
-        assert_eq!(g[1], 0.0);
+    fn gradient_keeps_magnitude_and_tilts_only_when_anisotropic() {
+        let iso = Transform { center: [0.0; 3], scale: [0.1; 3] };
+        let g = [0.3, -0.2, 0.9];
+        let gi = iso.apply_gradient(g);
+        for k in 0..3 {
+            assert!((gi[k] - g[k]).abs() < 1e-15, "isotropic must keep the pole");
+        }
+        // gempy's observed case: az 80 / dip 8 pole under scale [1/2000, 1/760, 1/2000].
+        let an = Transform { center: [0.0; 3], scale: [1.0 / 2000.0, 1.0 / 760.0, 1.0 / 2000.0] };
+        let pole = [0.137059, 0.02416716, 0.990268];
+        let ga = an.apply_gradient(pole);
+        let mag = |v: [f64; 3]| (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+        assert!((mag(ga) - mag(pole)).abs() < 1e-12, "magnitude preserved");
+        // y shrinks by 760/2000 relative to x and z (then renormalized).
+        assert!((ga[1] / ga[2] - (pole[1] / pole[2]) * (760.0 / 2000.0)).abs() < 1e-12);
+        assert!((ga[0] - 0.13709).abs() < 5e-5 && (ga[1] - 0.00919).abs() < 5e-5);
     }
 }

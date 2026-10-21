@@ -227,6 +227,9 @@ Assembly gate (`validation/dump_kernel.py`, full-`K` max|Δ| vs gempy, gate 1e-4
 | `matern_5_2` | 1.2e-10 | 4.6e-10 |
 | `exponential` | 0 | 4.4e-15 |
 
+`--model aniso` (unequal spans, §5.1) since 2026-10-21: 9.5e-9 / 4.9e-10 /
+8.9e-15 respectively; `b` exact for all.
+
 The cubic's `8.9e-9` on `multi` is the known divisor detail: geofield uses
 `r² + 1e-5`, gempy `(sqrt(r²+1e-10))² + 1e-5` — they differ by the `1e-10`
 floor (+ rounding). Matérn's residual is `exp` ULPs.
@@ -394,13 +397,32 @@ center      = (max_coord + min_coord) / 2
 translation = − center
 ```
 
-`anisotropic_limit = [1,1,1]` forces all three axes to share the **smallest**
-scale (isotropic cube). Application order is **SRT** (`S @ R @ T`), i.e.
-translate-then-scale, rotation = 0:
+`scale` then goes through `_adjust_scale_to_limit_ratio(s, anisotropic_limit=[1,1,1])`
+(Rust: `data::adjust_scale_to_limit_ratio`), and is applied **per axis** in
+**SRT** order (`S @ R @ T`), i.e. translate-then-scale, rotation = 0:
 
 ```
-x_norm = scale * (x − center)
+x_norm = scale ⊙ (x − center)          # scale = [sx, sy, sz]
 ```
+
+> **⚠ LANDMINE — the limit-ratio pass is order-dependent, NOT "take the
+> minimum".** Its intent is an isotropic cube, but it computes all six ratios
+> from the *input* scales and then overwrites `s` in place, with later
+> assignments reading already-overwritten entries:
+> ```
+> r = [s0/s1, s0/s2, s1/s0, s1/s2, s2/s0, s2/s1]      # from the input s
+> if r0>1: s0 = s1;   if r1>1: s0 = s2
+> if r2>1: s1 = s0;   if r3>1: s1 = s2               # s0 may be updated already
+> if r4>1: s2 = s0;   if r5>1: s2 = s1               # s0, s1 may be updated
+> ```
+> It yields the isotropic minimum whenever the smallest scale is on x, or on z,
+> or the scales are already equal — but e.g. `[1/2000, 1/700, 1/760]` (spans
+> 1000 × 350 × 380) comes out **`[1/2000, 1/760, 1/2000]`**: anisotropic, y
+> pulled to z's *input* scale rather than x's. Confirmed against a live gempy
+> dump (`scale = [0.0005, 0.00132, 0.0005]`). This is the reference behavior and
+> geofield reproduces it verbatim; do not "fix" it to `min` without recording a
+> deliberate deviation here. (Until 2026-10-21 geofield used `min` — correct
+> only for equal spans; see §7.0.)
 
 **Extent (resolved against source — watch the factor of 2):** the extreme point
 `x = max` maps to `scale·(max − center) = ((max−min)/2)/(2·(max−min)) = 1/4`.
@@ -411,8 +433,24 @@ source.) The `# to compare with legacy add 0.5` comment recenters to
 `[0.25, 0.75]` (legacy's box) — it shifts but does **not** rescale, so the
 effective normalized half-extent in gempy `main` is **0.25**. This is what gives
 the `range = 1.7` kernel its safety margin (§1.1 landmine).
-Gradients transform by the inverse-transpose 3×3 (magnitude-preserving when
-scale is isotropic — which it is by default).
+(The limit-ratio pass only ever *lowers* a scale — every assignment replaces an
+entry with a smaller one — so even an anisotropic box keeps every axis within
+±0.25 and the §1.1 margin holds.)
+
+**Orientation poles — `transform_gradient(g, preserve_magnitude=True)`.** gempy's
+`dip_gradients` (the RHS of §4/§6) are the poles multiplied by the
+inverse-transpose of the linear part, `diag(1/scale)`, then rescaled back to the
+input magnitude:
+```
+t = g ⊘ scale;     dip_gradient = t · (|g| / |t|)
+```
+Only the direction changes, and only when the scale is anisotropic. For an
+isotropic scale this returns the raw pole — which is why the original
+(isotropic-only) block diff read gempy's RHS as "the raw pole". Rust:
+`Transform::apply_gradient`, used for `AssembledGeometry::ori_pole`.
+
+**World gradients of the field** chain through the per-axis scale:
+`∇_world[e] = scale[e] · ∇_norm[e]` (`Field::scalar_field_gradient`).
 
 > **Trap — rescaling sets the effective range.** All kernel math runs in the
 > normalized box. Match center/scale exactly or the field shape drifts.
@@ -452,15 +490,16 @@ A Cholesky that "succeeds" means the drift border was assembled wrong.
 
 ## 7. Open items to confirm against a live model dump
 
-0. **Anisotropic rescaling (found 2026-10-20, not yet handled).** Current gempy
-   `main` rescales **per axis** when the data's x/y/z spans differ (observed
-   scale `[0.0005, 0.00132, 0.0005]` on an 1000×350×380 point cloud) and
-   transforms the orientation gradients to match (`dip_gradients` ≠ the raw
-   poles). §5.1's isotropic box — which geofield's `Transform` implements — is
-   only what gempy does when the spans are equal. model1 and the `tiny`/`multi`
-   gate models have equal spans and so match; a non-cubic data cloud would not.
-   This is independent of the kernel choice. Until resolved, the gate models
-   keep equal spans on purpose (see `dump_kernel.py --model multi`).
+0. ~~Anisotropic rescaling~~ — **resolved 2026-10-21.** Found 2026-10-20: gempy
+   rescales per axis when the data spans differ and tilts the poles to match,
+   while geofield used one isotropic `min` scale and the raw poles. Now
+   reproduced verbatim (§5.1: the order-dependent limit-ratio pass, the
+   magnitude-preserving pole transform, the per-axis gradient chain rule).
+   Gate: `dump_kernel.py --model aniso` (spans 1000 × 350 × 380 — the case
+   that exposed it) passes for all three kernels — full-`K` max|Δ| 9.5e-9
+   (cubic) / 4.9e-10 (matern_5_2) / 8.9e-15 (exponential), RHS `b` max|Δ| **0**;
+   the same model failed at max|Δ| ≈ 25 before the fix. Every earlier gate
+   (tiny, multi, model1 ×3 kernels) is unchanged to the printed digit.
 
 1. Exact placement/ordering of the `selector` border rows vs. our `K` index
    layout (gempy interleaves orientation components; we must match the RHS

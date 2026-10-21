@@ -1,0 +1,12 @@
+{
+  "range": 1.7,
+  "c_o": 10.0,
+  "uni_degree": 1.0,
+  "i_res": 4.0,
+  "gi_res": 2.0,
+  "number_dimensions": 3.0,
+  "n_uni_eq": 3.0,
+  "kernel_function": "cubic",
+  "sp_nugget": 2e-05,
+  "grad_nugget": 0.01
+}

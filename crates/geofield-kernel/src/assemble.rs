@@ -107,8 +107,9 @@ pub struct AssembledGeometry {
     pub opts: KernelOptions,
     /// Orientation positions in normalized coords.
     pub ori_pos: Vec<[f64; 3]>,
-    /// Orientation poles, RAW (world) — NOT gradient-transformed. gempy uses the
-    /// raw pole in the RHS (confirmed by block diff); see build of this field.
+    /// Orientation poles in the normalized box (gempy `dip_gradients`):
+    /// `Transform::apply_gradient` — magnitude-preserving; equals the raw pole when
+    /// the scale is isotropic. See build of this field.
     pub ori_pole: Vec<[f64; 3]>,
     /// Per non-reference surface point: (rest position, ref position), both
     /// normalized, in input order.
@@ -129,11 +130,14 @@ impl AssembledGeometry {
             .iter()
             .map(|o| transform.apply(o.xyz))
             .collect();
-        // RAW pole — NOT gradient-transformed. The block diff against gempy
-        // (validation/dump_kernel.py) showed b was off by exactly 1/scale: gempy
-        // puts the raw orientation pole into the RHS, it does NOT apply the
-        // §5.1 inverse-transpose to it. (Step A of the assembly+eval correction.)
-        let ori_pole: Vec<[f64; 3]> = series.orientations.iter().map(|o| o.pole).collect();
+        // gempy's `dip_gradients`: the pole through `transform_gradient(...,
+        // preserve_magnitude=True)` (§5.1) — the inverse-transpose direction at the input
+        // magnitude. For an isotropic scale that is the raw pole (which is why an earlier
+        // isotropic-only block diff read it as "raw"; the plain inverse-transpose without
+        // the magnitude step was off by exactly 1/scale). For an anisotropic scale the
+        // direction tilts, and the RHS must carry the tilted pole.
+        let ori_pole: Vec<[f64; 3]> =
+            series.orientations.iter().map(|o| transform.apply_gradient(o.pole)).collect();
 
         // Increment rows: every surface point that is NOT its interface's
         // reference, in input order.
