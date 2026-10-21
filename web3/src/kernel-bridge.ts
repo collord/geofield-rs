@@ -108,7 +108,7 @@ function k(): KernelExports {
 
 /** Total field evals (gf_eval + gf_eval_grad) since the last reset — the per-sample
  *  wasm-module-boundary crossings. Returns 0 if the kernel was built without
- *  `wasm-abi-stats`. For the web2 scale harness. */
+ *  `wasm-abi-stats`. For scale/profiling runs. */
 export function evalCount(): number {
   return Number(k().gf_eval_count());
 }

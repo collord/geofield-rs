@@ -1,4 +1,12 @@
 <!--
+SYNC IMPACT REPORT — amendment 2026-10-21 (manual)
+- Version: 1.1.0 → 1.1.1 (PATCH — wording only). The legacy `web/` and `web2/`
+  harnesses were removed; references to them (Principle I's harness list, the
+  Validation Standards Playwright bullet, the commit-scope example) now name the
+  one remaining browser app, `web3/`, which is also the GitHub Pages site. No
+  principle or gate changed.
+- Templates to propagate: none (no template names the removed harnesses).
+
 SYNC IMPACT REPORT — amendment 2026-06-18 (manual, during feature 001 implement)
 - Version: 1.0.0 → 1.1.0 (MINOR — materially new normative guidance, no principle
   removed/redefined). Added the **functional-test (Playwright) gate** for the
@@ -73,7 +81,7 @@ Every capability that claims correctness MUST cite the external gate that backs
 it. "The numbers are stable" is not evidence; "matches the reference to `2.7e-15`
 affine, 100% voxel agreement" is.
 
-**This extends to the browser harnesses (`web`, `web2`, `web3`).** UI and
+**This extends to the browser app (`web3`, published to GitHub Pages).** UI and
 end-to-end behavior is the engine's outward face, and its gate is an **automated
 functional test that drives the real app** (Playwright) — the UI analog of the
 mesher's invariant test. "It type-checks" and "it looks right in the browser" are
@@ -180,7 +188,7 @@ named cause is provisional and labelled so.
   true extent. New meshing paths add the invariant test that pins their failure
   mode.
 - **Browser behavior is verified by a functional test**, not by a manual walk:
-  the `web*/` harnesses carry **Playwright** end-to-end tests that drive the real
+  the `web3/` app carries **Playwright** end-to-end tests that drive the real
   app (load a scenario, perform an edit, assert the view/state changed). A feature
   with UI acceptance criteria adds the functional test that pins them. `tsc` +
   `vite build` are the *compile* gate (necessary); the Playwright run is the
@@ -192,7 +200,7 @@ named cause is provisional and labelled so.
 
 - **Commits are scoped and typed** (`feat(scope):`, `fix(scope):`,
   `refactor:`, `docs(scope):`, `chore:`) with the subsystem in the scope
-  (`web2`, `fault`, `kernel`, `wasm-split`). One coherent change per commit; the
+  (`web3`, `fault`, `kernel`, `wasm-split`). One coherent change per commit; the
   message says what changed and, where non-obvious, why.
 - **A spec precedes a non-trivial subsystem.** New cross-cutting work gets a
   `docs/` or `SPEC-*.md` that is honest about [EXISTS]/[EXTENDS]/[NEW], states
@@ -228,4 +236,4 @@ allowed only with a written reason for why the simpler path fails.
 Runtime development guidance for agents lives in `CLAUDE.md` and the current
 plan; this constitution is the layer above them that they answer to.
 
-**Version**: 1.1.0 | **Ratified**: 2026-06-18 | **Last Amended**: 2026-06-18
+**Version**: 1.1.1 | **Ratified**: 2026-06-18 | **Last Amended**: 2026-10-21

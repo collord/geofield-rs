@@ -1,6 +1,6 @@
 // Typed message contract between the UI (main thread) and the solver worker.
 //
-// Adapted from web/src/protocol.ts to the TWO-AXIS model (feature 001): each series
+// Adapted from the original web/ harness's protocol to the TWO-AXIS model (feature 001): each series
 // carries `unboundedAbove` (Axis B) separately from `relation` (Axis A, narrowed to
 // 0=Erode 1=Onlap 2=Conformable — the legacy 3=Basement code is retired). The worker
 // streams back a parsed `CoreUpdate` (declared state + derived view) alongside meshes.
@@ -50,7 +50,7 @@ export interface SeriesJson {
  *  "exponential" is gempy's name for the GAUSSIAN `exp(-r²/2a²)`. */
 export type KernelName = "cubic" | "matern_5_2" | "exponential";
 
-/** Open contact sheets vs. closed lithology-unit solids (the web/ render modes). */
+/** Open contact sheets vs. closed lithology-unit solids (the original web/ harness's render modes). */
 export type RenderMode = "contact" | "solid";
 
 // --- Main → worker ---------------------------------------------------------

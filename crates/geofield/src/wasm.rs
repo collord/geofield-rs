@@ -977,7 +977,7 @@ impl WasmStack {
     }
 
     /// Adaptive octree mesh of interface `interface_idx` of series `series`, **within a
-    /// single fault block `block`** — the per-block open-sheet view (matches `web/`): the
+    /// single fault block `block`** — the per-block open-sheet view (the original `web/` harness's): the
     /// contact is contoured from that block's own smooth field and cut flush at the fault
     /// plane, so a faulted contact renders as separate sheets per block rather than one
     /// surface stretched across the offset. Still clipped to the series' visible region

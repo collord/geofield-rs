@@ -1,5 +1,5 @@
-geofield web harness — third-party and component licences
-==========================================================
+geofield web3 app — third-party and component licences
+=======================================================
 
 This web application loads TWO separately-compiled WebAssembly modules. They are
 distinct works, each governed by its own licence, combined only at load time by
@@ -24,6 +24,7 @@ geofield_bg.wasm is not a fused binary of EUPL code, and remains BSD-3-Clause; t
 EUPL obligations travel only with geofield_kernel.wasm.
 
 The bundled JavaScript also includes third-party libraries (React, three.js,
-wasm-bindgen glue) under their respective permissive licences.
+@dnd-kit, wasm-bindgen glue) under their respective permissive licences, and
+manifold-3d (Apache-2.0), loaded as its own WebAssembly module.
 
 Copyright (c) 2026 <YOUR NAME>

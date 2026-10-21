@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 // `import * as importN from "kernel"`, so we alias the bare specifier "kernel" to the
 // bridge module that owns the kernel instance (geofield_kernel.wasm, EUPL) and the
 // memory-bridging shims. This is what keeps the EUPL code in its own artifact: the
-// engine never links it, it imports it. (Mirrors web/vite.config.ts.)
+// engine never links it, it imports it.
 export default defineConfig({
   plugins: [react()],
   resolve: {

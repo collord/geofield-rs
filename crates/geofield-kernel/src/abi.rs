@@ -79,7 +79,7 @@ pub(crate) fn install_panic_hook() {
 
 // Optional boundary-crossing instrumentation (feature = "wasm-abi-stats"). Counts every
 // gf_eval / gf_eval_grad — the per-sample wasm-module-boundary calls the octree makes —
-// so the web2 harness can report how many crossings a mesh costs.
+// so a scale harness can report how many crossings a mesh costs.
 #[cfg(feature = "wasm-abi-stats")]
 thread_local! {
     static EVAL_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };

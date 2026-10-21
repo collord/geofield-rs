@@ -74,7 +74,7 @@ normals):
   and the closed mesh has zero non-manifold edges.
 
 Both are exposed over WASM (`mesh_isosurface`, `mesh_isosurface_octree`). The
-`web/` harness uses the octree path, meshing one surface per interface at its
+`web3/` app uses the octree path, meshing one surface per interface at its
 recovered isovalue (the geological contacts).
 
 ## Public API
@@ -265,5 +265,5 @@ In the browser the two ship as **separate WebAssembly artifacts** —
 host. The engine does not link or embed the kernel in its wasm build; it reaches the
 kernel's field oracle across a WebAssembly module boundary (runtime imports), so
 `geofield.wasm` contains no EUPL-covered code and the EUPL obligations travel only with
-`geofield_kernel.wasm`. See `web/public/NOTICE.txt` (shipped to the web bundle) and each
+`geofield_kernel.wasm`. See `web3/public/NOTICE.txt` (shipped with the web app) and each
 crate's `LICENSE`.

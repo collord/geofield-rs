@@ -1,6 +1,6 @@
 // The testbed's solver worker: owns BOTH wasm instances (EUPL kernel + BSD engine) + the
 // kernel-bridge, fits the stack and meshes off the UI thread, and streams status, surfaces,
-// and the hierarchy `CoreUpdate` back. Adapted from web/src/worker.ts to the two-axis model
+// and the hierarchy `CoreUpdate` back. Adapted from the original web/ harness's worker to the two-axis model
 // (feature 001): add_series carries `unboundedAbove`, and the worker posts the parsed
 // `CoreUpdate` (declared state + derived view) from `WasmStack.core_update_json()`.
 //
