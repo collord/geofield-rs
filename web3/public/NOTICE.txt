@@ -27,4 +27,4 @@ The bundled JavaScript also includes third-party libraries (React, three.js,
 @dnd-kit, wasm-bindgen glue) under their respective permissive licences, and
 manifold-3d (Apache-2.0), loaded as its own WebAssembly module.
 
-Copyright (c) 2026 <YOUR NAME>
+Copyright (c) 2026 Jerritt Collord
