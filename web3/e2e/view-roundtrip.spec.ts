@@ -3,6 +3,9 @@
 import { test, expect } from "@playwright/test";
 
 test("Export carries camera + render mode; load restores them", async ({ page }) => {
+  // Three fits (contact → solid → reload in solid mode) take ~27 s on their own — too close to
+  // the 30 s default budget once the suite runs in parallel (it timed out there once).
+  test.setTimeout(90_000);
   await page.goto("/");
   await page.getByTestId("seed-template").selectOption("cross-cutting-vein-dipping");
   await expect(page.getByText("status: done")).toBeVisible({ timeout: 30_000 });

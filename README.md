@@ -9,6 +9,9 @@ Given surface points and orientations, it assembles the dual cokriging system,
 solves it once, and exposes the scalar field, its analytic gradient, and a
 lithology assignment.
 
+**Try it in the browser:** the `web3/` authoring app is published to GitHub Pages at
+<https://collord.github.io/geofield-rs/> (see [Web app](#web-app)).
+
 ## Scope
 
 This crate implements the **single scalar field, non-faulted, single-series**
@@ -171,6 +174,26 @@ The browser parity harness lives in [`examples/web/`](examples/web/): build the
 web package, serve the repo root, and open `examples/web/index.html` to compare
 the WASM field against a native reference. Native↔WASM agreement was verified to
 `1.2e-15` (f64 round-off).
+
+### Web app
+
+`web3/` is the browser authoring app (stack hierarchy, sections, digitizing, the kernel
+picker); its behavior spec is `web3/SPEC.md`.
+
+```bash
+cd web3
+npm ci
+npm run wasm        # kernel wasm (cargo) + engine wasm (wasm-pack)
+npm run dev         # or: npm run build && npm run preview
+npm run test:e2e    # the Playwright functional gate
+```
+
+**GitHub Pages.** Pushing any tag runs `.github/workflows/pages.yml`: it builds both wasm
+modules, runs the full Playwright suite, and — only if that passes — builds with
+`GEOFIELD_BASE=/<repo>/` and deploys `web3/dist`. It can also be run by hand
+(*Actions → Pages → Run workflow*). One-time setup: *Settings → Pages → Source: GitHub
+Actions*. The workflow also generates the meshes for the imported-mesh template
+(`web3/public/meshes/README.md`).
 
 ## Tests
 
